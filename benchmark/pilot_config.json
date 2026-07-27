@@ -1,6 +1,6 @@
 {
   "api_base": "https://openrouter.ai/api/v1",
-  "budget_usd": 0.5,
+  "budget_usd": 1.75,
   "task_count": 2,
   "max_task_count": 3,
   "max_revision_rounds": 1,
@@ -9,11 +9,11 @@
   "reservation_safety_multiplier": 1.25,
   "models": {
     "spec_generator": {
-      "model": "qwen/qwen3-coder-next",
-      "input_usd_per_million": 0.25,
-      "output_usd_per_million": 1.5,
-      "max_output_tokens": 4500,
-      "reasoning_effort": null,
+      "model": "anthropic/claude-sonnet-5",
+      "input_usd_per_million": 3.0,
+      "output_usd_per_million": 15.0,
+      "max_output_tokens": 6000,
+      "reasoning_effort": "high",
       "prompt": "benchmark/prompts/spec_generator.txt"
     },
     "plaintext_writer": {
