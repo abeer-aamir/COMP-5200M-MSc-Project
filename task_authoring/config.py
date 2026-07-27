@@ -27,6 +27,7 @@ class RoleConfig:
     output_usd_per_million: Decimal
     max_output_tokens: int
     reasoning_effort: str | None
+    reasoning_max_tokens: int | None
     prompt_path: Path
 
 
@@ -87,6 +88,26 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
         max_tokens = int(item["max_output_tokens"])
         if not 256 <= max_tokens <= 12000:
             raise ConfigError(f"Unreasonable max_output_tokens for {role_name}")
+        reasoning_effort = item.get("reasoning_effort")
+        raw_reasoning_max = item.get("reasoning_max_tokens")
+        reasoning_max_tokens = (
+            None if raw_reasoning_max is None else int(raw_reasoning_max)
+        )
+        if reasoning_effort not in {None, "low", "medium", "high"}:
+            raise ConfigError(
+                f"reasoning_effort for {role_name} must be null, low, medium, or high"
+            )
+        if reasoning_max_tokens is not None and not (
+            1024 <= reasoning_max_tokens < max_tokens
+        ):
+            raise ConfigError(
+                f"reasoning_max_tokens for {role_name} must be at least 1024 "
+                "and below max_output_tokens"
+            )
+        if reasoning_effort is not None and reasoning_max_tokens is not None:
+            raise ConfigError(
+                f"{role_name} cannot set both reasoning_effort and reasoning_max_tokens"
+            )
         roles[role_name] = RoleConfig(
             name=role_name,
             model=str(item["model"]),
@@ -97,13 +118,10 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
                 item["output_usd_per_million"], f"{role_name} output price"
             ),
             max_output_tokens=max_tokens,
-            reasoning_effort=item.get("reasoning_effort"),
+            reasoning_effort=reasoning_effort,
+            reasoning_max_tokens=reasoning_max_tokens,
             prompt_path=prompt_path,
         )
-        if roles[role_name].reasoning_effort not in {None, "low", "medium", "high"}:
-            raise ConfigError(
-                f"reasoning_effort for {role_name} must be null, low, medium, or high"
-            )
 
     gate = raw.get("hardness_gate", {})
     required_gate_fields = {

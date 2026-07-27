@@ -13,7 +13,8 @@
       "input_usd_per_million": 3.0,
       "output_usd_per_million": 15.0,
       "max_output_tokens": 10000,
-      "reasoning_effort": "high",
+      "reasoning_effort": null,
+      "reasoning_max_tokens": 3000,
       "prompt": "benchmark/prompts/spec_generator.txt"
     },
     "plaintext_writer": {
@@ -22,6 +23,7 @@
       "output_usd_per_million": 0.3,
       "max_output_tokens": 2200,
       "reasoning_effort": null,
+      "reasoning_max_tokens": null,
       "prompt": "benchmark/prompts/plaintext_writer.txt"
     },
     "critic": {
@@ -30,6 +32,7 @@
       "output_usd_per_million": 2.0,
       "max_output_tokens": 6000,
       "reasoning_effort": "medium",
+      "reasoning_max_tokens": null,
       "prompt": "benchmark/prompts/critic.txt"
     }
   },

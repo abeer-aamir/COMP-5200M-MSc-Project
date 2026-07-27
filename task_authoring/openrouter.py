@@ -292,7 +292,12 @@ class OpenRouterClient:
                 },
             },
         }
-        if role.reasoning_effort is not None:
+        if role.reasoning_max_tokens is not None:
+            payload["reasoning"] = {
+                "max_tokens": role.reasoning_max_tokens,
+                "exclude": True,
+            }
+        elif role.reasoning_effort is not None:
             payload["reasoning"] = {
                 "effort": role.reasoning_effort,
                 "exclude": True,
