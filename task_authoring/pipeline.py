@@ -134,7 +134,41 @@ class TaskAuthoringPipeline:
             if result.billable:
                 self.ledger.charge(result.cost_usd)
         except Exception as exc:
-            if self.client.billable:
+            audit_result = getattr(exc, "audit_result", None)
+            raw_content = getattr(exc, "raw_content", None)
+            failure_usage: dict[str, Any] = {}
+            if isinstance(audit_result, ChatResult):
+                if audit_result.billable:
+                    self.ledger.charge(audit_result.cost_usd)
+                self._record_usage(role_name, audit_result)
+                invalid_path = (
+                    self.private_dir
+                    / task_id
+                    / f"round-{round_number}"
+                    / f"{role_name}_invalid_response.txt"
+                )
+                invalid_path.parent.mkdir(parents=True, exist_ok=True)
+                invalid_text = (
+                    raw_content if isinstance(raw_content, str) else repr(raw_content)
+                )
+                invalid_path.write_text(invalid_text, encoding="utf-8")
+                failure_usage = {
+                    "billable": audit_result.billable,
+                    "response_model": audit_result.response_model,
+                    "provider": audit_result.provider,
+                    "request_id": audit_result.request_id,
+                    "generation_id": audit_result.generation_id,
+                    "prompt_tokens": audit_result.prompt_tokens,
+                    "completion_tokens": audit_result.completion_tokens,
+                    "reasoning_tokens": audit_result.reasoning_tokens,
+                    "cached_tokens": audit_result.cached_tokens,
+                    "cost_usd": str(audit_result.cost_usd),
+                    "latency_ms": audit_result.latency_ms,
+                    "retries": audit_result.retries,
+                    "invalid_response_path": str(invalid_path),
+                    "invalid_response_sha256": _sha256_text(invalid_text),
+                }
+            elif self.client.billable:
                 self._unknown_cost_failures += 1
             self._log_event(
                 {
@@ -148,7 +182,8 @@ class TaskAuthoringPipeline:
                     "spent_so_far_usd": str(self.ledger.spent_usd),
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1000],
-                    "cost_unknown": self.client.billable,
+                    "cost_unknown": self.client.billable and audit_result is None,
+                    **failure_usage,
                 }
             )
             raise
@@ -177,6 +212,7 @@ class TaskAuthoringPipeline:
                 "spent_so_far_usd": str(self.ledger.spent_usd),
                 "latency_ms": result.latency_ms,
                 "retries": result.retries,
+                "parse_mode": result.parse_mode,
             }
         )
         return result

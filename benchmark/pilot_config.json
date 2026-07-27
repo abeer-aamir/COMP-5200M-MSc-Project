@@ -12,7 +12,7 @@
       "model": "anthropic/claude-sonnet-5",
       "input_usd_per_million": 3.0,
       "output_usd_per_million": 15.0,
-      "max_output_tokens": 6000,
+      "max_output_tokens": 8000,
       "reasoning_effort": "high",
       "prompt": "benchmark/prompts/spec_generator.txt"
     },

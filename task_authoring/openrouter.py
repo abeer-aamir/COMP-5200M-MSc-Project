@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
@@ -37,6 +38,66 @@ class ChatResult:
     latency_ms: int
     retries: int
     billable: bool
+    parse_mode: str = "direct-json"
+
+
+class StructuredResponseError(ProviderError):
+    """A billable response arrived but its content could not be parsed safely."""
+
+    def __init__(
+        self,
+        message: str,
+        audit_result: ChatResult,
+        raw_content: str,
+    ):
+        super().__init__(message)
+        self.audit_result = audit_result
+        self.raw_content = raw_content
+
+
+def _parse_structured_object(raw_content: Any) -> tuple[dict[str, Any], str]:
+    if isinstance(raw_content, dict):
+        return raw_content, "native-object"
+    if isinstance(raw_content, list):
+        raw_content = "".join(
+            part.get("text", "") for part in raw_content if isinstance(part, dict)
+        )
+    if not isinstance(raw_content, str):
+        raise ValueError("response content was neither text nor an object")
+
+    try:
+        content = json.loads(raw_content)
+        parse_mode = "direct-json"
+    except json.JSONDecodeError as direct_error:
+        fenced = re.fullmatch(
+            r"\s*```(?:json)?\s*(.*?)\s*```\s*",
+            raw_content,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if fenced:
+            try:
+                content = json.loads(fenced.group(1))
+                parse_mode = "markdown-fence"
+            except json.JSONDecodeError:
+                raise direct_error
+        else:
+            first_object = raw_content.find("{")
+            if first_object < 0:
+                raise direct_error
+            try:
+                content, consumed = json.JSONDecoder().raw_decode(
+                    raw_content[first_object:]
+                )
+            except json.JSONDecodeError:
+                raise direct_error
+            prefix = raw_content[:first_object].strip()
+            suffix = raw_content[first_object + consumed :].strip()
+            if not prefix and not suffix:
+                raise direct_error
+            parse_mode = "mixed-text-extraction"
+    if not isinstance(content, dict):
+        raise ValueError("structured response was not a JSON object")
+    return content, parse_mode
 
 
 class CompletionClient(Protocol):
@@ -244,20 +305,8 @@ class OpenRouterClient:
         choices = response.get("choices") or []
         if not choices:
             raise ProviderError("OpenRouter response contained no choices")
-        raw_content = choices[0].get("message", {}).get("content")
-        if isinstance(raw_content, list):
-            raw_content = "".join(
-                part.get("text", "") for part in raw_content if isinstance(part, dict)
-            )
-        if not isinstance(raw_content, str):
-            raise ProviderError("OpenRouter response content was not text")
-        try:
-            content = json.loads(raw_content)
-        except json.JSONDecodeError as exc:
-            raise ProviderError("Structured response was not valid JSON") from exc
-        if not isinstance(content, dict):
-            raise ProviderError("Structured response must be a JSON object")
-
+        choice = choices[0]
+        raw_content = choice.get("message", {}).get("content")
         response_model = str(response.get("model", ""))
         if response_model != role.model:
             raise ProviderError(
@@ -270,8 +319,13 @@ class OpenRouterClient:
             )
         details = usage.get("completion_tokens_details") or {}
         prompt_details = usage.get("prompt_tokens_details") or {}
-        return ChatResult(
-            content=content,
+        raw_for_audit = (
+            raw_content
+            if isinstance(raw_content, str)
+            else json.dumps(raw_content, ensure_ascii=False)
+        )
+        audit_result = ChatResult(
+            content={},
             requested_model=role.model,
             response_model=response_model,
             provider=response.get("provider"),
@@ -286,6 +340,17 @@ class OpenRouterClient:
             retries=retries,
             billable=True,
         )
+        try:
+            content, parse_mode = _parse_structured_object(raw_content)
+        except (json.JSONDecodeError, ValueError) as exc:
+            finish_reason = choice.get("finish_reason")
+            raise StructuredResponseError(
+                "Structured response was not valid JSON"
+                + (f" (finish_reason={finish_reason})" if finish_reason else ""),
+                audit_result,
+                raw_for_audit,
+            ) from exc
+        return replace(audit_result, content=content, parse_mode=parse_mode)
 
 
 class ReplayClient:
