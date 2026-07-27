@@ -246,32 +246,43 @@ class TaskAuthoringPipeline:
     def _generate_task(self, task_index: int, brief: str) -> dict[str, Any]:
         task_id = f"pilot-{task_index:03d}"
         task_dir = self.private_dir / task_id
-        revision_context: dict[str, Any] | None = None
+        spec_revision_context: dict[str, Any] | None = None
+        writer_revision_context: dict[str, Any] | None = None
+        reusable_spec: dict[str, Any] | None = None
         last_errors: list[str] = []
 
         for round_number in range(self.config.max_revision_rounds + 1):
             round_dir = task_dir / f"round-{round_number}"
-            spec_input = {
-                "task_id": task_id,
-                "authoring_brief": brief,
-                "target_kubernetes_version": self.config.target_kubernetes_version,
-                "kind_node_image": self.config.kind_node_image,
-                "round": round_number,
-                "revision_context": revision_context,
-            }
-            spec_result = self._call_role(
-                "spec_generator", task_id, round_number, spec_input
-            )
-            spec = spec_result.content
+            if reusable_spec is None:
+                spec_input = {
+                    "task_id": task_id,
+                    "authoring_brief": brief,
+                    "target_kubernetes_version": self.config.target_kubernetes_version,
+                    "kind_node_image": self.config.kind_node_image,
+                    "round": round_number,
+                    "revision_context": spec_revision_context,
+                }
+                spec_result = self._call_role(
+                    "spec_generator", task_id, round_number, spec_input
+                )
+                spec = spec_result.content
+            else:
+                spec = reusable_spec
+                reusable_spec = None
             _write_json(round_dir / "spec.json", spec)
             spec_errors = validate_spec(spec, self.config, task_id)
             if spec_errors:
                 last_errors = spec_errors
                 _write_json(round_dir / "deterministic_errors.json", spec_errors)
-                revision_context = {
+                spec_revision_context = {
+                    "instruction": "Edit the previous specification in place.",
+                    "preserve_public_requirement_count": len(
+                        spec.get("public_requirements", [])
+                    ),
                     "previous_spec": spec,
                     "deterministic_errors": spec_errors,
                 }
+                writer_revision_context = None
                 continue
 
             public_projection = {
@@ -284,6 +295,7 @@ class TaskAuthoringPipeline:
             writer_input = {
                 "public_specification": public_projection,
                 "round": round_number,
+                "revision_context": writer_revision_context,
             }
             writer_result = self._call_role(
                 "plaintext_writer", task_id, round_number, writer_input
@@ -294,10 +306,14 @@ class TaskAuthoringPipeline:
             if writer_errors:
                 last_errors = writer_errors
                 _write_json(round_dir / "deterministic_errors.json", writer_errors)
-                revision_context = {
-                    "previous_spec": spec,
+                reusable_spec = spec
+                spec_revision_context = None
+                writer_revision_context = {
                     "previous_public_text": writer.get("task_text"),
                     "deterministic_errors": writer_errors,
+                    "instruction": (
+                        "Revise the public text only; preserve every specification detail."
+                    ),
                 }
                 continue
 
@@ -333,12 +349,17 @@ class TaskAuthoringPipeline:
                     ],
                 }
 
-            revision_context = {
+            spec_revision_context = {
+                "instruction": "Edit the previous specification in place.",
+                "preserve_public_requirement_count": len(
+                    spec.get("public_requirements", [])
+                ),
                 "previous_spec": spec,
-                "previous_public_text": writer["task_text"],
-                "critic_review": critic,
-                "deterministic_errors": last_errors,
+                "critic_revision_instructions": critic.get(
+                    "revision_instructions", []
+                ),
             }
+            writer_revision_context = None
 
         return {
             "task_id": task_id,

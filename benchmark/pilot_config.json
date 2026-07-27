@@ -1,6 +1,6 @@
 {
   "api_base": "https://openrouter.ai/api/v1",
-  "budget_usd": 1.75,
+  "budget_usd": 1.90,
   "task_count": 2,
   "max_task_count": 3,
   "max_revision_rounds": 1,
@@ -12,7 +12,7 @@
       "model": "anthropic/claude-sonnet-5",
       "input_usd_per_million": 3.0,
       "output_usd_per_million": 15.0,
-      "max_output_tokens": 8000,
+      "max_output_tokens": 10000,
       "reasoning_effort": "high",
       "prompt": "benchmark/prompts/spec_generator.txt"
     },

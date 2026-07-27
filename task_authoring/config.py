@@ -85,7 +85,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
         if root not in prompt_path.parents or not prompt_path.is_file():
             raise ConfigError(f"Invalid prompt path for {role_name}: {prompt_path}")
         max_tokens = int(item["max_output_tokens"])
-        if not 256 <= max_tokens <= 8000:
+        if not 256 <= max_tokens <= 12000:
             raise ConfigError(f"Unreasonable max_output_tokens for {role_name}")
         roles[role_name] = RoleConfig(
             name=role_name,
