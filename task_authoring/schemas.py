@@ -73,7 +73,7 @@ SPEC_SCHEMA: dict[str, Any] = {
         "properties": {
             "task_id": {"type": "string", "pattern": "^pilot-[0-9]{3}$"},
             "title": {"type": "string", "minLength": 8, "maxLength": 100},
-            "scenario": {"type": "string", "minLength": 80, "maxLength": 1000},
+            "scenario": {"type": "string", "minLength": 80, "maxLength": 400},
             "target_kubernetes_version": {"type": "string", "const": "1.35"},
             "categories": {
                 "type": "array",
@@ -82,13 +82,15 @@ SPEC_SCHEMA: dict[str, Any] = {
             },
             "public_requirements": {
                 "type": "array",
+                "minItems": 12,
+                "maxItems": 14,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["id", "text", "depends_on", "verification"],
                     "properties": {
                         "id": {"type": "string", "pattern": "^R[0-9]{2}$"},
-                        "text": {"type": "string", "minLength": 20, "maxLength": 500},
+                        "text": {"type": "string", "minLength": 20, "maxLength": 300},
                         "depends_on": {
                             "type": "array",
                             "uniqueItems": True,
@@ -114,19 +116,27 @@ SPEC_SCHEMA: dict[str, Any] = {
             },
             "runtime_behaviors": {
                 "type": "array",
-                "items": {"type": "string", "minLength": 20, "maxLength": 400},
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "string", "minLength": 20, "maxLength": 150},
             },
             "safety_constraints": {
                 "type": "array",
-                "items": {"type": "string", "minLength": 15, "maxLength": 300},
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {"type": "string", "minLength": 15, "maxLength": 150},
             },
             "hardness_rationale": {
                 "type": "array",
-                "items": {"type": "string", "minLength": 20, "maxLength": 400},
+                "minItems": 4,
+                "maxItems": 4,
+                "items": {"type": "string", "minLength": 20, "maxLength": 160},
             },
             "likely_failure_modes": {
                 "type": "array",
-                "items": {"type": "string", "minLength": 20, "maxLength": 400},
+                "minItems": 4,
+                "maxItems": 4,
+                "items": {"type": "string", "minLength": 20, "maxLength": 160},
             },
         },
     },
@@ -141,7 +151,7 @@ WRITER_SCHEMA: dict[str, Any] = {
         "additionalProperties": False,
         "required": ["task_text", "covered_requirement_ids"],
         "properties": {
-            "task_text": {"type": "string", "minLength": 600, "maxLength": 7000},
+            "task_text": {"type": "string", "minLength": 600, "maxLength": 5000},
             "covered_requirement_ids": {
                 "type": "array",
                 "uniqueItems": True,
@@ -474,8 +484,8 @@ def validate_writer(writer: Any, spec: dict[str, Any]) -> list[str]:
     item = _require_mapping(writer, "writer output", errors)
     text = item.get("task_text")
     coverage = item.get("covered_requirement_ids")
-    if not isinstance(text, str) or not 600 <= len(text) <= 7000:
-        errors.append("public task text must contain 600-7000 characters")
+    if not isinstance(text, str) or not 600 <= len(text) <= 5000:
+        errors.append("public task text must contain 600-5000 characters")
     expected = {req["id"] for req in spec.get("public_requirements", [])}
     if not isinstance(coverage, list) or set(coverage) != expected or len(coverage) != len(expected):
         errors.append("writer coverage must contain every requirement ID exactly once")

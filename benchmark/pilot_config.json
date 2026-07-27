@@ -1,6 +1,6 @@
 {
   "api_base": "https://openrouter.ai/api/v1",
-  "budget_usd": 1.90,
+  "budget_usd": 1.75,
   "task_count": 2,
   "max_task_count": 3,
   "max_revision_rounds": 1,
@@ -12,7 +12,7 @@
       "model": "anthropic/claude-sonnet-5",
       "input_usd_per_million": 3.0,
       "output_usd_per_million": 15.0,
-      "max_output_tokens": 10000,
+      "max_output_tokens": 8000,
       "reasoning_effort": null,
       "reasoning_max_tokens": 3000,
       "prompt": "benchmark/prompts/spec_generator.txt"
@@ -39,7 +39,7 @@
   "hardness_gate": {
     "minimum_score": 8,
     "minimum_categories": 5,
-    "minimum_public_requirements": 10,
+    "minimum_public_requirements": 12,
     "minimum_resource_kinds": 6,
     "minimum_runtime_behaviors": 3,
     "minimum_dependency_edges": 5,
