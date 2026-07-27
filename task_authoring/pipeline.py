@@ -58,6 +58,7 @@ class TaskAuthoringPipeline:
         self.private_dir = self.run_dir / "private"
         self.usage_path = self.private_dir / "usage.jsonl"
         self._event_sequence = 0
+        self._unknown_cost_failures = 0
         self._usage_totals = self._new_usage_total()
         self._usage_by_role = {
             role_name: self._new_usage_total() for role_name in self.config.roles
@@ -133,6 +134,8 @@ class TaskAuthoringPipeline:
             if result.billable:
                 self.ledger.charge(result.cost_usd)
         except Exception as exc:
+            if self.client.billable:
+                self._unknown_cost_failures += 1
             self._log_event(
                 {
                     "task_id": task_id,
@@ -145,7 +148,7 @@ class TaskAuthoringPipeline:
                     "spent_so_far_usd": str(self.ledger.spent_usd),
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1000],
-                    "cost_unknown": True,
+                    "cost_unknown": self.client.billable,
                 }
             )
             raise
@@ -326,6 +329,8 @@ class TaskAuthoringPipeline:
             "mode": "paid" if self.client.billable else "offline-replay",
             "budget_cap_usd": str(self.ledger.cap_usd),
             "provider_reported_spend_usd": str(self.ledger.spent_usd),
+            "provider_cost_complete": self._unknown_cost_failures == 0,
+            "unknown_cost_failures": self._unknown_cost_failures,
             "usage_totals": self._usage_snapshot(self._usage_totals),
             "usage_by_role": {
                 role_name: self._usage_snapshot(total)

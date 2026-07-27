@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -217,6 +218,162 @@ ROLE_SCHEMAS = {
 }
 
 
+# Anthropic's structured-output grammar does not accept every validation keyword
+# that is useful to us locally. OpenRouter can route the same request through
+# several Anthropic providers, so send the common structural subset and retain the
+# complete schema for deterministic validation after the response is received.
+_PROVIDER_DESCRIPTION_CONSTRAINTS = {
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
+}
+
+
+def _constraint_description(keyword: str, value: Any) -> str:
+    descriptions = {
+        "minimum": f"Value must be at least {value}.",
+        "maximum": f"Value must be at most {value}.",
+        "exclusiveMinimum": f"Value must be greater than {value}.",
+        "exclusiveMaximum": f"Value must be less than {value}.",
+        "multipleOf": f"Value must be a multiple of {value}.",
+        "minLength": f"Length must be at least {value} characters.",
+        "maxLength": f"Length must be at most {value} characters.",
+        "pattern": f"Value must match this regular expression: {value}.",
+        "format": f"Value must use the {value} format.",
+        "minItems": f"Array must contain at least {value} items.",
+        "maxItems": f"Array must contain at most {value} items.",
+        "uniqueItems": "Array items must be unique.",
+        "minProperties": f"Object must contain at least {value} properties.",
+        "maxProperties": f"Object must contain at most {value} properties.",
+    }
+    return descriptions[keyword]
+
+
+def _provider_schema_node(node: Any) -> Any:
+    if not isinstance(node, dict):
+        return node
+    transformed: dict[str, Any] = {}
+    notes: list[str] = []
+    for key, value in node.items():
+        if key in _PROVIDER_DESCRIPTION_CONSTRAINTS:
+            if value is not False and value is not None:
+                notes.append(_constraint_description(key, value))
+            continue
+        if key == "properties":
+            transformed[key] = {
+                name: _provider_schema_node(child) for name, child in value.items()
+            }
+        elif key in {"items", "additionalProperties"} and isinstance(value, dict):
+            transformed[key] = _provider_schema_node(value)
+        elif key in {"anyOf", "allOf", "oneOf", "prefixItems"}:
+            transformed[key] = [_provider_schema_node(child) for child in value]
+        else:
+            transformed[key] = value
+    if notes:
+        existing = transformed.get("description", "").strip()
+        transformed["description"] = " ".join(filter(None, [existing, *notes]))
+    return transformed
+
+
+def provider_compatible_schema(schema_wrapper: dict[str, Any]) -> dict[str, Any]:
+    """Return an Anthropic/provider-compatible copy of an OpenRouter schema.
+
+    The original schema is never changed and remains the source of truth for local
+    response validation.
+    """
+    transformed = dict(schema_wrapper)
+    transformed["schema"] = _provider_schema_node(schema_wrapper["schema"])
+    return transformed
+
+
+def _json_schema_errors(value: Any, schema: dict[str, Any], path: str) -> list[str]:
+    errors: list[str] = []
+    expected_type = schema.get("type")
+    type_checks = {
+        "object": lambda item: isinstance(item, dict),
+        "array": lambda item: isinstance(item, list),
+        "string": lambda item: isinstance(item, str),
+        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+        "number": lambda item: isinstance(item, (int, float))
+        and not isinstance(item, bool),
+        "boolean": lambda item: isinstance(item, bool),
+        "null": lambda item: item is None,
+    }
+    if expected_type in type_checks and not type_checks[expected_type](value):
+        return [f"{path} must be of type {expected_type}"]
+
+    if "const" in schema and value != schema["const"]:
+        errors.append(f"{path} must equal {schema['const']!r}")
+    if "enum" in schema and value not in schema["enum"]:
+        errors.append(f"{path} is not an allowed value")
+
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        errors.extend(f"{path} is missing {key}" for key in required if key not in value)
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            errors.extend(
+                f"{path} contains unexpected property {key}"
+                for key in value
+                if key not in properties
+            )
+        for key, child_schema in properties.items():
+            if key in value:
+                errors.extend(
+                    _json_schema_errors(value[key], child_schema, f"{path}.{key}")
+                )
+
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            errors.append(f"{path} must contain at least {schema['minItems']} items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errors.append(f"{path} must contain at most {schema['maxItems']} items")
+        if schema.get("uniqueItems"):
+            fingerprints = [
+                json.dumps(item, ensure_ascii=False, sort_keys=True) for item in value
+            ]
+            if len(fingerprints) != len(set(fingerprints)):
+                errors.append(f"{path} items must be unique")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                errors.extend(
+                    _json_schema_errors(item, item_schema, f"{path}[{index}]")
+                )
+
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            errors.append(f"{path} is shorter than {schema['minLength']} characters")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            errors.append(f"{path} is longer than {schema['maxLength']} characters")
+        if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
+            errors.append(f"{path} does not match the required pattern")
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            errors.append(f"{path} must be at least {schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            errors.append(f"{path} must be at most {schema['maximum']}")
+    return errors
+
+
+def validate_schema_instance(
+    value: Any, schema_wrapper: dict[str, Any], label: str
+) -> list[str]:
+    return _json_schema_errors(value, schema_wrapper["schema"], label)
+
+
 def _require_mapping(value: Any, label: str, errors: list[str]) -> dict[str, Any]:
     if not isinstance(value, dict):
         errors.append(f"{label} must be an object")
@@ -225,7 +382,9 @@ def _require_mapping(value: Any, label: str, errors: list[str]) -> dict[str, Any
 
 
 def validate_spec(spec: Any, config: PilotConfig, task_id: str) -> list[str]:
-    errors: list[str] = []
+    errors = validate_schema_instance(spec, SPEC_SCHEMA, "spec")
+    if errors:
+        return errors
     item = _require_mapping(spec, "spec", errors)
     required = SPEC_SCHEMA["schema"]["required"]
     for field in required:
@@ -309,7 +468,9 @@ def validate_spec(spec: Any, config: PilotConfig, task_id: str) -> list[str]:
 
 
 def validate_writer(writer: Any, spec: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
+    errors = validate_schema_instance(writer, WRITER_SCHEMA, "writer output")
+    if errors:
+        return errors
     item = _require_mapping(writer, "writer output", errors)
     text = item.get("task_text")
     coverage = item.get("covered_requirement_ids")
@@ -339,7 +500,9 @@ def validate_writer(writer: Any, spec: dict[str, Any]) -> list[str]:
 def validate_critic(
     critic: Any, spec: dict[str, Any], config: PilotConfig
 ) -> list[str]:
-    errors: list[str] = []
+    errors = validate_schema_instance(critic, CRITIC_SCHEMA, "critic output")
+    if errors:
+        return errors
     item = _require_mapping(critic, "critic output", errors)
     required_ids = {req["id"] for req in spec.get("public_requirements", [])}
     score = item.get("hardness_score")

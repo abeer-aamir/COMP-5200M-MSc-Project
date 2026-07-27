@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .config import HARD_MAX_BUDGET_USD, RoleConfig
+from .schemas import provider_compatible_schema
 
 
 class ProviderError(RuntimeError):
@@ -214,7 +215,10 @@ class OpenRouterClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "response_format": {"type": "json_schema", "json_schema": schema},
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": provider_compatible_schema(schema),
+            },
             "max_tokens": role.max_output_tokens,
             "provider": {
                 "require_parameters": True,
