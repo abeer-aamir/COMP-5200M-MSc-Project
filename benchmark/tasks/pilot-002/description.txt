@@ -1,0 +1,62 @@
+Please build a small config-driven worker pipeline in a namespace called
+`pipeline-ns`. Keep all application resources there, apart from the Namespace
+object. This will run on a single-node kind Kubernetes 1.35 cluster with a
+NetworkPolicy-capable CNI and no workload internet access. You can rely on
+`busybox:1.36.1` already being loaded on the node.
+
+Create a ConfigMap named `pipeline-config` containing `WORKER_COUNT=3` and
+`POLL_INTERVAL=5`. Mount it as a ConfigMap volume at `/etc/pipeline` in both the
+controller and worker pods. Also create `pipeline-secret` with the placeholder
+value `API_TOKEN=pilot-token`. The controller must receive that key through an
+environment variable; do not mount this Secret as a file anywhere.
+
+The workers should be a StatefulSet named `worker`, with exactly 3 replicas
+labelled `role=worker`, and `serviceName: worker-svc`. Create `worker-svc` as a
+headless Service on TCP 8080. Use a volume claim template called `worker-data`,
+1Gi per pod with `ReadWriteOnce`, mounted at `/data`. Each worker needs an init
+container which stays in its init phase until `/data/ready` exists. Once it can
+start, the main worker container should listen on 8080 and return success at
+`/health`; BusyBox httpd is enough.
+
+The marker producer is a CronJob named `marker-job`, scheduled every 2 minutes.
+Because StatefulSet claims have predictable names, its pod should mount these
+three existing claims:
+
+- `worker-data-worker-0` at `/worker-data/0`
+- `worker-data-worker-1` at `/worker-data/1`
+- `worker-data-worker-2` at `/worker-data/2`
+
+It should create a `ready` file in all three mount paths and complete in less
+than 60 seconds; set `activeDeadlineSeconds` to 60 or less. This PVC sharing is
+intentional and the cluster has only one node, so all four pods use the same
+node. Do not create replacement PVCs for the CronJob.
+
+Create a Deployment called `controller` with exactly 1 replica and label its
+pod `role=controller`. It should use ServiceAccount `controller-sa` and remain
+running with a small BusyBox process. Its readiness probe must be an `exec`
+check performed from inside the controller pod. On every check, try the three
+stable worker addresses (`worker-0.worker-svc`, `worker-1.worker-svc`, and
+`worker-2.worker-svc`) at `/health` on port 8080, count the successful replies,
+and succeed only when at least 2 workers answer. Do not use a single HTTP probe
+against the Service and assume that means two workers are healthy.
+
+Bind `controller-sa` through a namespaced Role and RoleBinding which grant only
+`get` and `list` for Pods and Services. The controller does not need permission
+to change anything. Controller and worker containers, including init
+containers, must run as non-root user 1000, use read-only root filesystems, and
+drop all Linux capabilities. Use `emptyDir` where the small HTTP process needs a
+writable directory.
+
+Add a NetworkPolicy called `restrict-worker`: worker pods should accept TCP
+8080 only from pods labelled `role=controller`, and other ingress should be
+denied. Add `restrict-egress` for the controller as well. It may contact worker
+pods on TCP 8080 and use cluster DNS on TCP/UDP 53, but it should have no other
+egress. Express the worker destination using pod selectors, since a normal
+Kubernetes NetworkPolicy does not select a Service object.
+
+Create `worker-pdb` with `minAvailable: 2`. The finished system should also have
+the dynamic behavior implied above: if the worker StatefulSet is scaled down to
+one replica, the controller must become NotReady; after the workers are restored
+and healthy, it should become Ready again.
+
+Return one complete multi-document YAML configuration and no explanation.

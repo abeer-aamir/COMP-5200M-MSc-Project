@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "kubernetes_version": "1.35",
+  "execution_image": "busybox:1.36.1",
+  "tasks": [
+    {
+      "task_id": "pilot-001",
+      "namespace": "order-system",
+      "description": "benchmark/tasks/pilot-001/description.txt",
+      "post_execution_suite": "pilot-001"
+    },
+    {
+      "task_id": "pilot-002",
+      "namespace": "pipeline-ns",
+      "description": "benchmark/tasks/pilot-002/description.txt",
+      "post_execution_suite": "pilot-002"
+    }
+  ]
+}

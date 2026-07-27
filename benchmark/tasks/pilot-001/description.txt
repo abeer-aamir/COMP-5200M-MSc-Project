@@ -1,0 +1,81 @@
+I need an order-processing stack in Kubernetes. Keep the whole application in
+one namespace called `order-system` (apart from the Namespace object itself),
+and use only normal built-in Kubernetes resources. The cluster is a single-node
+kind cluster on Kubernetes 1.35, it will not have internet access, and
+`busybox:1.36.1` is already loaded for the small HTTP and connectivity helpers.
+
+The cache should be a StatefulSet called `cache`, with 2 replicas and pods
+labelled `role=cache`. Give it a headless Service called `cache-headless` on TCP
+6379. Each cache pod needs its own 1Gi `ReadWriteOnce` claim from a volume claim
+template named `cache-data`, mounted at `/data`. The cache containers should
+actually listen on 6379 and return a successful response for `/health`; a small
+BusyBox httpd is fine for this.
+
+The API should be a Deployment called `api`, with 3 replicas labelled
+`role=api`, using port 8080. It should serve a simple successful `/health`
+response. Its readiness check has to run inside the API container and must fail
+until `cache-0.cache-headless` resolves and its `/health` endpoint can be reached
+on port 6379. Also give the API an init container which waits for both
+`cache-0.cache-headless` and `cache-1.cache-headless` to resolve and answer on
+6379 before the main container starts. In other words, do these checks through
+normal pod DNS and network traffic, not by asking the Kubernetes API for the
+StatefulSet status.
+
+Create `api-config` with these exact entries and expose it to the API as
+environment variables:
+
+```
+APP_MODE=production
+CACHE_HOST=cache-headless
+CACHE_PORT=6379
+```
+
+Create `api-credentials` with a placeholder key `API_KEY=pilot-token`. Project
+that Secret into the API at `/etc/api/secrets`, with file mode `0440`; it should
+not also appear as an environment variable. Expose the API using a ClusterIP
+Service called `api-svc`, with service port 80 targeting container port 8080.
+
+Use a ServiceAccount called `api-sa` only for the API pods. Its namespaced Role
+and RoleBinding should allow exactly `get`, `list`, and `watch` for Pods and
+ConfigMaps. It must not get write access, Secret access, or permissions for
+other resource kinds.
+
+Network access should be deliberately tight. API pods may use DNS on TCP/UDP
+53 and contact cache pods on TCP 6379, but should have no other egress. Cache
+pods should accept TCP 6379 only from pods labelled `role=api` or
+`role=reconciler`, with other ingress denied. The reconciliation job below must
+use `role=reconciler`; do not leave a broad exception just to make it work.
+
+Run the API and cache pod containers, including init containers, as non-root
+user 1000. Their container filesystems should be read-only and every container
+must drop all Linux capabilities. Writable paths needed by the tiny servers can
+use `emptyDir` volumes.
+
+Add a CronJob called `cache-reconciler`, scheduled every 5 minutes. A Job from
+it should check both stable cache pod addresses over port 6379 and exit non-zero
+if either cache replica is unavailable. It should finish normally when both are
+healthy. Set its Job template to `backoffLimit: 0` and give it an
+`activeDeadlineSeconds` no greater than 60, so a bad reconciliation does not sit
+around retrying. Add one PodDisruptionBudget for the API with `minAvailable: 2`,
+and one for the cache with `minAvailable: 1`.
+
+I also want the generated Deployment to be rollout-sensitive to its config,
+without pretending that a plain ConfigMap watches and restarts pods by itself.
+Put an annotation named `checksum/api-config` on the API pod template. Its value
+must be the lowercase SHA-256 hex digest of these UTF-8 bytes, including the
+final newline and this exact key order:
+
+```
+APP_MODE=production
+CACHE_HOST=cache-headless
+CACHE_PORT=6379
+```
+
+That way, regenerating and applying the manifests after a config change will
+change the pod template and cause a normal Deployment rollout.
+
+Finally, add a ResourceQuota in `order-system` that caps Pods at 10 and total
+requested PVC storage at 5Gi. Everything above, including a reconciliation Job
+and a normal API rolling update, has to fit inside those limits.
+
+Return one complete multi-document YAML configuration and no explanation.
