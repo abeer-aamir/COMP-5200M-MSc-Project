@@ -45,17 +45,55 @@ class TaskAuthoringPipeline:
         client: CompletionClient,
         output_root: Path | str,
         budget_cap_usd: Decimal | None = None,
+        key_budget_context: dict[str, Any] | None = None,
     ):
         self.config = config
         self.client = client
         self.output_root = Path(output_root)
         self.ledger = BudgetLedger(budget_cap_usd or config.budget_usd)
+        self.key_budget_context = key_budget_context
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.run_dir = self.output_root / self.run_id
         self.public_dir = self.run_dir / "public"
         self.private_dir = self.run_dir / "private"
         self.usage_path = self.private_dir / "usage.jsonl"
         self._event_sequence = 0
+        self._usage_totals = self._new_usage_total()
+        self._usage_by_role = {
+            role_name: self._new_usage_total() for role_name in self.config.roles
+        }
+
+    @staticmethod
+    def _new_usage_total() -> dict[str, Any]:
+        return {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "cost_usd": Decimal("0"),
+        }
+
+    def _record_usage(self, role_name: str, result: ChatResult) -> None:
+        for total in (self._usage_totals, self._usage_by_role[role_name]):
+            total["requests"] += 1
+            total["prompt_tokens"] += result.prompt_tokens
+            total["completion_tokens"] += result.completion_tokens
+            total["reasoning_tokens"] += result.reasoning_tokens
+            total["cached_tokens"] += result.cached_tokens
+            total["cost_usd"] += result.cost_usd
+
+    @staticmethod
+    def _usage_snapshot(total: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "requests": total["requests"],
+            "prompt_tokens": total["prompt_tokens"],
+            "completion_tokens": total["completion_tokens"],
+            "total_tokens": total["prompt_tokens"] + total["completion_tokens"],
+            "reasoning_tokens": total["reasoning_tokens"],
+            "cached_tokens": total["cached_tokens"],
+            "cost_usd": str(total["cost_usd"]),
+        }
 
     def _log_event(self, event: dict[str, Any]) -> None:
         self._event_sequence += 1
@@ -112,6 +150,8 @@ class TaskAuthoringPipeline:
             )
             raise
 
+        self._record_usage(role_name, result)
+
         self._log_event(
             {
                 "task_id": task_id,
@@ -161,6 +201,7 @@ class TaskAuthoringPipeline:
             "kind_node_image": self.config.kind_node_image,
             "models": roles,
             "hardness_gate": self.config.hardness_gate,
+            "openrouter_key_budget_context": self.key_budget_context,
         }
 
     def _generate_task(self, task_index: int, brief: str) -> dict[str, Any]:
@@ -285,6 +326,12 @@ class TaskAuthoringPipeline:
             "mode": "paid" if self.client.billable else "offline-replay",
             "budget_cap_usd": str(self.ledger.cap_usd),
             "provider_reported_spend_usd": str(self.ledger.spent_usd),
+            "usage_totals": self._usage_snapshot(self._usage_totals),
+            "usage_by_role": {
+                role_name: self._usage_snapshot(total)
+                for role_name, total in self._usage_by_role.items()
+            },
+            "openrouter_key_budget_context": self.key_budget_context,
             "accepted_tasks": sum(x.get("status") == "accepted" for x in task_results),
             "requested_tasks": self.config.task_count,
             "tasks": task_results,

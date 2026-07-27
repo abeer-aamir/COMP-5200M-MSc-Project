@@ -26,6 +26,7 @@ class RoleConfig:
     input_usd_per_million: Decimal
     output_usd_per_million: Decimal
     max_output_tokens: int
+    reasoning_effort: str | None
     prompt_path: Path
 
 
@@ -96,8 +97,13 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
                 item["output_usd_per_million"], f"{role_name} output price"
             ),
             max_output_tokens=max_tokens,
+            reasoning_effort=item.get("reasoning_effort"),
             prompt_path=prompt_path,
         )
+        if roles[role_name].reasoning_effort not in {None, "low", "medium", "high"}:
+            raise ConfigError(
+                f"reasoning_effort for {role_name} must be null, low, medium, or high"
+            )
 
     gate = raw.get("hardness_gate", {})
     required_gate_fields = {

@@ -103,23 +103,38 @@ class BudgetLedger:
         self.spent_usd = new_total
 
 
-def validate_key_limit(key_data: dict[str, Any], requested_cap: Decimal) -> Decimal:
+def key_budget_context(key_data: dict[str, Any]) -> dict[str, Any]:
+    """Return non-secret account budget fields for provenance and review."""
     data = key_data.get("data", key_data)
-    limit = data.get("limit")
+    fields = (
+        "limit",
+        "limit_remaining",
+        "limit_reset",
+        "usage",
+        "usage_daily",
+        "usage_weekly",
+        "usage_monthly",
+    )
+    return {field: data.get(field) for field in fields}
+
+
+def derive_effective_local_cap(
+    key_data: dict[str, Any], requested_cap: Decimal
+) -> Decimal:
+    """Keep the local run cap even when the OpenRouter account cap is larger.
+
+    A reported remaining allowance can only tighten the local cap. An absent or larger
+    account/key limit is accepted because the per-request ledger and max_price routing
+    controls enforce this pilot's much smaller budget.
+    """
+    data = key_data.get("data", key_data)
     remaining = data.get("limit_remaining")
-    if limit is None:
-        raise BudgetError("OpenRouter key has no spending limit; create a capped pilot key")
-    limit_decimal = Decimal(str(limit))
-    if limit_decimal > HARD_MAX_BUDGET_USD:
-        raise BudgetError(
-            f"OpenRouter key limit is ${limit_decimal}; it must be at most $3.00"
-        )
     if remaining is None:
-        raise BudgetError("OpenRouter did not report the key's remaining allowance")
+        return requested_cap
     remaining_decimal = Decimal(str(remaining))
     if remaining_decimal <= 0:
         raise BudgetError("OpenRouter key has no remaining allowance")
-    return min(requested_cap, remaining_decimal, limit_decimal)
+    return min(requested_cap, remaining_decimal)
 
 
 class OpenRouterClient:
@@ -197,10 +212,20 @@ class OpenRouterClient:
             "max_tokens": role.max_output_tokens,
             "provider": {
                 "require_parameters": True,
-                "allow_fallbacks": False,
+                "allow_fallbacks": True,
                 "data_collection": "deny",
+                "sort": "price",
+                "max_price": {
+                    "prompt": float(role.input_usd_per_million),
+                    "completion": float(role.output_usd_per_million),
+                },
             },
         }
+        if role.reasoning_effort is not None:
+            payload["reasoning"] = {
+                "effort": role.reasoning_effort,
+                "exclude": True,
+            }
         response, latency_ms, retries = self._request_json(
             "POST", "/chat/completions", payload
         )

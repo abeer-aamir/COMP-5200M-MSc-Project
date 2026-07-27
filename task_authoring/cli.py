@@ -9,7 +9,12 @@ from decimal import Decimal
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG_PATH, DEFAULT_ENV_PATH, PROJECT_ROOT, load_config, load_env_file
-from .openrouter import OpenRouterClient, ReplayClient, validate_key_limit
+from .openrouter import (
+    OpenRouterClient,
+    ReplayClient,
+    derive_effective_local_cap,
+    key_budget_context,
+)
 from .pipeline import TaskAuthoringPipeline
 
 
@@ -78,6 +83,7 @@ def _plan(config) -> dict[str, object]:
         "network_calls": 0,
         "paid_calls": 0,
         "configured_budget_usd": str(config.budget_usd),
+        "account_key_limit_policy": "larger or uncapped keys accepted; local cap remains authoritative",
         "task_count": config.task_count,
         "maximum_model_calls": calls_per_task * config.task_count,
         "conservative_role_reservation_usd": role_estimates,
@@ -113,9 +119,13 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(f"Add OPENROUTER_API_KEY to {DEFAULT_ENV_PATH}")
         client = OpenRouterClient(api_key, config.api_base)
         key_status = client.get_key_status()  # Free preflight; no model request.
-        effective_cap = validate_key_limit(key_status, config.budget_usd)
+        effective_cap = derive_effective_local_cap(key_status, config.budget_usd)
         pipeline = TaskAuthoringPipeline(
-            config, client, args.output_root, budget_cap_usd=effective_cap
+            config,
+            client,
+            args.output_root,
+            budget_cap_usd=effective_cap,
+            key_budget_context=key_budget_context(key_status),
         )
         summary = pipeline.run(brief)
         print(json.dumps(summary, indent=2))
