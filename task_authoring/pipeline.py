@@ -50,7 +50,9 @@ class TaskAuthoringPipeline:
         self.config = config
         self.client = client
         self.output_root = Path(output_root)
-        self.ledger = BudgetLedger(budget_cap_usd or config.budget_usd)
+        self.ledger = BudgetLedger(
+            config.budget_usd if budget_cap_usd is None else budget_cap_usd
+        )
         self.key_budget_context = key_budget_context
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.run_dir = self.output_root / self.run_id
@@ -178,7 +180,9 @@ class TaskAuthoringPipeline:
                     "status": "failed",
                     "requested_model": role.model,
                     "prompt_sha256": prompt_hash,
-                    "reservation_usd": str(reservation),
+                    "reservation_usd": (
+                        None if reservation is None else str(reservation)
+                    ),
                     "spent_so_far_usd": str(self.ledger.spent_usd),
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1000],
@@ -203,7 +207,7 @@ class TaskAuthoringPipeline:
                 "request_id": result.request_id,
                 "generation_id": result.generation_id,
                 "prompt_sha256": prompt_hash,
-                "reservation_usd": str(reservation),
+                "reservation_usd": None if reservation is None else str(reservation),
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.completion_tokens,
                 "reasoning_tokens": result.reasoning_tokens,
@@ -235,7 +239,9 @@ class TaskAuthoringPipeline:
             "config_path": str(self.config.path),
             "config_sha256": _sha256_text(self.config.path.read_text(encoding="utf-8")),
             "brief_sha256": _sha256_text(brief),
-            "budget_cap_usd": str(self.ledger.cap_usd),
+            "budget_cap_usd": (
+                None if self.ledger.cap_usd is None else str(self.ledger.cap_usd)
+            ),
             "target_kubernetes_version": self.config.target_kubernetes_version,
             "kind_node_image": self.config.kind_node_image,
             "models": roles,
@@ -384,7 +390,9 @@ class TaskAuthoringPipeline:
             "run_id": self.run_id,
             "status": status,
             "mode": "paid" if self.client.billable else "offline-replay",
-            "budget_cap_usd": str(self.ledger.cap_usd),
+            "budget_cap_usd": (
+                None if self.ledger.cap_usd is None else str(self.ledger.cap_usd)
+            ),
             "provider_reported_spend_usd": str(self.ledger.spent_usd),
             "provider_cost_complete": self._unknown_cost_failures == 0,
             "unknown_cost_failures": self._unknown_cost_failures,

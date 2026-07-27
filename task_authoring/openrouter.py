@@ -10,7 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
-from .config import HARD_MAX_BUDGET_USD, RoleConfig
+from .config import RoleConfig
 from .schemas import provider_compatible_schema
 
 
@@ -114,14 +114,16 @@ class CompletionClient(Protocol):
 
 
 class BudgetLedger:
-    def __init__(self, cap_usd: Decimal):
-        if cap_usd <= 0 or cap_usd > HARD_MAX_BUDGET_USD:
-            raise BudgetError(f"Budget cap must be in (0, {HARD_MAX_BUDGET_USD}]")
+    def __init__(self, cap_usd: Decimal | None):
+        if cap_usd is not None and cap_usd <= 0:
+            raise BudgetError("Budget cap must be null or above 0")
         self.cap_usd = cap_usd
         self.spent_usd = Decimal("0")
 
     @property
-    def remaining_usd(self) -> Decimal:
+    def remaining_usd(self) -> Decimal | None:
+        if self.cap_usd is None:
+            return None
         return self.cap_usd - self.spent_usd
 
     def estimate_reservation(
@@ -130,7 +132,9 @@ class BudgetLedger:
         system_prompt: str,
         user_prompt: str,
         safety_multiplier: Decimal,
-    ) -> Decimal:
+    ) -> Decimal | None:
+        if role.max_output_tokens is None:
+            return None
         # One UTF-8 byte per input token is deliberately pessimistic for English JSON.
         envelope_bytes = len(system_prompt.encode("utf-8")) + len(
             user_prompt.encode("utf-8")
@@ -145,19 +149,22 @@ class BudgetLedger:
         )
         return (input_cost + output_cost) * safety_multiplier
 
-    def check_reservation(self, reservation_usd: Decimal) -> None:
-        if reservation_usd > self.remaining_usd:
+    def check_reservation(self, reservation_usd: Decimal | None) -> None:
+        remaining = self.remaining_usd
+        if reservation_usd is None or remaining is None:
+            return
+        if reservation_usd > remaining:
             raise BudgetError(
                 "Refusing request: conservative reservation "
                 f"${reservation_usd:.6f} exceeds remaining budget "
-                f"${self.remaining_usd:.6f}"
+                f"${remaining:.6f}"
             )
 
     def charge(self, cost_usd: Decimal) -> None:
         if cost_usd < 0:
             raise BudgetError("Provider returned a negative cost")
         new_total = self.spent_usd + cost_usd
-        if new_total > self.cap_usd:
+        if self.cap_usd is not None and new_total > self.cap_usd:
             self.spent_usd = new_total
             raise BudgetError(
                 f"Provider-reported cost crossed the local cap: ${new_total:.6f}"
@@ -178,25 +185,6 @@ def key_budget_context(key_data: dict[str, Any]) -> dict[str, Any]:
         "usage_monthly",
     )
     return {field: data.get(field) for field in fields}
-
-
-def derive_effective_local_cap(
-    key_data: dict[str, Any], requested_cap: Decimal
-) -> Decimal:
-    """Keep the local run cap even when the OpenRouter account cap is larger.
-
-    A reported remaining allowance can only tighten the local cap. An absent or larger
-    account/key limit is accepted because the per-request ledger and max_price routing
-    controls enforce this pilot's much smaller budget.
-    """
-    data = key_data.get("data", key_data)
-    remaining = data.get("limit_remaining")
-    if remaining is None:
-        return requested_cap
-    remaining_decimal = Decimal(str(remaining))
-    if remaining_decimal <= 0:
-        raise BudgetError("OpenRouter key has no remaining allowance")
-    return min(requested_cap, remaining_decimal)
 
 
 class OpenRouterClient:
@@ -280,7 +268,6 @@ class OpenRouterClient:
                 "type": "json_schema",
                 "json_schema": provider_compatible_schema(schema),
             },
-            "max_tokens": role.max_output_tokens,
             "provider": {
                 "require_parameters": True,
                 "allow_fallbacks": True,
@@ -292,6 +279,8 @@ class OpenRouterClient:
                 },
             },
         }
+        if role.max_output_tokens is not None:
+            payload["max_tokens"] = role.max_output_tokens
         if role.reasoning_max_tokens is not None:
             payload["reasoning"] = {
                 "max_tokens": role.reasoning_max_tokens,

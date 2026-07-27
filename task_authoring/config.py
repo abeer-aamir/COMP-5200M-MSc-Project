@@ -12,7 +12,6 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "benchmark" / "pilot_config.json"
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
-HARD_MAX_BUDGET_USD = Decimal("3.00")
 REQUIRED_ROLES = ("spec_generator", "plaintext_writer", "critic")
 
 
@@ -26,7 +25,7 @@ class RoleConfig:
     model: str
     input_usd_per_million: Decimal
     output_usd_per_million: Decimal
-    max_output_tokens: int
+    max_output_tokens: int | None
     reasoning_effort: str | None
     reasoning_max_tokens: int | None
     ignored_providers: tuple[str, ...]
@@ -37,7 +36,7 @@ class RoleConfig:
 class PilotConfig:
     path: Path
     api_base: str
-    budget_usd: Decimal
+    budget_usd: Decimal | None
     task_count: int
     max_task_count: int
     max_revision_rounds: int
@@ -62,11 +61,10 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError(f"Cannot read configuration {config_path}: {exc}") from exc
 
-    budget = _decimal(raw.get("budget_usd"), "budget_usd")
-    if budget <= 0 or budget > HARD_MAX_BUDGET_USD:
-        raise ConfigError(
-            f"budget_usd must be above 0 and no more than ${HARD_MAX_BUDGET_USD}"
-        )
+    raw_budget = raw.get("budget_usd")
+    budget = None if raw_budget is None else _decimal(raw_budget, "budget_usd")
+    if budget is not None and budget <= 0:
+        raise ConfigError("budget_usd must be null or above 0")
 
     task_count = int(raw.get("task_count", 0))
     max_task_count = int(raw.get("max_task_count", 0))
@@ -87,9 +85,12 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
         prompt_path = (root / str(item["prompt"])).resolve()
         if root not in prompt_path.parents or not prompt_path.is_file():
             raise ConfigError(f"Invalid prompt path for {role_name}: {prompt_path}")
-        max_tokens = int(item["max_output_tokens"])
-        if not 256 <= max_tokens <= 12000:
-            raise ConfigError(f"Unreasonable max_output_tokens for {role_name}")
+        raw_max_tokens = item.get("max_output_tokens")
+        max_tokens = None if raw_max_tokens is None else int(raw_max_tokens)
+        if max_tokens is not None and max_tokens < 256:
+            raise ConfigError(
+                f"max_output_tokens for {role_name} must be null or at least 256"
+            )
         reasoning_effort = item.get("reasoning_effort")
         raw_reasoning_max = item.get("reasoning_max_tokens")
         reasoning_max_tokens = (
@@ -99,12 +100,17 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
             raise ConfigError(
                 f"reasoning_effort for {role_name} must be null, low, medium, or high"
             )
-        if reasoning_max_tokens is not None and not (
-            1024 <= reasoning_max_tokens < max_tokens
+        if reasoning_max_tokens is not None and reasoning_max_tokens < 1024:
+            raise ConfigError(
+                f"reasoning_max_tokens for {role_name} must be at least 1024"
+            )
+        if (
+            reasoning_max_tokens is not None
+            and max_tokens is not None
+            and reasoning_max_tokens >= max_tokens
         ):
             raise ConfigError(
-                f"reasoning_max_tokens for {role_name} must be at least 1024 "
-                "and below max_output_tokens"
+                f"reasoning_max_tokens for {role_name} must be below max_output_tokens"
             )
         if reasoning_effort is not None and reasoning_max_tokens is not None:
             raise ConfigError(

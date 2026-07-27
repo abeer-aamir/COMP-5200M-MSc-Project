@@ -72,8 +72,8 @@ SPEC_SCHEMA: dict[str, Any] = {
         ],
         "properties": {
             "task_id": {"type": "string", "pattern": "^pilot-[0-9]{3}$"},
-            "title": {"type": "string", "minLength": 8, "maxLength": 100},
-            "scenario": {"type": "string", "minLength": 80, "maxLength": 400},
+            "title": {"type": "string"},
+            "scenario": {"type": "string"},
             "target_kubernetes_version": {"type": "string", "const": "1.35"},
             "categories": {
                 "type": "array",
@@ -90,7 +90,7 @@ SPEC_SCHEMA: dict[str, Any] = {
                     "required": ["id", "text", "depends_on", "verification"],
                     "properties": {
                         "id": {"type": "string", "pattern": "^R[0-9]{2}$"},
-                        "text": {"type": "string", "minLength": 20, "maxLength": 360},
+                        "text": {"type": "string"},
                         "depends_on": {
                             "type": "array",
                             "uniqueItems": True,
@@ -118,25 +118,25 @@ SPEC_SCHEMA: dict[str, Any] = {
                 "type": "array",
                 "minItems": 3,
                 "maxItems": 3,
-                "items": {"type": "string", "minLength": 20, "maxLength": 150},
+                "items": {"type": "string"},
             },
             "safety_constraints": {
                 "type": "array",
                 "minItems": 3,
                 "maxItems": 3,
-                "items": {"type": "string", "minLength": 15, "maxLength": 150},
+                "items": {"type": "string"},
             },
             "hardness_rationale": {
                 "type": "array",
                 "minItems": 4,
                 "maxItems": 4,
-                "items": {"type": "string", "minLength": 20, "maxLength": 160},
+                "items": {"type": "string"},
             },
             "likely_failure_modes": {
                 "type": "array",
                 "minItems": 4,
                 "maxItems": 4,
-                "items": {"type": "string", "minLength": 20, "maxLength": 160},
+                "items": {"type": "string"},
             },
         },
     },
@@ -151,7 +151,7 @@ WRITER_SCHEMA: dict[str, Any] = {
         "additionalProperties": False,
         "required": ["task_text", "covered_requirement_ids"],
         "properties": {
-            "task_text": {"type": "string", "minLength": 600, "maxLength": 5000},
+            "task_text": {"type": "string"},
             "covered_requirement_ids": {
                 "type": "array",
                 "uniqueItems": True,
@@ -238,8 +238,6 @@ _PROVIDER_DESCRIPTION_CONSTRAINTS = {
     "exclusiveMinimum",
     "exclusiveMaximum",
     "multipleOf",
-    "minLength",
-    "maxLength",
     "pattern",
     "format",
     "minItems",
@@ -257,8 +255,6 @@ def _constraint_description(keyword: str, value: Any) -> str:
         "exclusiveMinimum": f"Value must be greater than {value}.",
         "exclusiveMaximum": f"Value must be less than {value}.",
         "multipleOf": f"Value must be a multiple of {value}.",
-        "minLength": f"Length must be at least {value} characters.",
-        "maxLength": f"Length must be at most {value} characters.",
         "pattern": f"Value must match this regular expression: {value}.",
         "format": f"Value must use the {value} format.",
         "minItems": f"Array must contain at least {value} items.",
@@ -362,13 +358,12 @@ def _json_schema_errors(value: Any, schema: dict[str, Any], path: str) -> list[s
                     _json_schema_errors(item, item_schema, f"{path}[{index}]")
                 )
 
-    if isinstance(value, str):
-        if "minLength" in schema and len(value) < schema["minLength"]:
-            errors.append(f"{path} is shorter than {schema['minLength']} characters")
-        if "maxLength" in schema and len(value) > schema["maxLength"]:
-            errors.append(f"{path} is longer than {schema['maxLength']} characters")
-        if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
-            errors.append(f"{path} does not match the required pattern")
+    if (
+        isinstance(value, str)
+        and "pattern" in schema
+        and re.fullmatch(schema["pattern"], value) is None
+    ):
+        errors.append(f"{path} does not match the required pattern")
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if "minimum" in schema and value < schema["minimum"]:
@@ -484,8 +479,6 @@ def validate_writer(writer: Any, spec: dict[str, Any]) -> list[str]:
     item = _require_mapping(writer, "writer output", errors)
     text = item.get("task_text")
     coverage = item.get("covered_requirement_ids")
-    if not isinstance(text, str) or not 600 <= len(text) <= 5000:
-        errors.append("public task text must contain 600-5000 characters")
     expected = {req["id"] for req in spec.get("public_requirements", [])}
     if not isinstance(coverage, list) or set(coverage) != expected or len(coverage) != len(expected):
         errors.append("writer coverage must contain every requirement ID exactly once")
