@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -28,6 +29,7 @@ class RoleConfig:
     max_output_tokens: int
     reasoning_effort: str | None
     reasoning_max_tokens: int | None
+    ignored_providers: tuple[str, ...]
     prompt_path: Path
 
 
@@ -108,6 +110,18 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
             raise ConfigError(
                 f"{role_name} cannot set both reasoning_effort and reasoning_max_tokens"
             )
+        raw_ignored_providers = item.get("ignored_providers", [])
+        if not isinstance(raw_ignored_providers, list) or any(
+            not isinstance(provider, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9/-]*", provider) is None
+            for provider in raw_ignored_providers
+        ):
+            raise ConfigError(
+                f"ignored_providers for {role_name} must be provider slug strings"
+            )
+        ignored_providers = tuple(raw_ignored_providers)
+        if len(set(ignored_providers)) != len(ignored_providers):
+            raise ConfigError(f"ignored_providers for {role_name} must be unique")
         roles[role_name] = RoleConfig(
             name=role_name,
             model=str(item["model"]),
@@ -120,6 +134,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
             max_output_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             reasoning_max_tokens=reasoning_max_tokens,
+            ignored_providers=ignored_providers,
             prompt_path=prompt_path,
         )
 

@@ -90,7 +90,7 @@ SPEC_SCHEMA: dict[str, Any] = {
                     "required": ["id", "text", "depends_on", "verification"],
                     "properties": {
                         "id": {"type": "string", "pattern": "^R[0-9]{2}$"},
-                        "text": {"type": "string", "minLength": 20, "maxLength": 300},
+                        "text": {"type": "string", "minLength": 20, "maxLength": 360},
                         "depends_on": {
                             "type": "array",
                             "uniqueItems": True,

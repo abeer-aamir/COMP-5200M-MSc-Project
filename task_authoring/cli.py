@@ -89,6 +89,11 @@ def _plan(config) -> dict[str, object]:
         "conservative_role_reservation_usd": role_estimates,
         "conservative_full_run_estimate_usd": f"{estimated:.6f}",
         "models": {name: role.model for name, role in config.roles.items()},
+        "ignored_providers": {
+            name: list(role.ignored_providers)
+            for name, role in config.roles.items()
+            if role.ignored_providers
+        },
         "target_kubernetes_version": config.target_kubernetes_version,
         "kind_node_image": config.kind_node_image,
     }

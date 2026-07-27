@@ -15,6 +15,7 @@
       "max_output_tokens": 8000,
       "reasoning_effort": null,
       "reasoning_max_tokens": 3000,
+      "ignored_providers": ["amazon-bedrock"],
       "prompt": "benchmark/prompts/spec_generator.txt"
     },
     "plaintext_writer": {
@@ -24,6 +25,7 @@
       "max_output_tokens": 2200,
       "reasoning_effort": null,
       "reasoning_max_tokens": null,
+      "ignored_providers": [],
       "prompt": "benchmark/prompts/plaintext_writer.txt"
     },
     "critic": {
@@ -33,6 +35,7 @@
       "max_output_tokens": 6000,
       "reasoning_effort": "medium",
       "reasoning_max_tokens": null,
+      "ignored_providers": [],
       "prompt": "benchmark/prompts/critic.txt"
     }
   },

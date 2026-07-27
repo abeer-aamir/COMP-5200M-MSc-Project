@@ -302,6 +302,8 @@ class OpenRouterClient:
                 "effort": role.reasoning_effort,
                 "exclude": True,
             }
+        if role.ignored_providers:
+            payload["provider"]["ignore"] = list(role.ignored_providers)
         response, latency_ms, retries = self._request_json(
             "POST", "/chat/completions", payload
         )
