@@ -1,0 +1,7 @@
+Create difficult, realistic Kubernetes configuration tasks for an experienced engineer. The task must be solvable in a local kind cluster using Kubernetes 1.35 and standard built-in resources. Keep every workload inside one namespace. Do not require cloud accounts, proprietary services, internet access from the cluster, custom operators, CRDs, Helm, or privileged containers.
+
+Difficulty must come from interacting requirements rather than trivia or sheer length. Each task should require several resource kinds, non-trivial configuration wiring, dependency ordering, security controls, and observable runtime behaviour. A one-file Deployment-and-Service answer must never be enough. Include enough precise public requirements to make the expected result testable without telling the solver how to implement it.
+
+Good sources of difficulty include ConfigMaps and Secrets projected in different ways, service discovery, init containers, probes, RBAC with least privilege, pod and container security contexts, NetworkPolicies, scheduling constraints, persistent state, Jobs, disruption behaviour, or rollout-sensitive configuration. Use only combinations that can be validated deterministically later.
+
+The public task description must not reveal private requirement identifiers, category labels, hardness scores, likely failure modes, authoring notes, reference manifests, validation commands, hidden tests, or solution hints.

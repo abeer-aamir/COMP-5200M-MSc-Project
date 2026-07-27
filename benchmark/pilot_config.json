@@ -1,0 +1,42 @@
+{
+  "api_base": "https://openrouter.ai/api/v1",
+  "budget_usd": 3.0,
+  "task_count": 2,
+  "max_task_count": 3,
+  "max_revision_rounds": 1,
+  "target_kubernetes_version": "1.35",
+  "kind_node_image": "kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f",
+  "reservation_safety_multiplier": 1.25,
+  "models": {
+    "spec_generator": {
+      "model": "anthropic/claude-sonnet-5",
+      "input_usd_per_million": 3.0,
+      "output_usd_per_million": 15.0,
+      "max_output_tokens": 4500,
+      "prompt": "benchmark/prompts/spec_generator.txt"
+    },
+    "plaintext_writer": {
+      "model": "google/gemini-3.5-flash-lite",
+      "input_usd_per_million": 0.3,
+      "output_usd_per_million": 2.5,
+      "max_output_tokens": 2200,
+      "prompt": "benchmark/prompts/plaintext_writer.txt"
+    },
+    "critic": {
+      "model": "openai/gpt-5.6-terra",
+      "input_usd_per_million": 2.5,
+      "output_usd_per_million": 15.0,
+      "max_output_tokens": 3200,
+      "prompt": "benchmark/prompts/critic.txt"
+    }
+  },
+  "hardness_gate": {
+    "minimum_score": 8,
+    "minimum_categories": 5,
+    "minimum_public_requirements": 10,
+    "minimum_resource_kinds": 6,
+    "minimum_runtime_behaviors": 3,
+    "minimum_dependency_edges": 5,
+    "minimum_safety_constraints": 3
+  }
+}

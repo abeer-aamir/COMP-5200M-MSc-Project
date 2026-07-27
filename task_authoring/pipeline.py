@@ -1,0 +1,299 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from .config import PilotConfig
+from .openrouter import BudgetLedger, ChatResult, CompletionClient
+from .schemas import (
+    ROLE_SCHEMAS,
+    acceptance_errors,
+    validate_critic,
+    validate_spec,
+    validate_writer,
+)
+
+
+class PipelineError(RuntimeError):
+    pass
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+class TaskAuthoringPipeline:
+    def __init__(
+        self,
+        config: PilotConfig,
+        client: CompletionClient,
+        output_root: Path | str,
+        budget_cap_usd: Decimal | None = None,
+    ):
+        self.config = config
+        self.client = client
+        self.output_root = Path(output_root)
+        self.ledger = BudgetLedger(budget_cap_usd or config.budget_usd)
+        self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.run_dir = self.output_root / self.run_id
+        self.public_dir = self.run_dir / "public"
+        self.private_dir = self.run_dir / "private"
+        self.usage_path = self.private_dir / "usage.jsonl"
+        self._event_sequence = 0
+
+    def _log_event(self, event: dict[str, Any]) -> None:
+        self._event_sequence += 1
+        enriched = {
+            "sequence": self._event_sequence,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "run_id": self.run_id,
+            **event,
+        }
+        self.usage_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.usage_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(enriched, ensure_ascii=False) + "\n")
+
+    def _call_role(
+        self,
+        role_name: str,
+        task_id: str,
+        round_number: int,
+        user_data: dict[str, Any],
+    ) -> ChatResult:
+        role = self.config.roles[role_name]
+        system_prompt = role.prompt_path.read_text(encoding="utf-8")
+        user_prompt = json.dumps(user_data, ensure_ascii=False, indent=2)
+        reservation = self.ledger.estimate_reservation(
+            role,
+            system_prompt,
+            user_prompt,
+            self.config.reservation_safety_multiplier,
+        )
+        if self.client.billable:
+            self.ledger.check_reservation(reservation)
+        prompt_hash = _sha256_text(system_prompt + "\n" + user_prompt)
+        try:
+            result = self.client.complete(
+                role, system_prompt, user_prompt, ROLE_SCHEMAS[role_name]
+            )
+            if result.billable:
+                self.ledger.charge(result.cost_usd)
+        except Exception as exc:
+            self._log_event(
+                {
+                    "task_id": task_id,
+                    "round": round_number,
+                    "role": role_name,
+                    "status": "failed",
+                    "requested_model": role.model,
+                    "prompt_sha256": prompt_hash,
+                    "reservation_usd": str(reservation),
+                    "spent_so_far_usd": str(self.ledger.spent_usd),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:1000],
+                    "cost_unknown": True,
+                }
+            )
+            raise
+
+        self._log_event(
+            {
+                "task_id": task_id,
+                "round": round_number,
+                "role": role_name,
+                "status": "completed",
+                "billable": result.billable,
+                "requested_model": result.requested_model,
+                "response_model": result.response_model,
+                "provider": result.provider,
+                "request_id": result.request_id,
+                "generation_id": result.generation_id,
+                "prompt_sha256": prompt_hash,
+                "reservation_usd": str(reservation),
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "reasoning_tokens": result.reasoning_tokens,
+                "cached_tokens": result.cached_tokens,
+                "cost_usd": str(result.cost_usd),
+                "spent_so_far_usd": str(self.ledger.spent_usd),
+                "latency_ms": result.latency_ms,
+                "retries": result.retries,
+            }
+        )
+        return result
+
+    def _provenance(self, brief: str) -> dict[str, Any]:
+        roles: dict[str, Any] = {}
+        for name, role in self.config.roles.items():
+            role_data = asdict(role)
+            role_data["input_usd_per_million"] = str(role.input_usd_per_million)
+            role_data["output_usd_per_million"] = str(role.output_usd_per_million)
+            role_data["prompt_path"] = str(role.prompt_path.relative_to(role.prompt_path.parents[2]))
+            role_data["prompt_sha256"] = _sha256_text(
+                role.prompt_path.read_text(encoding="utf-8")
+            )
+            roles[name] = role_data
+        return {
+            "run_id": self.run_id,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "mode": "paid" if self.client.billable else "offline-replay",
+            "config_path": str(self.config.path),
+            "config_sha256": _sha256_text(self.config.path.read_text(encoding="utf-8")),
+            "brief_sha256": _sha256_text(brief),
+            "budget_cap_usd": str(self.ledger.cap_usd),
+            "target_kubernetes_version": self.config.target_kubernetes_version,
+            "kind_node_image": self.config.kind_node_image,
+            "models": roles,
+            "hardness_gate": self.config.hardness_gate,
+        }
+
+    def _generate_task(self, task_index: int, brief: str) -> dict[str, Any]:
+        task_id = f"pilot-{task_index:03d}"
+        task_dir = self.private_dir / task_id
+        revision_context: dict[str, Any] | None = None
+        last_errors: list[str] = []
+
+        for round_number in range(self.config.max_revision_rounds + 1):
+            round_dir = task_dir / f"round-{round_number}"
+            spec_input = {
+                "task_id": task_id,
+                "authoring_brief": brief,
+                "target_kubernetes_version": self.config.target_kubernetes_version,
+                "kind_node_image": self.config.kind_node_image,
+                "round": round_number,
+                "revision_context": revision_context,
+            }
+            spec_result = self._call_role(
+                "spec_generator", task_id, round_number, spec_input
+            )
+            spec = spec_result.content
+            _write_json(round_dir / "spec.json", spec)
+            spec_errors = validate_spec(spec, self.config, task_id)
+            if spec_errors:
+                last_errors = spec_errors
+                _write_json(round_dir / "deterministic_errors.json", spec_errors)
+                revision_context = {
+                    "previous_spec": spec,
+                    "deterministic_errors": spec_errors,
+                }
+                continue
+
+            public_projection = {
+                "task_id": task_id,
+                "title": spec["title"],
+                "scenario": spec["scenario"],
+                "target_kubernetes_version": spec["target_kubernetes_version"],
+                "public_requirements": spec["public_requirements"],
+            }
+            writer_input = {
+                "public_specification": public_projection,
+                "round": round_number,
+            }
+            writer_result = self._call_role(
+                "plaintext_writer", task_id, round_number, writer_input
+            )
+            writer = writer_result.content
+            _write_json(round_dir / "writer.json", writer)
+            writer_errors = validate_writer(writer, spec)
+            if writer_errors:
+                last_errors = writer_errors
+                _write_json(round_dir / "deterministic_errors.json", writer_errors)
+                revision_context = {
+                    "previous_spec": spec,
+                    "previous_public_text": writer.get("task_text"),
+                    "deterministic_errors": writer_errors,
+                }
+                continue
+
+            critic_input = {
+                "private_specification": spec,
+                "proposed_public_task_text": writer["task_text"],
+                "hardness_gate": self.config.hardness_gate,
+                "round": round_number,
+            }
+            critic_result = self._call_role("critic", task_id, round_number, critic_input)
+            critic = critic_result.content
+            _write_json(round_dir / "critic.json", critic)
+            critic_shape_errors = validate_critic(critic, spec, self.config)
+            gate_errors = acceptance_errors(spec, writer, critic, self.config)
+            last_errors = sorted(set(critic_shape_errors + gate_errors))
+            _write_json(round_dir / "acceptance_errors.json", last_errors)
+            if not last_errors:
+                self.public_dir.mkdir(parents=True, exist_ok=True)
+                public_path = self.public_dir / f"{task_id}.txt"
+                public_path.write_text(writer["task_text"].strip() + "\n", encoding="utf-8")
+                _write_json(task_dir / "final_spec.json", spec)
+                _write_json(task_dir / "final_writer.json", writer)
+                _write_json(task_dir / "final_critic.json", critic)
+                return {
+                    "task_id": task_id,
+                    "status": "accepted",
+                    "round": round_number,
+                    "public_path": str(public_path),
+                    "hardness_score": critic["hardness_score"],
+                    "categories": [
+                        assignment["category"]
+                        for assignment in critic["category_assignments"]
+                    ],
+                }
+
+            revision_context = {
+                "previous_spec": spec,
+                "previous_public_text": writer["task_text"],
+                "critic_review": critic,
+                "deterministic_errors": last_errors,
+            }
+
+        return {
+            "task_id": task_id,
+            "status": "rejected",
+            "round": self.config.max_revision_rounds,
+            "errors": last_errors,
+        }
+
+    def run(self, brief: str) -> dict[str, Any]:
+        self.private_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(self.private_dir / "provenance.json", self._provenance(brief))
+        task_results: list[dict[str, Any]] = []
+        status = "completed"
+        fatal_error: dict[str, str] | None = None
+        try:
+            for task_index in range(1, self.config.task_count + 1):
+                task_results.append(self._generate_task(task_index, brief))
+        except Exception as exc:
+            status = "failed"
+            fatal_error = {"type": type(exc).__name__, "message": str(exc)}
+        summary = {
+            "run_id": self.run_id,
+            "status": status,
+            "mode": "paid" if self.client.billable else "offline-replay",
+            "budget_cap_usd": str(self.ledger.cap_usd),
+            "provider_reported_spend_usd": str(self.ledger.spent_usd),
+            "accepted_tasks": sum(x.get("status") == "accepted" for x in task_results),
+            "requested_tasks": self.config.task_count,
+            "tasks": task_results,
+            "fatal_error": fatal_error,
+        }
+        _write_json(self.private_dir / "summary.json", summary)
+        if fatal_error:
+            raise PipelineError(
+                f"Pilot failed; private summary retained at {self.private_dir / 'summary.json'}: "
+                f"{fatal_error['message']}"
+            )
+        return summary
