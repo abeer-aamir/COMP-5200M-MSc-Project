@@ -145,10 +145,16 @@ class OpenRouterClient:
         api_key: str,
         api_base: str,
         timeout_seconds: int = 120,
-        max_retries: int = 2,
+        max_retries: int = 1,
     ):
         if not api_key:
             raise ProviderError("OPENROUTER_API_KEY is empty")
+        if (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or not 0 <= max_retries <= 1
+        ):
+            raise ProviderError("max_retries must be 0 or 1 for this pilot")
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
         self.timeout_seconds = timeout_seconds
