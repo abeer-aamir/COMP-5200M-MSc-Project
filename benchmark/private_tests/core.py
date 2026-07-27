@@ -75,6 +75,7 @@ class Kubectl:
         namespace: str,
         kubeconfig: Path | None = None,
         command_timeout: int = 45,
+        executable: str | Path = "kubectl",
     ):
         if not context.strip():
             raise EvaluationError("an explicit kubectl context is required")
@@ -84,9 +85,10 @@ class Kubectl:
         self.namespace = namespace
         self.kubeconfig = kubeconfig
         self.command_timeout = command_timeout
+        self.executable = str(executable)
 
     def _base(self) -> list[str]:
-        command = ["kubectl", "--context", self.context]
+        command = [self.executable, "--context", self.context]
         if self.kubeconfig:
             command.extend(["--kubeconfig", str(self.kubeconfig)])
         return command

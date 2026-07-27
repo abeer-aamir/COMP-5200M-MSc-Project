@@ -1,0 +1,418 @@
+from __future__ import annotations
+
+import json
+import time
+import urllib.error
+import urllib.request
+from dataclasses import asdict, dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, Protocol
+
+from .config import ApiConfig
+
+
+class ProviderError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        transport_attempts: int = 0,
+        unknown_cost_attempts: int = 0,
+        audit_result: GenerationResult | None = None,
+    ):
+        super().__init__(message)
+        self.transport_attempts = transport_attempts
+        self.unknown_cost_attempts = unknown_cost_attempts
+        self.unknown_cost_possible = unknown_cost_attempts > 0
+        self.audit_result = audit_result
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    raw_text: str
+    requested_model: str
+    response_model: str
+    provider: str | None
+    generation_id: str | None
+    request_id: str | None
+    system_fingerprint: str | None
+    finish_reason: str | None
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    reasoning_tokens: int
+    cached_tokens: int
+    cost_usd: Decimal
+    cost_source: str
+    provider_cost_complete: bool
+    usage_complete: bool
+    usage_raw: dict[str, Any] | None
+    latency_ms: int
+    transport_retries: int
+    unobserved_billable_attempts: int
+    billable: bool
+
+    def audit_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value.pop("raw_text")
+        value["cost_usd"] = str(self.cost_usd)
+        return value
+
+
+class TextGenerationClient(Protocol):
+    billable: bool
+
+    def complete(self, system_prompt: str, user_prompt: str) -> GenerationResult:
+        ...
+
+
+def safe_key_budget_context(key_data: dict[str, Any]) -> dict[str, Any]:
+    """Retain only non-secret budget and usage fields from OpenRouter /key."""
+
+    data = key_data.get("data", key_data)
+    fields = (
+        "limit",
+        "limit_remaining",
+        "limit_reset",
+        "usage",
+        "usage_daily",
+        "usage_weekly",
+        "usage_monthly",
+    )
+    return {field: data.get(field) for field in fields}
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type", "text") == "text"
+        )
+    raise ProviderError("OpenRouter response content was not text")
+
+
+def _nonnegative_int(value: Any) -> tuple[int, bool]:
+    if isinstance(value, bool):
+        return 0, False
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0, False
+    return (parsed, True) if parsed >= 0 else (0, False)
+
+
+class OpenRouterTextClient:
+    billable = True
+
+    def __init__(
+        self,
+        api_key: str,
+        config: ApiConfig,
+        *,
+        timeout_seconds: int = 180,
+    ):
+        if not api_key:
+            raise ProviderError("OPENROUTER_API_KEY is empty")
+        self.api_key = api_key
+        self.config = config
+        self.timeout_seconds = timeout_seconds
+
+    def _request_json(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], int, int, str | None, int]:
+        url = f"{self.config.base_url}/{path.lstrip('/')}"
+        encoded = None if payload is None else json.dumps(payload).encode("utf-8")
+        started = time.monotonic()
+        last_error: Exception | None = None
+        uncertain_attempts = 0
+        attempts = self.config.transport_retries + 1
+        for attempt in range(attempts):
+            request = urllib.request.Request(
+                url,
+                data=encoded,
+                method=method,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://localhost/aipycraft-dissertation",
+                    "X-OpenRouter-Title": "AIPyCraft Kubernetes Baseline",
+                },
+            )
+            retry_after = 1.0
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout_seconds
+                ) as response:
+                    decoded = response.read().decode("utf-8")
+                    request_id = response.headers.get("x-request-id")
+                result = json.loads(decoded)
+                if not isinstance(result, dict):
+                    raise json.JSONDecodeError("response was not an object", decoded, 0)
+                return (
+                    result,
+                    round((time.monotonic() - started) * 1000),
+                    attempt,
+                    request_id,
+                    uncertain_attempts,
+                )
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                last_error = ProviderError(f"OpenRouter HTTP {exc.code}: {body[:1200]}")
+                header = exc.headers.get("Retry-After") if exc.headers else None
+                if header:
+                    try:
+                        retry_after = min(max(float(header), 1.0), 5.0)
+                    except ValueError:
+                        retry_after = 1.0
+                if exc.code not in {408, 409, 429, 500, 502, 503, 504}:
+                    break
+                if method.upper() == "POST" and exc.code == 408:
+                    uncertain_attempts += 1
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_error = exc
+                uncertain_attempts += int(method.upper() == "POST")
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                uncertain_attempts += int(method.upper() == "POST")
+            if attempt + 1 < attempts:
+                time.sleep(retry_after)
+        raise ProviderError(
+            f"OpenRouter request failed after {min(attempt + 1, attempts)} attempt(s): "
+            f"{last_error}",
+            transport_attempts=min(attempt + 1, attempts),
+            unknown_cost_attempts=uncertain_attempts,
+        ) from last_error
+
+    def get_key_status(self) -> dict[str, Any]:
+        data, _, _, _, _ = self._request_json("GET", "/key")
+        return data
+
+    def request_payload(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        return {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": self.config.temperature,
+            "stream": False,
+            "provider": {
+                "only": list(self.config.provider_only),
+                "allow_fallbacks": self.config.allow_fallbacks,
+                "require_parameters": True,
+                "data_collection": "deny",
+            },
+        }
+
+    def _audit_response(
+        self,
+        response: dict[str, Any],
+        *,
+        latency_ms: int,
+        retries: int,
+        header_request_id: str | None,
+        uncertain_attempts: int,
+    ) -> GenerationResult:
+        choices = response.get("choices")
+        choice = (
+            choices[0]
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            else {}
+        )
+        message = choice.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        try:
+            raw_text = _message_text(content)
+        except ProviderError:
+            raw_text = ""
+
+        usage_value = response.get("usage")
+        usage = usage_value if isinstance(usage_value, dict) else {}
+        prompt_tokens, prompt_ok = _nonnegative_int(usage.get("prompt_tokens"))
+        completion_tokens, completion_ok = _nonnegative_int(
+            usage.get("completion_tokens")
+        )
+        total_tokens, total_ok = _nonnegative_int(usage.get("total_tokens"))
+        if not total_ok:
+            total_tokens = prompt_tokens + completion_tokens
+        completion_details = usage.get("completion_tokens_details")
+        if not isinstance(completion_details, dict):
+            completion_details = {}
+        prompt_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = {}
+        reasoning_tokens, reasoning_ok = _nonnegative_int(
+            completion_details.get("reasoning_tokens", 0)
+        )
+        cached_tokens, cached_ok = _nonnegative_int(
+            prompt_details.get("cached_tokens", 0)
+        )
+        usage_complete = (
+            isinstance(usage_value, dict)
+            and prompt_ok
+            and completion_ok
+            and total_ok
+            and reasoning_ok
+            and cached_ok
+        )
+
+        provider_cost = usage.get("cost")
+        provider_cost_ok = False
+        if provider_cost is not None:
+            try:
+                cost = Decimal(str(provider_cost))
+                provider_cost_ok = cost.is_finite() and cost >= 0
+            except (InvalidOperation, ValueError):
+                provider_cost_ok = False
+            if not provider_cost_ok:
+                cost = Decimal("0")
+        else:
+            cost = Decimal("0")
+        if provider_cost_ok:
+            cost_source = "provider_reported"
+        else:
+            cost = (
+                Decimal(prompt_tokens) * self.config.input_usd_per_million
+                + Decimal(completion_tokens) * self.config.output_usd_per_million
+            ) / Decimal(1_000_000)
+            cost_source = "estimated_from_locked_prices"
+
+        generation_id = response.get("id")
+        response_model = response.get("model")
+        provider = response.get("provider")
+        fingerprint = response.get("system_fingerprint")
+        sanitized_usage = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "cost": usage.get("cost"),
+            "completion_tokens_details": completion_details,
+            "prompt_tokens_details": prompt_details,
+        }
+        return GenerationResult(
+            raw_text=raw_text,
+            requested_model=self.config.model,
+            response_model=str(response_model) if response_model is not None else "",
+            provider=str(provider) if provider is not None else None,
+            generation_id=str(generation_id) if generation_id is not None else None,
+            request_id=header_request_id
+            or (str(generation_id) if generation_id is not None else None),
+            system_fingerprint=(
+                str(fingerprint) if fingerprint is not None else None
+            ),
+            finish_reason=(
+                str(choice.get("finish_reason"))
+                if choice.get("finish_reason") is not None
+                else None
+            ),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            reasoning_tokens=reasoning_tokens,
+            cached_tokens=cached_tokens,
+            cost_usd=cost,
+            cost_source=cost_source,
+            provider_cost_complete=provider_cost_ok and uncertain_attempts == 0,
+            usage_complete=usage_complete,
+            usage_raw=sanitized_usage,
+            latency_ms=latency_ms,
+            transport_retries=retries,
+            unobserved_billable_attempts=uncertain_attempts,
+            billable=True,
+        )
+
+    def complete(self, system_prompt: str, user_prompt: str) -> GenerationResult:
+        payload = self.request_payload(system_prompt, user_prompt)
+        response, latency_ms, retries, header_request_id, uncertain_attempts = self._request_json(
+            "POST", "/chat/completions", payload
+        )
+        audit = self._audit_response(
+            response,
+            latency_ms=latency_ms,
+            retries=retries,
+            header_request_id=header_request_id,
+            uncertain_attempts=uncertain_attempts,
+        )
+
+        def reject(message: str) -> None:
+            raise ProviderError(
+                message,
+                transport_attempts=retries + 1,
+                audit_result=audit,
+            )
+
+        if response.get("error"):
+            reject(f"OpenRouter error response: {response['error']}")
+        choices = response.get("choices")
+        if (
+            not isinstance(choices, list)
+            or not choices
+            or not isinstance(choices[0], dict)
+        ):
+            reject("OpenRouter response contained no choices")
+        if audit.response_model != self.config.model:
+            reject(
+                f"Model substitution refused: requested {self.config.model}, "
+                f"got {audit.response_model or '<missing>'}"
+            )
+        if audit.provider is None or audit.provider.casefold() not in {
+            value.casefold() for value in self.config.provider_only
+        }:
+            reject(
+                "Provider substitution refused: requested "
+                f"{list(self.config.provider_only)}, got {audit.provider or '<missing>'}"
+            )
+        choice = choices[0]
+        try:
+            _message_text((choice.get("message") or {}).get("content"))
+        except (AttributeError, ProviderError) as exc:
+            reject(f"OpenRouter response content was not text: {exc}")
+        return audit
+
+
+class ReplayTextClient:
+    """Deterministic, no-network model replacement backed by ordered text files."""
+
+    billable = False
+
+    def __init__(self, fixture_dir: Path | str, model: str):
+        self.paths = sorted(Path(fixture_dir).glob("*.txt"))
+        if not self.paths:
+            raise ProviderError(f"No replay .txt files found in {fixture_dir}")
+        self.model = model
+        self.position = 0
+
+    def complete(self, system_prompt: str, user_prompt: str) -> GenerationResult:
+        del system_prompt, user_prompt
+        if self.position >= len(self.paths):
+            raise ProviderError("Replay fixtures exhausted")
+        path = self.paths[self.position]
+        self.position += 1
+        return GenerationResult(
+            raw_text=path.read_text(encoding="utf-8"),
+            requested_model=self.model,
+            response_model=self.model,
+            provider="offline-replay",
+            generation_id=f"replay-{self.position:03d}",
+            request_id=f"replay-{self.position:03d}",
+            system_fingerprint=None,
+            finish_reason="stop",
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            reasoning_tokens=0,
+            cached_tokens=0,
+            cost_usd=Decimal("0"),
+            cost_source="offline_replay",
+            provider_cost_complete=True,
+            usage_complete=True,
+            usage_raw=None,
+            latency_ms=0,
+            transport_retries=0,
+            unobserved_billable_attempts=0,
+            billable=False,
+        )
