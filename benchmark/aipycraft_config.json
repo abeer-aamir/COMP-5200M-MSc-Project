@@ -11,11 +11,15 @@
     "output_usd_per_million": "1.00"
   },
   "pipeline": {
-    "max_regenerations": 5,
+    "max_regenerations": 2,
     "runtime_observation_seconds": 30,
     "runtime_poll_seconds": 2,
     "command_timeout_seconds": 120,
     "output_root": "benchmark/aipycraft_runs"
+  },
+  "ai_validator": {
+    "enabled": true,
+    "feedback_mode": "detailed"
   },
   "environment": {
     "lock_file": "benchmark/environment/environment.lock.json",
@@ -24,6 +28,8 @@
   },
   "prompts": {
     "generate": "benchmark/prompts/aipycraft_k8s_generate.txt",
-    "regenerate": "benchmark/prompts/aipycraft_k8s_regenerate.txt"
+    "regenerate": "benchmark/prompts/aipycraft_k8s_regenerate.txt",
+    "validator_detailed": "benchmark/prompts/aipycraft_k8s_validate_detailed.txt",
+    "validator_verdict_only": "benchmark/prompts/aipycraft_k8s_validate_verdict.txt"
   }
 }

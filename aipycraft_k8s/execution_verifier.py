@@ -85,17 +85,18 @@ def run_execution_gate(
     *,
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    """Run generic operational checks whose failures may be sent for repair.
+    """Run generic operational checks as post-deployment ground truth.
 
     This stage deliberately knows no requirement IDs or task-specific expected
-    values. It checks only whether applied resources can become operational.
+    values. It checks only whether applied resources can become operational,
+    and its findings are never returned to the model for regeneration.
     """
 
     report: dict[str, Any] = {
         "task_id": task.task_id,
         "namespace": task.namespace,
         "status": "running",
-        "repair_on_failure": True,
+        "repair_on_failure": False,
         "task_specific": False,
         "checks": [],
         "failures": [],

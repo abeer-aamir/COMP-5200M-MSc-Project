@@ -16,7 +16,7 @@ FROZEN_MODEL = "qwen/qwen3-coder"
 FROZEN_PROVIDERS = ("deepinfra",)
 FROZEN_INPUT_PRICE = Decimal("0.30")
 FROZEN_OUTPUT_PRICE = Decimal("1.00")
-FROZEN_MAX_REGENERATIONS = 5
+FROZEN_MAX_REGENERATIONS = 2
 
 
 class ConfigError(ValueError):
@@ -42,6 +42,12 @@ class PipelineSettings:
     runtime_poll_seconds: float
     command_timeout_seconds: int
     output_root: Path
+
+
+@dataclass(frozen=True)
+class AiValidatorConfig:
+    enabled: bool
+    feedback_mode: str
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,8 @@ class EnvironmentConfig:
 class PromptConfig:
     generate: Path
     regenerate: Path
+    validator_detailed: Path
+    validator_verdict_only: Path
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,7 @@ class AppConfig:
     path: Path
     api: ApiConfig
     pipeline: PipelineSettings
+    ai_validator: AiValidatorConfig
     environment: EnvironmentConfig
     prompts: PromptConfig
 
@@ -299,7 +308,14 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     raw = _read_object(config_path)
     _exact_keys(
         raw,
-        {"schema_version", "api", "pipeline", "environment", "prompts"},
+        {
+            "schema_version",
+            "api",
+            "pipeline",
+            "ai_validator",
+            "environment",
+            "prompts",
+        },
         "configuration",
     )
     if raw["schema_version"] != 1:
@@ -334,7 +350,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         raise ConfigError(f"The frozen baseline model must be {FROZEN_MODEL}")
     normalized_providers = tuple(item.strip().lower() for item in providers)
     if normalized_providers != FROZEN_PROVIDERS:
-        raise ConfigError("The frozen baseline provider must be Cloudflare only")
+        raise ConfigError("The frozen baseline provider must be DeepInfra only")
     if api["allow_fallbacks"] is not False:
         raise ConfigError("Frozen experiments require allow_fallbacks=false")
     retries = api["transport_retries"]
@@ -372,6 +388,17 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         if isinstance(pipeline[key], bool) or float(pipeline[key]) <= 0:
             raise ConfigError(f"pipeline.{key} must be above zero")
 
+    ai_validator = _exact_keys(
+        raw["ai_validator"], {"enabled", "feedback_mode"}, "ai_validator"
+    )
+    if not isinstance(ai_validator["enabled"], bool):
+        raise ConfigError("ai_validator.enabled must be true or false")
+    feedback_mode = ai_validator["feedback_mode"]
+    if feedback_mode not in {"detailed", "verdict_only"}:
+        raise ConfigError(
+            "ai_validator.feedback_mode must be detailed or verdict_only"
+        )
+
     environment = _exact_keys(
         raw["environment"], {"lock_file", "kind_config", "cache_root"}, "environment"
     )
@@ -380,7 +407,16 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     cache_root = _project_path(
         environment["cache_root"], "environment.cache_root", must_exist=False
     )
-    prompts = _exact_keys(raw["prompts"], {"generate", "regenerate"}, "prompts")
+    prompts = _exact_keys(
+        raw["prompts"],
+        {
+            "generate",
+            "regenerate",
+            "validator_detailed",
+            "validator_verdict_only",
+        },
+        "prompts",
+    )
 
     return AppConfig(
         path=config_path,
@@ -403,6 +439,10 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
                 pipeline["output_root"], "pipeline.output_root", must_exist=False
             ),
         ),
+        ai_validator=AiValidatorConfig(
+            enabled=ai_validator["enabled"],
+            feedback_mode=str(feedback_mode),
+        ),
         environment=EnvironmentConfig(
             lock=load_environment_lock(lock_path),
             kind_config=kind_config,
@@ -411,5 +451,12 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         prompts=PromptConfig(
             generate=_project_path(prompts["generate"], "prompts.generate"),
             regenerate=_project_path(prompts["regenerate"], "prompts.regenerate"),
+            validator_detailed=_project_path(
+                prompts["validator_detailed"], "prompts.validator_detailed"
+            ),
+            validator_verdict_only=_project_path(
+                prompts["validator_verdict_only"],
+                "prompts.validator_verdict_only",
+            ),
         ),
     )

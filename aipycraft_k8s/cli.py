@@ -28,7 +28,10 @@ PAID_CONFIRMATION = "I_ACCEPT_PAID_OPENROUTER_CALLS"
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate, deploy, diagnose, repair, and evaluate Kubernetes YAML."
+        description=(
+            "Generate, pre-validate, deploy, and evaluate Kubernetes YAML with "
+            "bounded pre-execution correction."
+        )
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -74,6 +77,9 @@ def _select_tasks(selection: str) -> list[Any]:
 
 def _plan(config: Any) -> dict[str, Any]:
     lock = config.environment.lock
+    max_generations = config.pipeline.max_regenerations + 1
+    max_validator_responses = max_generations if config.ai_validator.enabled else 0
+    max_model_responses = max_generations + max_validator_responses
     return {
         "status": "planned",
         "paid_calls_made": False,
@@ -81,17 +87,36 @@ def _plan(config: Any) -> dict[str, Any]:
         "provider_only": list(config.api.provider_only),
         "allow_fallbacks": config.api.allow_fallbacks,
         "temperature": config.api.temperature,
-        "max_model_responses_per_task": config.pipeline.max_regenerations + 1,
+        "max_aipycraft_generations_per_task": max_generations,
+        "max_ai_validator_responses_per_task": max_validator_responses,
+        "max_model_responses_per_task": max_model_responses,
         "max_http_post_attempts_per_task": (
-            (config.pipeline.max_regenerations + 1)
-            * (config.api.transport_retries + 1)
+            max_model_responses * (config.api.transport_retries + 1)
         ),
         "application_spend_cap_usd": None,
         "pricing_usd_per_million": {
             "input": str(config.api.input_usd_per_million),
             "output": str(config.api.output_usd_per_million),
         },
-        "pre_execution_candidate_checks": ["YAML syntax composition only"],
+        "pre_execution_candidate_checks": [
+            "YAML syntax composition only (deterministic parser)",
+            (
+                "public plaintext-to-YAML AI review"
+                if config.ai_validator.enabled
+                else "AI review disabled"
+            ),
+        ],
+        "ai_validator": {
+            "enabled": config.ai_validator.enabled,
+            "model": config.api.model,
+            "provider_only": list(config.api.provider_only),
+            "feedback_mode": config.ai_validator.feedback_mode,
+            "failure_threshold": (
+                "clear missing or contradicted requirement only; runtime uncertainty "
+                "alone passes"
+            ),
+            "rejection_policy": "regenerate before deployment",
+        },
         "generic_execution_gate": {
             "timing": "after apply and initial runtime observation",
             "checks": [
@@ -103,11 +128,18 @@ def _plan(config: Any) -> dict[str, Any]:
                 ),
                 "standalone Pods become Ready or Succeeded",
             ],
-            "failure_policy": "send generic diagnostics for regeneration",
+            "failure_policy": "log as ground truth; never send to the model",
             "task_specific": False,
         },
         "deployment": "kubectl apply --validate=false with no namespace override",
-        "post_execution_failure_policy": "log discrepancy; never regenerate",
+        "post_execution_failure_policy": {
+            "deployment_runtime_and_generic_execution": (
+                "log ground-truth failure; never regenerate"
+            ),
+            "hidden_specification_oracle": (
+                "log discrepancy; never send to the model or regenerate"
+            ),
+        },
         "environment": {
             "kind": lock.kind_version,
             "kubernetes": lock.node_image,
