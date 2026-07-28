@@ -38,6 +38,10 @@ def check_yaml_syntax(raw: str) -> YamlCheck:
 
     candidate, normalization = unwrap_whole_response_fence(raw)
     try:
+        # PRE-EXECUTION POLICY: Kubernetes schema, resource-kind, namespace,
+        # security, dry-run, and requirement checks remain deliberately
+        # disabled here. They are not silently performed by another parser.
+        # Reusable operational checks run only after real isolated deployment.
         # compose_all checks the YAML representation graph without constructing
         # Python values. Unknown tags, scalars, empty streams, privileged Pods,
         # and Kubernetes-semantic nonsense therefore remain valid here.

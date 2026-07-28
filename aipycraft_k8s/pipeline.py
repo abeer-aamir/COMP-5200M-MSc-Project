@@ -15,6 +15,7 @@ from typing import Any, Callable
 from .config import AppConfig, PROJECT_ROOT
 from .diagnostics import observe_runtime
 from .environment import EnvironmentError, IsolatedKindHarness
+from .execution_verifier import run_execution_gate
 from .openrouter import (
     GenerationResult,
     ProviderError,
@@ -102,6 +103,7 @@ class PipelineRun:
             ],
             "usage_totals": summary["usage_totals"],
             "unknown_cost_failures": summary["unknown_cost_failures"],
+            "execution_gate": summary.get("execution_gate_public"),
             "post_execution": summary.get("post_execution_public"),
             "run_dir": str(self.run_dir),
             "fatal_error": summary.get("fatal_error"),
@@ -118,6 +120,7 @@ class KubernetesAIPyCraftPipeline:
         post_verifier: Callable[[BenchmarkTask, Any], dict[str, Any]] = (
             run_post_execution_verifier
         ),
+        execution_verifier: Callable[..., dict[str, Any]] = run_execution_gate,
         runtime_observer: Callable[..., dict[str, Any]] = observe_runtime,
         key_context_supplier: Callable[[], dict[str, Any]] | None = None,
     ):
@@ -125,6 +128,7 @@ class KubernetesAIPyCraftPipeline:
         self.client = client
         self.harness = harness
         self.post_verifier = post_verifier
+        self.execution_verifier = execution_verifier
         self.runtime_observer = runtime_observer
         self.key_context_supplier = key_context_supplier
 
@@ -161,6 +165,8 @@ class KubernetesAIPyCraftPipeline:
                 f"STDOUT:\n{detail.stdout}\nSTDERR:\n{detail.stderr}"
             )
         if kind == "runtime":
+            return json.dumps(detail.get("failures", []), indent=2, sort_keys=True)
+        if kind == "execution_gate":
             return json.dumps(detail.get("failures", []), indent=2, sort_keys=True)
         raise ValueError(f"Unknown failure kind {kind}")
 
@@ -279,6 +285,7 @@ class KubernetesAIPyCraftPipeline:
             "regenerations": 0,
             "duplicate_generation_responses": 0,
             "attempts": attempts,
+            "execution_gate_public": None,
             "unknown_cost_failures": 0,
             "provenance": {
                 "git": _git_provenance(),
@@ -307,6 +314,9 @@ class KubernetesAIPyCraftPipeline:
                         PROJECT_ROOT / "benchmark/private_tests/suites.py"
                     ),
                 },
+                "generic_execution_verifier_sha256": _sha256_file(
+                    PROJECT_ROOT / "aipycraft_k8s/execution_verifier.py"
+                ),
             },
             "fatal_error": None,
         }
@@ -356,6 +366,7 @@ class KubernetesAIPyCraftPipeline:
                     "pre_execution": None,
                     "deployment": None,
                     "runtime": None,
+                    "execution_gate": None,
                     "post_execution": None,
                     "result": "running",
                 }
@@ -464,6 +475,40 @@ class KubernetesAIPyCraftPipeline:
                             summary["regenerations"] += 1
                             continue
                         summary["status"] = "candidate_failed"
+                        terminal = True
+                        break
+
+                    execution = self.execution_verifier(
+                        task,
+                        environment,
+                        timeout_seconds=self.config.pipeline.command_timeout_seconds,
+                    )
+                    attempt["execution_gate"] = execution
+                    _write_json(attempt_dir / "execution_gate.json", execution)
+                    summary["execution_gate_public"] = {
+                        "status": execution.get("status"),
+                        "checks": len(execution.get("checks", [])),
+                        "failures": len(execution.get("failures", [])),
+                        "repair_on_failure": execution.get("repair_on_failure", True),
+                        "task_specific": execution.get("task_specific", False),
+                    }
+                    if execution.get("status") == "failed":
+                        attempt["result"] = "execution_gate_error"
+                        if index < self.config.pipeline.max_regenerations:
+                            repair_failure = self._failure_text(
+                                "execution_gate", execution
+                            )
+                            summary["regenerations"] += 1
+                            continue
+                        summary["status"] = "candidate_failed"
+                        terminal = True
+                        break
+                    if execution.get("status") != "passed":
+                        attempt["result"] = "execution_gate_infrastructure_error"
+                        summary["status"] = "infrastructure_error"
+                        summary["fatal_error"] = execution.get(
+                            "error", "Generic execution gate failed"
+                        )
                         terminal = True
                         break
 

@@ -92,6 +92,20 @@ def _plan(config: Any) -> dict[str, Any]:
             "output": str(config.api.output_usd_per_million),
         },
         "pre_execution_candidate_checks": ["YAML syntax composition only"],
+        "generic_execution_gate": {
+            "timing": "after apply and initial runtime observation",
+            "checks": [
+                "declared CronJobs complete when exercised once",
+                "controllers and direct Jobs become operational",
+                (
+                    "selector-based Services obtain ready endpoints and expose a "
+                    "listening TCP target"
+                ),
+                "standalone Pods become Ready or Succeeded",
+            ],
+            "failure_policy": "send generic diagnostics for regeneration",
+            "task_specific": False,
+        },
         "deployment": "kubectl apply --validate=false with no namespace override",
         "post_execution_failure_policy": "log discrepancy; never regenerate",
         "environment": {
