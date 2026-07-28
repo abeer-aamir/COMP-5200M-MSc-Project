@@ -12,10 +12,11 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "benchmark" / "aipycraft_config.json"
 FROZEN_API_BASE = "https://openrouter.ai/api/v1"
-FROZEN_MODEL = "meta-llama/llama-3.2-1b-instruct"
-FROZEN_PROVIDERS = ("cloudflare",)
-FROZEN_INPUT_PRICE = Decimal("0.027")
-FROZEN_OUTPUT_PRICE = Decimal("0.201")
+FROZEN_MODEL = "qwen/qwen-2.5-7b-instruct"
+FROZEN_PROVIDERS = ("phala",)
+FROZEN_INPUT_PRICE = Decimal("0.04")
+FROZEN_OUTPUT_PRICE = Decimal("0.10")
+FROZEN_MAX_REGENERATIONS = 5
 
 
 class ConfigError(ValueError):
@@ -358,8 +359,11 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         },
         "pipeline",
     )
-    if pipeline["max_regenerations"] != 1:
-        raise ConfigError("The baseline is locked to exactly one regeneration")
+    if pipeline["max_regenerations"] != FROZEN_MAX_REGENERATIONS:
+        raise ConfigError(
+            "The baseline is locked to exactly "
+            f"{FROZEN_MAX_REGENERATIONS} regenerations"
+        )
     for key in (
         "runtime_observation_seconds",
         "runtime_poll_seconds",
@@ -391,7 +395,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             output_usd_per_million=output_price,
         ),
         pipeline=PipelineSettings(
-            max_regenerations=1,
+            max_regenerations=FROZEN_MAX_REGENERATIONS,
             runtime_observation_seconds=int(pipeline["runtime_observation_seconds"]),
             runtime_poll_seconds=float(pipeline["runtime_poll_seconds"]),
             command_timeout_seconds=int(pipeline["command_timeout_seconds"]),

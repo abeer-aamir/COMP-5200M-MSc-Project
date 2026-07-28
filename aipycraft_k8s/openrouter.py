@@ -53,10 +53,48 @@ class GenerationResult:
     unobserved_billable_attempts: int
     billable: bool
 
+    def usage_consistency_issues(self) -> list[str]:
+        """Return conservative local checks without replacing provider accounting."""
+
+        if not self.billable:
+            return []
+        response_bytes = len(self.raw_text.encode("utf-8"))
+        issues: list[str] = []
+        if response_bytes and self.completion_tokens == 0:
+            issues.append("nonempty_response_with_zero_completion_tokens")
+        elif (
+            self.completion_tokens > 0
+            and response_bytes > self.completion_tokens * 64
+        ):
+            issues.append("response_bytes_implausibly_high_for_completion_tokens")
+        if self.total_tokens != self.prompt_tokens + self.completion_tokens:
+            issues.append("total_tokens_not_prompt_plus_completion")
+        if self.reasoning_tokens > self.completion_tokens:
+            issues.append("reasoning_tokens_exceed_completion_tokens")
+        if self.cached_tokens > self.prompt_tokens:
+            issues.append("cached_tokens_exceed_prompt_tokens")
+        return issues
+
     def audit_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value.pop("raw_text")
         value["cost_usd"] = str(self.cost_usd)
+        response_bytes = len(self.raw_text.encode("utf-8"))
+        issues = self.usage_consistency_issues()
+        value["local_response_metrics"] = {
+            "characters": len(self.raw_text),
+            "utf8_bytes": response_bytes,
+            "lines": len(self.raw_text.splitlines()),
+        }
+        value["provider_usage_consistency"] = {
+            "status": (
+                "not_applicable"
+                if not self.billable
+                else "suspicious" if issues else "plausible"
+            ),
+            "issues": issues,
+            "note": "Local checks do not replace provider-reported billing fields.",
+        }
         return value
 
 

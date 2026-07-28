@@ -117,6 +117,10 @@ def _aggregate_usage(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total_tokens",
         "reasoning_tokens",
         "cached_tokens",
+        "response_characters",
+        "response_utf8_bytes",
+        "response_lines",
+        "suspicious_provider_usage_responses",
         "unobserved_billable_attempts",
     )
     totals: dict[str, Any] = {

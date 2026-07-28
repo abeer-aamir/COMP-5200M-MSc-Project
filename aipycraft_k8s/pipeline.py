@@ -180,6 +180,14 @@ class KubernetesAIPyCraftPipeline:
             "total_tokens": sum(item.total_tokens for item in results),
             "reasoning_tokens": sum(item.reasoning_tokens for item in results),
             "cached_tokens": sum(item.cached_tokens for item in results),
+            "response_characters": sum(len(item.raw_text) for item in results),
+            "response_utf8_bytes": sum(
+                len(item.raw_text.encode("utf-8")) for item in results
+            ),
+            "response_lines": sum(len(item.raw_text.splitlines()) for item in results),
+            "suspicious_provider_usage_responses": sum(
+                bool(item.usage_consistency_issues()) for item in results
+            ),
             "cost_usd": str(cost),
             "provider_cost_complete": all(
                 item.provider_cost_complete for item in results
@@ -360,6 +368,14 @@ class KubernetesAIPyCraftPipeline:
                 attempt["generation"] = {
                     **generation.audit_dict(),
                     "raw_response_sha256": _sha256_text(generation.raw_text),
+                    "local_prompt_metrics": {
+                        "system_characters": len(system_prompt),
+                        "system_utf8_bytes": len(system_prompt.encode("utf-8")),
+                        "system_lines": len(system_prompt.splitlines()),
+                        "user_characters": len(user_prompt),
+                        "user_utf8_bytes": len(user_prompt.encode("utf-8")),
+                        "user_lines": len(user_prompt.splitlines()),
+                    },
                 }
                 _write_json(attempt_dir / "generation.json", attempt["generation"])
 
@@ -467,6 +483,14 @@ class KubernetesAIPyCraftPipeline:
                     attempt["generation"] = {
                         **audit.audit_dict(),
                         "raw_response_sha256": _sha256_text(audit.raw_text),
+                        "local_prompt_metrics": {
+                            "system_characters": len(system_prompt),
+                            "system_utf8_bytes": len(system_prompt.encode("utf-8")),
+                            "system_lines": len(system_prompt.splitlines()),
+                            "user_characters": len(user_prompt),
+                            "user_utf8_bytes": len(user_prompt.encode("utf-8")),
+                            "user_lines": len(user_prompt.splitlines()),
+                        },
                         "validation_error": str(exc),
                     }
                     attempt["result"] = "provider_response_rejected"
