@@ -12,10 +12,10 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "benchmark" / "aipycraft_config.json"
 FROZEN_API_BASE = "https://openrouter.ai/api/v1"
-FROZEN_MODEL = "qwen/qwen-2.5-7b-instruct"
-FROZEN_PROVIDERS = ("phala",)
-FROZEN_INPUT_PRICE = Decimal("0.04")
-FROZEN_OUTPUT_PRICE = Decimal("0.10")
+FROZEN_MODEL = "qwen/qwen3-coder"
+FROZEN_PROVIDERS = ("deepinfra",)
+FROZEN_INPUT_PRICE = Decimal("0.30")
+FROZEN_OUTPUT_PRICE = Decimal("1.00")
 FROZEN_MAX_REGENERATIONS = 5
 
 
