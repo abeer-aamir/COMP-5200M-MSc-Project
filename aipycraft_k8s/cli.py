@@ -102,7 +102,8 @@ def _plan(config: Any) -> dict[str, Any]:
             "fresh_cluster_per_deployment_attempt": True,
             "configured_extra_mounts": False,
             "configured_extra_port_mappings": False,
-            "api_server_loopback_only": True,
+            "api_server_host_published": False,
+            "api_access": "docker_exec_only",
         },
     }
 
