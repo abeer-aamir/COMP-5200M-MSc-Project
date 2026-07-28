@@ -173,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             harness = IsolatedKindHarness(
                 config.environment,
                 command_timeout_seconds=config.pipeline.command_timeout_seconds,
+                max_attempts=config.pipeline.max_regenerations + 1,
             )
             _print(harness.smoke())
             return 0
@@ -181,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         harness = IsolatedKindHarness(
             config.environment,
             command_timeout_seconds=config.pipeline.command_timeout_seconds,
+            max_attempts=config.pipeline.max_regenerations + 1,
         )
         key_supplier = None
         if args.command == "run":

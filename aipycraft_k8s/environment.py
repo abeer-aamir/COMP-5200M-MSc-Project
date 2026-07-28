@@ -455,8 +455,8 @@ class AttemptEnvironment:
         }
 
 
-_SAFE_CLUSTER = re.compile(r"\Aaipc-[a-z0-9-]{1,42}-a[12]\Z")
-_SAFE_NETWORK = re.compile(r"\Aaipc-[a-z0-9-]{1,42}-a[12]-net\Z")
+_SAFE_CLUSTER = re.compile(r"\Aaipc-[a-z0-9-]{1,42}-a[1-9][0-9]*\Z")
+_SAFE_NETWORK = re.compile(r"\Aaipc-[a-z0-9-]{1,42}-a[1-9][0-9]*-net\Z")
 _NETWORK_DISPOSABLE_KEY = "org.aipycraft.disposable"
 _NETWORK_OWNER_KEY = "org.aipycraft.owner"
 
@@ -474,12 +474,16 @@ class IsolatedKindHarness:
         config: EnvironmentConfig,
         *,
         command_timeout_seconds: int,
+        max_attempts: int,
         runner: CommandRunner | None = None,
         kubectl_path: str | Path | None = None,
     ):
+        if isinstance(max_attempts, bool) or max_attempts < 1:
+            raise EnvironmentError("max_attempts must be a positive integer")
         self.config = config
         self.lock = config.lock
         self.command_timeout_seconds = command_timeout_seconds
+        self.max_attempts = max_attempts
         self.runner = runner or CommandRunner()
         self.preparer = EnvironmentPreparer(config, runner=self.runner)
         self.kubectl_path = str(
@@ -1238,8 +1242,14 @@ spec:
     def attempt(
         self, run_id: str, attempt_number: int, attempt_dir: Path
     ) -> Iterator[AttemptEnvironment]:
-        if attempt_number not in {1, 2}:
-            raise EnvironmentError("Only attempt numbers 1 and 2 are permitted")
+        if (
+            isinstance(attempt_number, bool)
+            or attempt_number < 1
+            or attempt_number > self.max_attempts
+        ):
+            raise EnvironmentError(
+                f"Attempt number must be between 1 and {self.max_attempts}"
+            )
         attempt_dir.mkdir(parents=True, exist_ok=True)
         cluster, network = self._names(run_id, attempt_number)
         ownership = _AttemptOwnership(owner_token=uuid.uuid4().hex)

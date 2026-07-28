@@ -97,6 +97,9 @@ class PipelineRun:
             "mode": summary["mode"],
             "attempts": len(summary["attempts"]),
             "regenerations": summary["regenerations"],
+            "duplicate_generation_responses": summary[
+                "duplicate_generation_responses"
+            ],
             "usage_totals": summary["usage_totals"],
             "unknown_cost_failures": summary["unknown_cost_failures"],
             "post_execution": summary.get("post_execution_public"),
@@ -274,6 +277,7 @@ class KubernetesAIPyCraftPipeline:
             ),
             "max_regenerations": self.config.pipeline.max_regenerations,
             "regenerations": 0,
+            "duplicate_generation_responses": 0,
             "attempts": attempts,
             "unknown_cost_failures": 0,
             "provenance": {
@@ -357,7 +361,18 @@ class KubernetesAIPyCraftPipeline:
                 }
                 attempts.append(attempt)
                 generation = self.client.complete(system_prompt, user_prompt)
+                raw_response_sha256 = _sha256_text(generation.raw_text)
+                duplicate_of_attempt = next(
+                    (
+                        prior_index + 1
+                        for prior_index, prior in enumerate(generations)
+                        if _sha256_text(prior.raw_text) == raw_response_sha256
+                    ),
+                    None,
+                )
                 generations.append(generation)
+                if duplicate_of_attempt is not None:
+                    summary["duplicate_generation_responses"] += 1
                 summary["unknown_cost_failures"] += (
                     generation.unobserved_billable_attempts
                 )
@@ -367,7 +382,8 @@ class KubernetesAIPyCraftPipeline:
                 )
                 attempt["generation"] = {
                     **generation.audit_dict(),
-                    "raw_response_sha256": _sha256_text(generation.raw_text),
+                    "raw_response_sha256": raw_response_sha256,
+                    "duplicate_of_attempt": duplicate_of_attempt,
                     "local_prompt_metrics": {
                         "system_characters": len(system_prompt),
                         "system_utf8_bytes": len(system_prompt.encode("utf-8")),
@@ -509,9 +525,25 @@ class KubernetesAIPyCraftPipeline:
         except EnvironmentError as exc:
             summary["status"] = "infrastructure_error"
             summary["fatal_error"] = str(exc)
+            if attempts and attempts[-1]["result"] == "running":
+                attempts[-1]["result"] = "environment_error"
+                attempts[-1]["infrastructure_error"] = str(exc)
+                if current_attempt_dir is not None:
+                    _write_json(
+                        current_attempt_dir / "infrastructure_error.json",
+                        {"error": str(exc)},
+                    )
         except Exception as exc:
             summary["status"] = "infrastructure_error"
             summary["fatal_error"] = f"{type(exc).__name__}: {exc}"
+            if attempts and attempts[-1]["result"] == "running":
+                attempts[-1]["result"] = "pipeline_error"
+                attempts[-1]["infrastructure_error"] = summary["fatal_error"]
+                if current_attempt_dir is not None:
+                    _write_json(
+                        current_attempt_dir / "infrastructure_error.json",
+                        {"error": summary["fatal_error"]},
+                    )
         finally:
             if self.key_context_supplier:
                 try:
