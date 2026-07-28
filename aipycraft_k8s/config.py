@@ -63,6 +63,12 @@ class EnvironmentLock:
     kubectl_filename: str
     kubernetes_minor: str
     node_image: str
+    node_image_source: str
+    node_image_id: str
+    node_image_dockerfile: Path
+    node_image_dockerfile_sha256: str
+    node_image_entrypoint: Path
+    node_image_entrypoint_sha256: str
     kind_config_sha256: str
     docker_network_subnet: str
     docker_network_gateway: str
@@ -159,7 +165,7 @@ def load_environment_lock(path: Path) -> EnvironmentLock:
         },
         "environment lock",
     )
-    if raw["schema_version"] != 2:
+    if raw["schema_version"] != 3:
         raise ConfigError("Unsupported environment lock schema_version")
     kind = _exact_keys(
         raw["kind"],
@@ -186,6 +192,12 @@ def load_environment_lock(path: Path) -> EnvironmentLock:
         {
             "kubernetes_minor",
             "node_image",
+            "node_image_source",
+            "node_image_id",
+            "node_image_dockerfile",
+            "node_image_dockerfile_sha256",
+            "node_image_entrypoint",
+            "node_image_entrypoint_sha256",
             "kind_config_sha256",
             "docker_network_subnet",
             "docker_network_gateway",
@@ -224,13 +236,20 @@ def load_environment_lock(path: Path) -> EnvironmentLock:
     for label, value in (
         ("kind checksum", kind["windows_amd64_sha256"]),
         ("kubectl checksum", kubectl["windows_amd64_sha256"]),
+        ("node image Dockerfile checksum", cluster["node_image_dockerfile_sha256"]),
+        ("node image entrypoint checksum", cluster["node_image_entrypoint_sha256"]),
         ("kind config checksum", cluster["kind_config_sha256"]),
         ("Calico checksum", calico["manifest_sha256"]),
     ):
         if not re.fullmatch(r"[0-9a-f]{64}", str(value)):
             raise ConfigError(f"{label} must be a lowercase sha256 value")
-    if not re.search(r"@sha256:[0-9a-f]{64}\Z", str(cluster["node_image"])):
-        raise ConfigError("cluster.node_image must be digest-pinned")
+    if not re.search(r"@sha256:[0-9a-f]{64}\Z", str(cluster["node_image_source"])):
+        raise ConfigError("cluster.node_image_source must be digest-pinned")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(cluster["node_image_id"])):
+        raise ConfigError("cluster.node_image_id must be a sha256 image id")
+    node_image = str(cluster["node_image"])
+    if "@" in node_image or not re.fullmatch(r"[a-z0-9._/-]+:[a-zA-Z0-9._-]+", node_image):
+        raise ConfigError("cluster.node_image must be a local tagged image")
     try:
         network = ipaddress.ip_network(str(cluster["docker_network_subnet"]), strict=True)
         gateway = ipaddress.ip_address(str(cluster["docker_network_gateway"]))
@@ -252,7 +271,17 @@ def load_environment_lock(path: Path) -> EnvironmentLock:
         kubectl_sha256=str(kubectl["windows_amd64_sha256"]),
         kubectl_filename=str(kubectl["filename"]),
         kubernetes_minor=str(cluster["kubernetes_minor"]),
-        node_image=str(cluster["node_image"]),
+        node_image=node_image,
+        node_image_source=str(cluster["node_image_source"]),
+        node_image_id=str(cluster["node_image_id"]),
+        node_image_dockerfile=_project_path(
+            cluster["node_image_dockerfile"], "cluster.node_image_dockerfile"
+        ),
+        node_image_dockerfile_sha256=str(cluster["node_image_dockerfile_sha256"]),
+        node_image_entrypoint=_project_path(
+            cluster["node_image_entrypoint"], "cluster.node_image_entrypoint"
+        ),
+        node_image_entrypoint_sha256=str(cluster["node_image_entrypoint_sha256"]),
         kind_config_sha256=str(cluster["kind_config_sha256"]),
         docker_network_subnet=str(cluster["docker_network_subnet"]),
         docker_network_gateway=str(cluster["docker_network_gateway"]),

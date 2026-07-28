@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "kind": {
     "version": "v0.32.0",
     "windows_amd64_url": "https://github.com/kubernetes-sigs/kind/releases/download/v0.32.0/kind-windows-amd64",
@@ -14,7 +14,13 @@
   },
   "cluster": {
     "kubernetes_minor": "1.35",
-    "node_image": "kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95",
+    "node_image": "aipycraft/kindest-node:v1.35.5-internal-v1",
+    "node_image_source": "kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95",
+    "node_image_id": "sha256:b68425c937cc079d1333f9c0014910ef57c2f1571a0e815dce79fea5746098ba",
+    "node_image_dockerfile": "benchmark/environment/kind-node-internal.Dockerfile",
+    "node_image_dockerfile_sha256": "1de2ab734bf85284d1b4f1524f6a9dca9d1e33666b47d1f45a6572a49b25a3a8",
+    "node_image_entrypoint": "benchmark/environment/kind-internal-entrypoint.sh",
+    "node_image_entrypoint_sha256": "9d3314dc3baf3d3285efb83271fbfe183ee38a4522272acb8d0e01f89408d80d",
     "kind_config_sha256": "692535fbf60a8dc679ba67b78afba9221ceac1e3ae1ff633a555fe1ba3e62b03",
     "docker_network_subnet": "172.31.250.0/24",
     "docker_network_gateway": "172.31.250.1"
@@ -28,23 +34,23 @@
   "preload_images": [
     {
       "tag": "docker.io/library/busybox:1.36.1",
-      "source": "docker.io/library/busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
-      "digest": "sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+      "source": "docker.io/library/busybox:1.36.1@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f",
+      "digest": "sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f"
     },
     {
       "tag": "quay.io/calico/cni:v3.32.1",
-      "source": "quay.io/calico/cni:v3.32.1@sha256:bb1567e3ed81e2e8414e9a68f186e1f7ffd4067a4871a9ae90896793af0190dd",
-      "digest": "sha256:bb1567e3ed81e2e8414e9a68f186e1f7ffd4067a4871a9ae90896793af0190dd"
+      "source": "quay.io/calico/cni:v3.32.1@sha256:3ef9bbb3fdb2b3194dff57d7d8496d5e18247afb59606dfc694ab88ed1fa9f86",
+      "digest": "sha256:3ef9bbb3fdb2b3194dff57d7d8496d5e18247afb59606dfc694ab88ed1fa9f86"
     },
     {
       "tag": "quay.io/calico/node:v3.32.1",
-      "source": "quay.io/calico/node:v3.32.1@sha256:7f874b3f0b540c2b523aea9961ef5e2f43b0af9056a47874c916d6cf348168d3",
-      "digest": "sha256:7f874b3f0b540c2b523aea9961ef5e2f43b0af9056a47874c916d6cf348168d3"
+      "source": "quay.io/calico/node:v3.32.1@sha256:c061070a27292f8152ae6a0582078eb9059d1b6ed5e57c2052e5c22534734240",
+      "digest": "sha256:c061070a27292f8152ae6a0582078eb9059d1b6ed5e57c2052e5c22534734240"
     },
     {
       "tag": "quay.io/calico/kube-controllers:v3.32.1",
-      "source": "quay.io/calico/kube-controllers:v3.32.1@sha256:18008f781c869376dbbc4dfb1ffe3afb46f7897887d4f20e080c420ac44a6612",
-      "digest": "sha256:18008f781c869376dbbc4dfb1ffe3afb46f7897887d4f20e080c420ac44a6612"
+      "source": "quay.io/calico/kube-controllers:v3.32.1@sha256:df00967cbd6d88e1ff3123e1598895845622e2987928b4ebd9d8ac49aefe00c3",
+      "digest": "sha256:df00967cbd6d88e1ff3123e1598895845622e2987928b4ebd9d8ac49aefe00c3"
     }
   ]
 }

@@ -23,10 +23,10 @@ def run_post_execution_verifier(
         }
     try:
         kube = Kubectl(
-            context=env.context,
+            context=env.kubectl_context,
             namespace=task.namespace,
-            kubeconfig=env.kubeconfig,
-            executable=env.kubectl_path,
+            kubeconfig=env.container_kubeconfig,
+            command_prefix=["docker", "exec", "-i", env.node_name, "kubectl"],
         )
         return run_suite(task.post_execution_suite, kube)
     except EvaluationError as exc:

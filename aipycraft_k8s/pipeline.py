@@ -276,6 +276,17 @@ class KubernetesAIPyCraftPipeline:
                 "pipeline_requirements_sha256": _sha256_file(
                     PROJECT_ROOT / "requirements-aipycraft-k8s.txt"
                 ),
+                "node_image": {
+                    "tag": self.config.environment.lock.node_image,
+                    "source": self.config.environment.lock.node_image_source,
+                    "id": self.config.environment.lock.node_image_id,
+                    "dockerfile_sha256": _sha256_file(
+                        self.config.environment.lock.node_image_dockerfile
+                    ),
+                    "entrypoint_sha256": _sha256_file(
+                        self.config.environment.lock.node_image_entrypoint
+                    ),
+                },
                 "hidden_evaluator": {
                     "core_sha256": _sha256_file(
                         PROJECT_ROOT / "benchmark/private_tests/core.py"

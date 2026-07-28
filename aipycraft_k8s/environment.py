@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .commands import CommandError, CommandResult, CommandRunner
-from .config import EnvironmentConfig, EnvironmentLock
+from .config import PROJECT_ROOT, EnvironmentConfig, EnvironmentLock
 
 
 class EnvironmentError(RuntimeError):
@@ -128,8 +128,30 @@ class EnvironmentPreparer:
         docker_identity = self._docker_identity()
         pulled: list[dict[str, str]] = []
         self.runner.run(
-            ["docker", "pull", self.lock.node_image], timeout=self.timeout_seconds
+            ["docker", "pull", self.lock.node_image_source],
+            timeout=self.timeout_seconds,
         )
+        self.runner.run(
+            [
+                "docker",
+                "build",
+                "--network",
+                "none",
+                "--provenance=false",
+                "--tag",
+                self.lock.node_image,
+                "--file",
+                self.lock.node_image_dockerfile,
+                PROJECT_ROOT,
+            ],
+            timeout=self.timeout_seconds,
+        )
+        node_image_id = self._inspect_image_id(self.lock.node_image)
+        if node_image_id != self.lock.node_image_id:
+            raise EnvironmentError(
+                "Locally built internal kind image did not match its locked image id: "
+                f"expected {self.lock.node_image_id}, got {node_image_id}"
+            )
         for image in self.lock.preload_images:
             self.runner.run(
                 ["docker", "pull", image.source], timeout=self.timeout_seconds
@@ -146,7 +168,11 @@ class EnvironmentPreparer:
             "kubectl": str(paths.kubectl),
             "calico_manifest": str(paths.calico_manifest),
             "docker": docker_identity,
-            "node_image": self.lock.node_image,
+            "node_image": {
+                "tag": self.lock.node_image,
+                "source": self.lock.node_image_source,
+                "id": node_image_id,
+            },
             "preloaded_images": pulled,
         }
 
@@ -213,6 +239,16 @@ class EnvironmentPreparer:
             ("kind", paths.kind, self.lock.kind_sha256),
             ("kubectl", paths.kubectl, self.lock.kubectl_sha256),
             ("calico_manifest", paths.calico_manifest, self.lock.calico_manifest_sha256),
+            (
+                "node_image_dockerfile",
+                self.lock.node_image_dockerfile,
+                self.lock.node_image_dockerfile_sha256,
+            ),
+            (
+                "node_image_entrypoint",
+                self.lock.node_image_entrypoint,
+                self.lock.node_image_entrypoint_sha256,
+            ),
             ("kind_config", self.config.kind_config, self.lock.kind_config_sha256),
         ):
             if not path.is_file():
@@ -239,9 +275,22 @@ class EnvironmentPreparer:
             raise EnvironmentError(
                 f"Expected kubectl {self.lock.kubectl_version}, got {version!r}"
             )
+        source_id = self._inspect_image_id(self.lock.node_image_source)
+        source_digest = self.lock.node_image_source.rsplit("@", 1)[1]
+        if source_id != source_digest:
+            raise EnvironmentError(
+                f"Locked base node image resolved to {source_id}, expected {source_digest}"
+            )
+        node_image_id = self._inspect_image_id(self.lock.node_image)
+        if node_image_id != self.lock.node_image_id:
+            raise EnvironmentError(
+                f"Local node image resolved to {node_image_id}, expected {self.lock.node_image_id}"
+            )
         checks["node_image"] = {
             "reference": self.lock.node_image,
-            "id": self._inspect_image_id(self.lock.node_image),
+            "source": self.lock.node_image_source,
+            "source_id": source_id,
+            "id": node_image_id,
         }
         image_checks: list[dict[str, str]] = []
         for image in self.lock.preload_images:
@@ -290,6 +339,38 @@ class AttemptEnvironment:
     command_timeout_seconds: int
     isolation_inspection: dict[str, Any] | None = None
 
+    @property
+    def node_name(self) -> str:
+        return f"{self.cluster_name}-control-plane"
+
+    @property
+    def container_kubeconfig(self) -> str:
+        return "/etc/kubernetes/admin.conf"
+
+    @property
+    def kubectl_context(self) -> str:
+        return self.context
+
+    def kubectl_prefix(self) -> list[str]:
+        return [
+            "docker",
+            "exec",
+            "-i",
+            self.node_name,
+            "kubectl",
+            "--kubeconfig",
+            self.container_kubeconfig,
+            "--context",
+            self.kubectl_context,
+        ]
+
+    def _prepare_input(self, path: Path) -> tuple[str, str, int]:
+        source = path.resolve()
+        if not source.is_file():
+            raise EnvironmentError(f"kubectl input file does not exist: {source}")
+        content = source.read_text(encoding="utf-8")
+        return content, _sha256_file(source), len(content.encode("utf-8"))
+
     def kubectl(
         self,
         args: list[str | Path],
@@ -297,18 +378,35 @@ class AttemptEnvironment:
         check: bool = True,
         timeout: int | None = None,
     ) -> CommandResult:
-        return self.runner.run(
-            [
-                self.kubectl_path,
-                "--kubeconfig",
-                self.kubeconfig,
-                "--context",
-                self.context,
-                *args,
-            ],
+        rendered_args: list[str | Path] = []
+        input_text: str | None = None
+        input_audit: dict[str, Any] | None = None
+        for item in args:
+            if isinstance(item, Path):
+                if input_text is not None:
+                    raise EnvironmentError("Only one file input is permitted per kubectl command")
+                input_text, digest, byte_count = self._prepare_input(item)
+                rendered_args.append("-")
+                input_audit = {
+                    "source": str(item.resolve()),
+                    "source_sha256": digest,
+                    "bytes": byte_count,
+                    "method": "stdin",
+                }
+            else:
+                rendered_args.append(item)
+        result = self.runner.run(
+            [*self.kubectl_prefix(), *rendered_args],
             timeout=timeout or self.command_timeout_seconds,
             check=check,
+            input_text=input_text,
         )
+        if input_audit is not None:
+            input_audit["command"] = result.audit_dict()
+            transfer_path = self.attempt_dir / "environment_file_transfers.jsonl"
+            with transfer_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(input_audit, sort_keys=True) + "\n")
+        return result
 
     def kubectl_json(self, args: list[str]) -> dict[str, Any]:
         result = self.kubectl([*args, "-o", "json"])
@@ -338,7 +436,10 @@ class AttemptEnvironment:
             "cluster_name": self.cluster_name,
             "network_name": self.network_name,
             "context": self.context,
-            "kubeconfig": str(self.kubeconfig),
+            "api_access": "docker_exec_only",
+            "container_kubeconfig": self.container_kubeconfig,
+            "container_kubectl_context": self.kubectl_context,
+            "host_kubeconfig": None,
             "isolation_inspection": self.isolation_inspection,
             "kind_version": lock.kind_version,
             "kubectl_version": lock.kubectl_version,
@@ -508,7 +609,12 @@ spec:
     - name: probe
       image: busybox:1.36.1
       imagePullPolicy: Never
-      command: ["sh", "-ec", "echo storage-ok > /data/probe; test \"$(cat /data/probe)\" = storage-ok"]
+      command:
+        - sh
+        - -ec
+        - |
+          echo storage-ok > /data/probe
+          test "$(cat /data/probe)" = storage-ok
       volumeMounts:
         - name: data
           mountPath: /data
@@ -728,15 +834,24 @@ spec:
         node_labels = (node_data.get("Config") or {}).get("Labels") or {}
         if node_labels.get("io.x-k8s.kind.cluster") != cluster:
             raise EnvironmentError("Docker node does not belong to the expected kind cluster")
+        if (node_data.get("State") or {}).get("Running") is not True:
+            raise EnvironmentError("The isolated kind control-plane container is not running")
 
-        port_bindings = (node_data.get("HostConfig") or {}).get("PortBindings") or {}
-        if set(port_bindings) != {"6443/tcp"}:
+        requested_bindings = (node_data.get("HostConfig") or {}).get("PortBindings") or {}
+        if set(requested_bindings) - {"6443/tcp"}:
             raise EnvironmentError(
-                f"Unexpected host port bindings on kind node: {sorted(port_bindings)}"
+                "The isolated kind node requested unexpected host ports: "
+                f"{sorted(requested_bindings)}"
             )
-        api_bindings = port_bindings.get("6443/tcp") or []
-        if len(api_bindings) != 1 or api_bindings[0].get("HostIp") != "127.0.0.1":
-            raise EnvironmentError("The Kubernetes API is not bound only to loopback")
+        port_state = (node_data.get("NetworkSettings") or {}).get("Ports") or {}
+        published_ports = {
+            port: bindings for port, bindings in port_state.items() if bindings
+        }
+        if published_ports:
+            raise EnvironmentError(
+                "The isolated kind node unexpectedly publishes host ports: "
+                f"{sorted(published_ports)}"
+            )
 
         mounts = node_data.get("Mounts") or []
         unexpected_binds = [
@@ -754,7 +869,8 @@ spec:
             "network_subnet": self.lock.docker_network_subnet,
             "network_gateway": self.lock.docker_network_gateway,
             "node_networks": sorted(attached_networks),
-            "published_ports": port_bindings,
+            "requested_host_port_bindings": requested_bindings,
+            "published_ports": published_ports,
             "mounts": [
                 {
                     "type": item.get("Type"),
@@ -800,11 +916,12 @@ spec:
         )
         ownership.network_acquired = True
         ownership.cluster_create_started = True
-        self.runner.run(
+        create_result = self.runner.run(
             [
                 cache.kind,
                 "create",
                 "cluster",
+                "--retain",
                 "--name",
                 cluster,
                 "--image",
@@ -815,7 +932,50 @@ spec:
                 kubeconfig,
             ],
             timeout=180,
+            check=False,
             env={"KIND_EXPERIMENTAL_DOCKER_NETWORK": network},
+        )
+        create_detail = f"{create_result.stdout}\n{create_result.stderr}"
+        accepted_unpublished_api = (
+            create_result.returncode != 0
+            and "failed to get api server port" in create_detail
+        )
+        _write_json(
+            attempt_dir / "kind_create.json",
+            {
+                "command": create_result.audit_dict(),
+                "accepted_unpublished_api_result": accepted_unpublished_api,
+            },
+        )
+        if create_result.returncode != 0 and not accepted_unpublished_api:
+            raise CommandError(create_result)
+        context_result = self.runner.run(
+            [
+                "docker",
+                "exec",
+                f"{cluster}-control-plane",
+                "kubectl",
+                "--kubeconfig",
+                "/etc/kubernetes/admin.conf",
+                "config",
+                "current-context",
+            ],
+            timeout=30,
+        )
+        context = context_result.stdout.strip()
+        if not re.fullmatch(r"kubernetes-admin@[A-Za-z0-9._-]+", context):
+            raise EnvironmentError(
+                f"Refusing unexpected in-node kubectl context {context!r}"
+            )
+        _write_json(
+            attempt_dir / "container_api_access.json",
+            {
+                "method": "docker_exec",
+                "node": f"{cluster}-control-plane",
+                "kubeconfig": "/etc/kubernetes/admin.conf",
+                "context": context,
+                "context_discovery": context_result.audit_dict(),
+            },
         )
         env = AttemptEnvironment(
             cluster_name=cluster,
@@ -830,6 +990,12 @@ spec:
         env.isolation_inspection = self._inspect_isolation(
             cluster, network, ownership.owner_token
         )
+        ready = env.readyz()
+        if ready.returncode != 0 or "ok" not in ready.stdout.lower():
+            raise EnvironmentError(
+                "The unexposed Kubernetes API was not ready through docker exec: "
+                + (ready.stderr.strip() or ready.stdout.strip() or "no output")
+            )
         self.runner.run(
             [
                 cache.kind,
@@ -966,9 +1132,47 @@ spec:
                     90,
                 )
                 if deleted is None or deleted.returncode != 0:
-                    report["cleanup_errors"].append(
-                        "kind did not delete the acquired disposable cluster"
+                    node_name = f"{cluster}-control-plane"
+                    node_inspect = run_cleanup(
+                        "fallback_node_inspect",
+                        [
+                            "docker",
+                            "container",
+                            "inspect",
+                            "--format",
+                            "{{json .Config.Labels}}",
+                            node_name,
+                        ],
+                        20,
                     )
+                    node_removed = False
+                    if node_inspect is not None and node_inspect.returncode == 0:
+                        try:
+                            node_labels = json.loads(node_inspect.stdout)
+                        except json.JSONDecodeError:
+                            node_labels = {}
+                        if node_labels.get("io.x-k8s.kind.cluster") == cluster:
+                            direct = run_cleanup(
+                                "fallback_remove_node",
+                                ["docker", "container", "rm", "--force", "--volumes", node_name],
+                                60,
+                            )
+                            node_removed = direct is not None and direct.returncode == 0
+                            if not node_removed:
+                                time.sleep(2)
+                                retry = run_cleanup(
+                                    "fallback_remove_node_retry",
+                                    ["docker", "container", "rm", "--force", "--volumes", node_name],
+                                    60,
+                                )
+                                node_removed = retry is not None and retry.returncode == 0
+                    elif node_inspect is not None and node_inspect.returncode == 1:
+                        detail = f"{node_inspect.stdout}\n{node_inspect.stderr}".lower()
+                        node_removed = "no such" in detail or "not found" in detail
+                    if not node_removed:
+                        report["cleanup_errors"].append(
+                            "kind and the ownership-checked fallback did not delete the disposable cluster"
+                        )
             else:
                 report["cleanup_errors"].append(
                     "locked kind executable was unavailable during cleanup"
@@ -1004,9 +1208,15 @@ spec:
                         "remove_network", ["docker", "network", "rm", network], 30
                     )
                     if removed is None or removed.returncode != 0:
-                        report["cleanup_errors"].append(
-                            "Docker did not remove the acquired disposable network"
+                        retry = run_cleanup(
+                            "remove_network_retry",
+                            ["docker", "network", "rm", network],
+                            30,
                         )
+                        if retry is None or retry.returncode != 0:
+                            report["cleanup_errors"].append(
+                                "Docker did not remove the acquired disposable network"
+                            )
             elif inspection is None:
                 report["cleanup_errors"].append(
                     "Docker network ownership could not be inspected"
@@ -1047,7 +1257,7 @@ spec:
                     network,
                     attempt_dir,
                     ownership=ownership,
-                    export_logs=(attempt_dir / "kubeconfig").exists(),
+                    export_logs=ownership.cluster_create_started,
                 )
                 if cleanup.get("cleanup_errors"):
                     message = "; ".join(cleanup["cleanup_errors"])

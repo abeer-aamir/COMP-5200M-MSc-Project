@@ -37,6 +37,7 @@ class CommandRunner:
         timeout: int,
         check: bool = True,
         env: Mapping[str, str] | None = None,
+        input_text: str | None = None,
     ) -> CommandResult:
         rendered = tuple(str(item) for item in argv)
         if not rendered:
@@ -56,6 +57,7 @@ class CommandRunner:
                 check=False,
                 shell=False,
                 env=child_env,
+                input=input_text,
             )
         except FileNotFoundError as exc:
             result = CommandResult(

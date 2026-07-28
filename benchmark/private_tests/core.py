@@ -5,7 +5,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 
 class EvaluationError(RuntimeError):
@@ -73,9 +73,10 @@ class Kubectl:
         self,
         context: str,
         namespace: str,
-        kubeconfig: Path | None = None,
+        kubeconfig: str | Path | None = None,
         command_timeout: int = 45,
         executable: str | Path = "kubectl",
+        command_prefix: Sequence[str] | None = None,
     ):
         if not context.strip():
             raise EvaluationError("an explicit kubectl context is required")
@@ -86,9 +87,11 @@ class Kubectl:
         self.kubeconfig = kubeconfig
         self.command_timeout = command_timeout
         self.executable = str(executable)
+        self.command_prefix = list(command_prefix) if command_prefix else None
 
     def _base(self) -> list[str]:
-        command = [self.executable, "--context", self.context]
+        command = list(self.command_prefix) if self.command_prefix else [self.executable]
+        command.extend(["--context", self.context])
         if self.kubeconfig:
             command.extend(["--kubeconfig", str(self.kubeconfig)])
         return command
