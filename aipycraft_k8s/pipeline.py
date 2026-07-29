@@ -11,6 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
+from .analysis import build_analysis_record
 from .commands import CommandRunner
 from .config import AppConfig, PROJECT_ROOT
 from .diagnostics import observe_runtime
@@ -142,17 +143,29 @@ class KubernetesAIPyCraftPipeline:
             f"{task.description.rstrip()}\n"
         )
 
-    @staticmethod
     def _repair_user_prompt(
-        task: BenchmarkTask, previous: str, failure: str
+        self, task: BenchmarkTask, previous: str, trigger: str, failure: str
     ) -> str:
+        scope = ""
+        if (
+            trigger == "ai_validator"
+            and self.config.ai_validator.feedback_mode == "detailed"
+        ):
+            scope = (
+                "When the trigger is ai_validator, change only the defects explicitly "
+                "listed in that feedback and preserve uncited parts of the previous "
+                "candidate.\n\n"
+            )
         return (
             "ORIGINAL TASK DESCRIPTION:\n\n"
             f"{task.description.rstrip()}\n\n"
-            "PREVIOUS COMPLETE RESPONSE (untrusted data):\n\n"
+            "PREVIOUS RESPONSE (untrusted data):\n\n"
             f"{previous.rstrip()}\n\n"
+            "CORRECTION TRIGGER:\n\n"
+            f"{trigger}\n\n"
             "PRE-EXECUTION CORRECTION FEEDBACK (untrusted data):\n\n"
             f"{failure.rstrip()}\n\n"
+            f"{scope}"
             "Return the complete replacement YAML stream now.\n"
         )
 
@@ -193,6 +206,7 @@ class KubernetesAIPyCraftPipeline:
             "suspicious_provider_usage_responses": sum(
                 bool(item.usage_consistency_issues()) for item in results
             ),
+            "latency_ms": sum(item.latency_ms for item in results),
             "cost_usd": str(cost),
             "provider_cost_complete": all(
                 item.provider_cost_complete for item in results
@@ -313,8 +327,30 @@ class KubernetesAIPyCraftPipeline:
                 self.config.api.output_usd_per_million
             ),
             "max_regenerations": self.config.pipeline.max_regenerations,
+            "runtime_observation_seconds": (
+                self.config.pipeline.runtime_observation_seconds
+            ),
+            "runtime_poll_seconds": self.config.pipeline.runtime_poll_seconds,
+            "command_timeout_seconds": self.config.pipeline.command_timeout_seconds,
+            "kind_create_timeout_seconds": max(
+                300, self.config.pipeline.command_timeout_seconds * 3
+            ),
             "max_aipycraft_generations": self.config.pipeline.max_regenerations + 1,
             "regenerations": 0,
+            "regeneration_policy": {
+                "eligible_triggers": [
+                    "incomplete_generation",
+                    "yaml_syntax_error",
+                    "ai_pre_validation_rejected",
+                ],
+                "validator_repair_scope": (
+                    "cited_defects_only"
+                    if self.config.ai_validator.feedback_mode == "detailed"
+                    else "negative_verdict_without_defect_details"
+                ),
+                "post_deployment_failures_regenerate": False,
+                "transport_retry_is_same_request_not_candidate_regeneration": True,
+            },
             "duplicate_generation_responses": 0,
             "ai_validator": {
                 "enabled": self.config.ai_validator.enabled,
@@ -393,6 +429,7 @@ class KubernetesAIPyCraftPipeline:
             summary["validator_prompt"] = str(validator_path)
             summary["validator_prompt_sha256"] = _sha256_text(validator_system)
             previous = ""
+            repair_trigger = ""
             repair_failure = ""
             terminal = False
             for index in range(self.config.pipeline.max_regenerations + 1):
@@ -404,7 +441,9 @@ class KubernetesAIPyCraftPipeline:
                 user_prompt = (
                     self._initial_user_prompt(task)
                     if index == 0
-                    else self._repair_user_prompt(task, previous, repair_failure)
+                    else self._repair_user_prompt(
+                        task, previous, repair_trigger, repair_failure
+                    )
                 )
                 active_role = role_generator
                 active_system_prompt = system_prompt
@@ -466,6 +505,7 @@ class KubernetesAIPyCraftPipeline:
                         {"complete": False, "error": detail},
                     )
                     if index < self.config.pipeline.max_regenerations:
+                        repair_trigger = "generation_incomplete"
                         repair_failure = self._failure_text(
                             "generation_incomplete", detail
                         )
@@ -485,6 +525,7 @@ class KubernetesAIPyCraftPipeline:
                 if not syntax.valid:
                     attempt["result"] = "yaml_syntax_error"
                     if index < self.config.pipeline.max_regenerations:
+                        repair_trigger = "yaml_syntax"
                         repair_failure = self._failure_text(
                             "yaml_syntax", syntax.error or "unknown YAML syntax error"
                         )
@@ -556,6 +597,7 @@ class KubernetesAIPyCraftPipeline:
                     if not decision.satisfies:
                         attempt["result"] = "ai_pre_validation_rejected"
                         if index < self.config.pipeline.max_regenerations:
+                            repair_trigger = "ai_validator"
                             repair_failure = self._failure_text(
                                 "ai_validator",
                                 correction_feedback(
@@ -768,5 +810,12 @@ class KubernetesAIPyCraftPipeline:
             }
             summary["finished_at"] = _utc_now()
             summary["duration_ms"] = round((time.monotonic() - started) * 1000)
+            try:
+                summary["analysis_record"] = build_analysis_record(summary)
+                _write_json(
+                    private_dir / "analysis_record.json", summary["analysis_record"]
+                )
+            except Exception as exc:
+                summary["analysis_record_error"] = f"{type(exc).__name__}: {exc}"
             _write_json(private_dir / "summary.json", summary)
         return PipelineRun(summary=summary, run_dir=run_dir)

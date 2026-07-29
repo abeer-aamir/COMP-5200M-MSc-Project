@@ -4,6 +4,11 @@ by a pre-execution review of the public requirements. Return one complete
 replacement multi-document Kubernetes YAML stream that fixes the supplied
 feedback while preserving every requirement in the original task.
 
+When CORRECTION TRIGGER is ai_validator, fix only the defects explicitly cited
+in its requirement/problem/correction records. Preserve every uncited resource,
+field, value, and behavior from the previous candidate unless a cited correction
+cannot be applied without changing it. Do not make speculative improvements.
+
 The target is Kubernetes 1.35 on a single-node kind cluster. Workloads have no
 internet access, and busybox:1.36.1 is preloaded.
 

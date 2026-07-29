@@ -107,6 +107,23 @@ def _plan(config: Any) -> dict[str, Any]:
                 else "AI review disabled"
             ),
         ],
+        "candidate_regeneration": {
+            "eligible_triggers": [
+                "incomplete generation",
+                "YAML syntax error",
+                "AI-validator rejection",
+            ],
+            "maximum_regenerations": config.pipeline.max_regenerations,
+            "validator_repair_scope": (
+                "change only cited requirement/problem/correction defects"
+                if config.ai_validator.feedback_mode == "detailed"
+                else "negative verdict provides no cited defect details"
+            ),
+            "transport_retry_note": (
+                "the separately logged transport retry resends the same request; "
+                "it is not candidate regeneration"
+            ),
+        },
         "ai_validator": {
             "enabled": config.ai_validator.enabled,
             "model": config.api.model,
@@ -129,10 +146,18 @@ def _plan(config: Any) -> dict[str, Any]:
                 ),
                 "standalone Pods become Ready or Succeeded",
             ],
+            "rollout_failure_diagnostics": (
+                "capture bounded init-container state, current logs, and previous "
+                "logs after restarts"
+            ),
             "failure_policy": "log as ground truth; never send to the model",
             "task_specific": False,
         },
         "deployment": "kubectl apply --validate=false with no namespace override",
+        "analysis_artifact": (
+            "private/analysis_record.json: stable per-run metrics row plus detailed "
+            "summary and attempt artifacts"
+        ),
         "post_execution_failure_policy": {
             "deployment_runtime_and_generic_execution": (
                 "log ground-truth failure; never regenerate"
@@ -171,6 +196,7 @@ def _aggregate_usage(results: list[dict[str, Any]]) -> dict[str, Any]:
         "response_utf8_bytes",
         "response_lines",
         "suspicious_provider_usage_responses",
+        "latency_ms",
         "unobserved_billable_attempts",
     )
     totals: dict[str, Any] = {

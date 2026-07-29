@@ -19,7 +19,7 @@
     "output_root": "benchmark/aipycraft_runs"
   },
   "ai_validator": {
-    "enabled": false,
+    "enabled": true,
     "feedback_mode": "detailed"
   },
   "environment": {

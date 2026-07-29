@@ -34,6 +34,145 @@ def _command_detail(result: Any) -> dict[str, Any]:
     }
 
 
+def _workload_selector(item: dict[str, Any]) -> str | None:
+    selector = item.get("spec", {}).get("selector", {})
+    if not isinstance(selector, dict):
+        return None
+    requirements: list[str] = []
+    match_labels = selector.get("matchLabels", {})
+    if isinstance(match_labels, dict):
+        requirements.extend(
+            f"{key}={value}" for key, value in sorted(match_labels.items())
+        )
+    match_expressions = selector.get("matchExpressions", [])
+    if isinstance(match_expressions, list):
+        for expression in match_expressions:
+            if not isinstance(expression, dict):
+                continue
+            key = expression.get("key")
+            operator = expression.get("operator")
+            values = expression.get("values", [])
+            if not isinstance(key, str) or not key:
+                continue
+            if operator in {"In", "NotIn"} and isinstance(values, list) and values:
+                rendered_values = ",".join(str(value) for value in values)
+                keyword = "in" if operator == "In" else "notin"
+                requirements.append(f"{key} {keyword} ({rendered_values})")
+            elif operator == "Exists":
+                requirements.append(key)
+            elif operator == "DoesNotExist":
+                requirements.append(f"!{key}")
+    return ",".join(requirements) if requirements else None
+
+
+def _init_container_diagnostics(
+    env: AttemptEnvironment,
+    workload: dict[str, Any],
+    namespace: str,
+    *,
+    command_timeout: int,
+) -> dict[str, Any]:
+    """Best-effort init-container state and logs for a failed rollout."""
+
+    selector = _workload_selector(workload)
+    diagnostics: dict[str, Any] = {
+        "status": "captured",
+        "selector": selector,
+        "pods": [],
+        "pod_limit": 20,
+        "init_container_limit_per_pod": 10,
+    }
+    if selector is None:
+        diagnostics["status"] = "unavailable"
+        diagnostics["error"] = "workload has no usable label selector"
+        return diagnostics
+
+    try:
+        value = env.kubectl_json(
+            ["get", "pods", "-n", namespace, "-l", selector]
+        )
+        raw_pods = value.get("items", [])
+        if not isinstance(raw_pods, list):
+            raise EnvironmentError("kubectl returned malformed pod items")
+        pods = [pod for pod in raw_pods if isinstance(pod, dict)]
+        diagnostics["matched_pods"] = len(pods)
+        diagnostics["truncated_pods"] = max(len(pods) - 20, 0)
+        for pod in pods[:20]:
+            pod_name = _name(pod)
+            status = pod.get("status", {})
+            statuses = status.get("initContainerStatuses", []) or []
+            by_name = {
+                str(item.get("name")): item
+                for item in statuses
+                if isinstance(item, dict) and item.get("name")
+            }
+            init_specs = pod.get("spec", {}).get("initContainers", []) or []
+            names = [
+                str(item.get("name"))
+                for item in init_specs
+                if isinstance(item, dict) and item.get("name")
+            ]
+            for name in by_name:
+                if name not in names:
+                    names.append(name)
+            pod_record: dict[str, Any] = {
+                "pod": pod_name,
+                "phase": status.get("phase"),
+                "reason": status.get("reason"),
+                "message": status.get("message"),
+                "init_containers": [],
+                "truncated_init_containers": max(len(names) - 10, 0),
+            }
+            for init_name in names[:10]:
+                container_status = by_name.get(init_name, {})
+                logs = env.kubectl(
+                    [
+                        "logs",
+                        pod_name,
+                        "-n",
+                        namespace,
+                        "-c",
+                        init_name,
+                        "--tail=200",
+                    ],
+                    check=False,
+                    timeout=command_timeout,
+                )
+                container_record: dict[str, Any] = {
+                    "container": init_name,
+                    "ready": container_status.get("ready"),
+                    "restart_count": container_status.get("restartCount"),
+                    "state": container_status.get("state"),
+                    "last_state": container_status.get("lastState"),
+                    "image": container_status.get("image"),
+                    "image_id": container_status.get("imageID"),
+                    "logs": _command_detail(logs),
+                }
+                restart_count = container_status.get("restartCount")
+                if isinstance(restart_count, int) and restart_count > 0:
+                    previous_logs = env.kubectl(
+                        [
+                            "logs",
+                            pod_name,
+                            "-n",
+                            namespace,
+                            "-c",
+                            init_name,
+                            "--previous",
+                            "--tail=200",
+                        ],
+                        check=False,
+                        timeout=command_timeout,
+                    )
+                    container_record["previous_logs"] = _command_detail(previous_logs)
+                pod_record["init_containers"].append(container_record)
+            diagnostics["pods"].append(pod_record)
+    except Exception as exc:
+        diagnostics["status"] = "capture_error"
+        diagnostics["error"] = f"{type(exc).__name__}: {exc}"
+    return diagnostics
+
+
 def _probe_name(cronjob_name: str) -> str:
     safe = re.sub(r"[^a-z0-9-]", "-", cronjob_name.lower()).strip("-")
     safe = safe[:34].rstrip("-") or "cronjob"
@@ -250,11 +389,19 @@ def run_execution_gate(
                 }
                 report["checks"].append(check)
                 if waited.returncode != 0:
+                    init_diagnostics = _init_container_diagnostics(
+                        env,
+                        item,
+                        task.namespace,
+                        command_timeout=command_timeout,
+                    )
+                    check["init_container_diagnostics"] = init_diagnostics
                     report["failures"].append(
                         {
                             "type": "workload_not_operational",
                             "resource": f"{resource}/{resource_name}",
                             "diagnostic": _command_detail(waited),
+                            "init_container_diagnostics": init_diagnostics,
                         }
                     )
 
