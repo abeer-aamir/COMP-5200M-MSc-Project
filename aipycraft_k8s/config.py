@@ -12,11 +12,13 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "benchmark" / "aipycraft_config.json"
 FROZEN_API_BASE = "https://openrouter.ai/api/v1"
-FROZEN_MODEL = "qwen/qwen3-coder"
-FROZEN_PROVIDERS = ("deepinfra",)
-FROZEN_INPUT_PRICE = Decimal("0.30")
-FROZEN_OUTPUT_PRICE = Decimal("1.00")
-FROZEN_MAX_REGENERATIONS = 2
+FROZEN_MODEL = "openai/gpt-5-mini"
+FROZEN_PROVIDERS = ("openai",)
+FROZEN_TEMPERATURE = None
+FROZEN_REASONING_EFFORT = "low"
+FROZEN_INPUT_PRICE = Decimal("0.25")
+FROZEN_OUTPUT_PRICE = Decimal("2.00")
+FROZEN_MAX_REGENERATIONS = 5
 
 
 class ConfigError(ValueError):
@@ -29,7 +31,8 @@ class ApiConfig:
     model: str
     provider_only: tuple[str, ...]
     allow_fallbacks: bool
-    temperature: float
+    temperature: float | None
+    reasoning_effort: str | None
     transport_retries: int
     input_usd_per_million: Decimal
     output_usd_per_million: Decimal
@@ -71,7 +74,6 @@ class EnvironmentLock:
     kubernetes_minor: str
     node_image: str
     node_image_source: str
-    node_image_id: str
     node_image_dockerfile: Path
     node_image_dockerfile_sha256: str
     node_image_entrypoint: Path
@@ -175,7 +177,7 @@ def load_environment_lock(path: Path) -> EnvironmentLock:
         },
         "environment lock",
     )
-    if raw["schema_version"] != 3:
+    if raw["schema_version"] != 4:
         raise ConfigError("Unsupported environment lock schema_version")
     kind = _exact_keys(
         raw["kind"],
@@ -203,7 +205,6 @@ def load_environment_lock(path: Path) -> EnvironmentLock:
             "kubernetes_minor",
             "node_image",
             "node_image_source",
-            "node_image_id",
             "node_image_dockerfile",
             "node_image_dockerfile_sha256",
             "node_image_entrypoint",
@@ -255,8 +256,6 @@ def load_environment_lock(path: Path) -> EnvironmentLock:
             raise ConfigError(f"{label} must be a lowercase sha256 value")
     if not re.search(r"@sha256:[0-9a-f]{64}\Z", str(cluster["node_image_source"])):
         raise ConfigError("cluster.node_image_source must be digest-pinned")
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(cluster["node_image_id"])):
-        raise ConfigError("cluster.node_image_id must be a sha256 image id")
     node_image = str(cluster["node_image"])
     if "@" in node_image or not re.fullmatch(r"[a-z0-9._/-]+:[a-zA-Z0-9._-]+", node_image):
         raise ConfigError("cluster.node_image must be a local tagged image")
@@ -283,7 +282,6 @@ def load_environment_lock(path: Path) -> EnvironmentLock:
         kubernetes_minor=str(cluster["kubernetes_minor"]),
         node_image=node_image,
         node_image_source=str(cluster["node_image_source"]),
-        node_image_id=str(cluster["node_image_id"]),
         node_image_dockerfile=_project_path(
             cluster["node_image_dockerfile"], "cluster.node_image_dockerfile"
         ),
@@ -329,6 +327,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             "provider_only",
             "allow_fallbacks",
             "temperature",
+            "reasoning_effort",
             "transport_retries",
             "input_usd_per_million",
             "output_usd_per_million",
@@ -350,15 +349,25 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         raise ConfigError(f"The frozen baseline model must be {FROZEN_MODEL}")
     normalized_providers = tuple(item.strip().lower() for item in providers)
     if normalized_providers != FROZEN_PROVIDERS:
-        raise ConfigError("The frozen baseline provider must be DeepInfra only")
+        raise ConfigError("The frozen treatment provider must be OpenAI only")
     if api["allow_fallbacks"] is not False:
         raise ConfigError("Frozen experiments require allow_fallbacks=false")
     retries = api["transport_retries"]
     if isinstance(retries, bool) or retries not in {0, 1}:
         raise ConfigError("api.transport_retries must be 0 or 1")
-    temperature = float(api["temperature"])
-    if temperature != 0.0:
-        raise ConfigError("The frozen baseline requires temperature=0")
+    temperature_value = api["temperature"]
+    temperature = (
+        None if temperature_value is None else float(temperature_value)
+    )
+    if temperature is not FROZEN_TEMPERATURE:
+        raise ConfigError(
+            "The frozen GPT-5 Mini treatment omits unsupported temperature"
+        )
+    reasoning_effort = api["reasoning_effort"]
+    if reasoning_effort != FROZEN_REASONING_EFFORT:
+        raise ConfigError(
+            "The frozen GPT-5 Mini treatment requires reasoning_effort=low"
+        )
     input_price = _decimal(api["input_usd_per_million"], "input token price")
     output_price = _decimal(api["output_usd_per_million"], "output token price")
     if input_price != FROZEN_INPUT_PRICE or output_price != FROZEN_OUTPUT_PRICE:
@@ -426,6 +435,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             provider_only=normalized_providers,
             allow_fallbacks=False,
             temperature=temperature,
+            reasoning_effort=str(reasoning_effort),
             transport_retries=int(retries),
             input_usd_per_million=input_price,
             output_usd_per_million=output_price,

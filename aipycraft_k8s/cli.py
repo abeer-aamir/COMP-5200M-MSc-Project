@@ -87,6 +87,7 @@ def _plan(config: Any) -> dict[str, Any]:
         "provider_only": list(config.api.provider_only),
         "allow_fallbacks": config.api.allow_fallbacks,
         "temperature": config.api.temperature,
+        "reasoning_effort": config.api.reasoning_effort,
         "max_aipycraft_generations_per_task": max_generations,
         "max_ai_validator_responses_per_task": max_validator_responses,
         "max_model_responses_per_task": max_model_responses,
@@ -150,6 +151,9 @@ def _plan(config: Any) -> dict[str, Any]:
             "configured_extra_port_mappings": False,
             "api_server_host_published": False,
             "api_access": "docker_exec_only",
+            "kind_create_timeout_seconds": max(
+                300, config.pipeline.command_timeout_seconds * 3
+            ),
         },
     }
 

@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "kind": {
     "version": "v0.32.0",
     "windows_amd64_url": "https://github.com/kubernetes-sigs/kind/releases/download/v0.32.0/kind-windows-amd64",
@@ -16,7 +16,6 @@
     "kubernetes_minor": "1.35",
     "node_image": "aipycraft/kindest-node:v1.35.5-internal-v1",
     "node_image_source": "kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95",
-    "node_image_id": "sha256:b68425c937cc079d1333f9c0014910ef57c2f1571a0e815dce79fea5746098ba",
     "node_image_dockerfile": "benchmark/environment/kind-node-internal.Dockerfile",
     "node_image_dockerfile_sha256": "1de2ab734bf85284d1b4f1524f6a9dca9d1e33666b47d1f45a6572a49b25a3a8",
     "node_image_entrypoint": "benchmark/environment/kind-internal-entrypoint.sh",

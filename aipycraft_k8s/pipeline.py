@@ -308,6 +308,7 @@ class KubernetesAIPyCraftPipeline:
             "provider_only": list(self.config.api.provider_only),
             "allow_fallbacks": self.config.api.allow_fallbacks,
             "temperature": self.config.api.temperature,
+            "reasoning_effort": self.config.api.reasoning_effort,
             "transport_retries": self.config.api.transport_retries,
             "api_base": self.config.api.base_url,
             "response_format": "raw_text",
@@ -344,7 +345,8 @@ class KubernetesAIPyCraftPipeline:
                 "node_image": {
                     "tag": self.config.environment.lock.node_image,
                     "source": self.config.environment.lock.node_image_source,
-                    "id": self.config.environment.lock.node_image_id,
+                    "id": None,
+                    "id_source": "machine_preparation_receipt",
                     "dockerfile_sha256": _sha256_file(
                         self.config.environment.lock.node_image_dockerfile
                     ),
@@ -372,6 +374,9 @@ class KubernetesAIPyCraftPipeline:
         _write_json(private_dir / "summary.json", summary)
         try:
             preflight = self.harness.preflight()
+            summary["provenance"]["node_image"]["id"] = (
+                preflight.get("checks", {}).get("node_image", {}).get("id")
+            )
             _write_json(private_dir / "environment_preflight.json", preflight)
             if self.key_context_supplier:
                 try:

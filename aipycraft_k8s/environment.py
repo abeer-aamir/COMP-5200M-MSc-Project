@@ -43,6 +43,7 @@ class CachePaths:
     kind: Path
     kubectl: Path
     calico_manifest: Path
+    preparation_receipt: Path
 
 
 class EnvironmentPreparer:
@@ -78,6 +79,7 @@ class EnvironmentPreparer:
                 / self.lock.calico_version
                 / self.lock.calico_filename
             ),
+            preparation_receipt=self.config.cache_root / "environment-preparation.json",
         )
 
     @staticmethod
@@ -131,6 +133,13 @@ class EnvironmentPreparer:
             ["docker", "pull", self.lock.node_image_source],
             timeout=self.timeout_seconds,
         )
+        source_image_id = self._inspect_image_id(self.lock.node_image_source)
+        expected_source_id = self.lock.node_image_source.rsplit("@", 1)[1]
+        if source_image_id != expected_source_id:
+            raise EnvironmentError(
+                "Locked base node image resolved to "
+                f"{source_image_id}, expected {expected_source_id}"
+            )
         self.runner.run(
             [
                 "docker",
@@ -147,11 +156,6 @@ class EnvironmentPreparer:
             timeout=self.timeout_seconds,
         )
         node_image_id = self._inspect_image_id(self.lock.node_image)
-        if node_image_id != self.lock.node_image_id:
-            raise EnvironmentError(
-                "Locally built internal kind image did not match its locked image id: "
-                f"expected {self.lock.node_image_id}, got {node_image_id}"
-            )
         for image in self.lock.preload_images:
             self.runner.run(
                 ["docker", "pull", image.source], timeout=self.timeout_seconds
@@ -162,6 +166,11 @@ class EnvironmentPreparer:
             pulled.append(
                 {"tag": image.tag, "source": image.source, "digest": image.digest}
             )
+        receipt = self._preparation_receipt(
+            source_image_id=source_image_id,
+            node_image_id=node_image_id,
+        )
+        _write_json(paths.preparation_receipt, receipt)
         return {
             "status": "prepared",
             "kind": str(paths.kind),
@@ -173,8 +182,65 @@ class EnvironmentPreparer:
                 "source": self.lock.node_image_source,
                 "id": node_image_id,
             },
+            "preparation_receipt": str(paths.preparation_receipt),
             "preloaded_images": pulled,
         }
+
+    def _preparation_receipt(
+        self, *, source_image_id: str, node_image_id: str
+    ) -> dict[str, Any]:
+        """Bind a machine-local build output to the repository's locked inputs."""
+
+        return {
+            "schema_version": 1,
+            "environment_lock_sha256": _sha256_file(self.lock.path),
+            "node_image": {
+                "tag": self.lock.node_image,
+                "source": self.lock.node_image_source,
+                "source_id": source_image_id,
+                "id": node_image_id,
+                "dockerfile_sha256": _sha256_file(
+                    self.lock.node_image_dockerfile
+                ),
+                "entrypoint_sha256": _sha256_file(
+                    self.lock.node_image_entrypoint
+                ),
+            },
+        }
+
+    def _load_preparation_receipt(self, path: Path) -> dict[str, Any]:
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise EnvironmentError(
+                f"Missing machine preparation receipt {path}; run prepare first"
+            ) from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            raise EnvironmentError(
+                f"Could not read machine preparation receipt {path}: {exc}"
+            ) from exc
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "schema_version",
+            "environment_lock_sha256",
+            "node_image",
+        }:
+            raise EnvironmentError("Machine preparation receipt has invalid fields")
+        image = receipt.get("node_image")
+        expected_image_fields = {
+            "tag",
+            "source",
+            "source_id",
+            "id",
+            "dockerfile_sha256",
+            "entrypoint_sha256",
+        }
+        if (
+            receipt.get("schema_version") != 1
+            or not isinstance(image, dict)
+            or set(image) != expected_image_fields
+        ):
+            raise EnvironmentError("Machine preparation receipt has an invalid schema")
+        return receipt
 
     def _inspect_image_id(self, reference: str) -> str:
         result = self.runner.run(
@@ -282,15 +348,25 @@ class EnvironmentPreparer:
                 f"Locked base node image resolved to {source_id}, expected {source_digest}"
             )
         node_image_id = self._inspect_image_id(self.lock.node_image)
-        if node_image_id != self.lock.node_image_id:
+        receipt = self._load_preparation_receipt(paths.preparation_receipt)
+        expected_receipt = self._preparation_receipt(
+            source_image_id=source_id,
+            node_image_id=node_image_id,
+        )
+        if receipt != expected_receipt:
             raise EnvironmentError(
-                f"Local node image resolved to {node_image_id}, expected {self.lock.node_image_id}"
+                "The local kind image or its locked build inputs changed after prepare; "
+                "run prepare again"
             )
         checks["node_image"] = {
             "reference": self.lock.node_image,
             "source": self.lock.node_image_source,
             "source_id": source_id,
             "id": node_image_id,
+            "preparation_receipt": str(paths.preparation_receipt),
+            "preparation_receipt_sha256": _sha256_file(
+                paths.preparation_receipt
+            ),
         }
         image_checks: list[dict[str, str]] = []
         for image in self.lock.preload_images:
@@ -483,6 +559,9 @@ class IsolatedKindHarness:
         self.config = config
         self.lock = config.lock
         self.command_timeout_seconds = command_timeout_seconds
+        self.kind_create_timeout_seconds = max(
+            300, command_timeout_seconds * 3
+        )
         self.max_attempts = max_attempts
         self.runner = runner or CommandRunner()
         self.preparer = EnvironmentPreparer(config, runner=self.runner)
@@ -935,7 +1014,7 @@ spec:
                 "--kubeconfig",
                 kubeconfig,
             ],
-            timeout=180,
+            timeout=self.kind_create_timeout_seconds,
             check=False,
             env={"KIND_EXPERIMENTAL_DOCKER_NETWORK": network},
         )

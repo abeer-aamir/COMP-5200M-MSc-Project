@@ -230,13 +230,12 @@ class OpenRouterTextClient:
         return data
 
     def request_payload(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": self.config.temperature,
             "stream": False,
             "provider": {
                 "only": list(self.config.provider_only),
@@ -245,6 +244,11 @@ class OpenRouterTextClient:
                 "data_collection": "deny",
             },
         }
+        if self.config.temperature is not None:
+            payload["temperature"] = self.config.temperature
+        if self.config.reasoning_effort is not None:
+            payload["reasoning"] = {"effort": self.config.reasoning_effort}
+        return payload
 
     def _audit_response(
         self,
