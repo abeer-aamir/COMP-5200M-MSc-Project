@@ -537,6 +537,17 @@ _NETWORK_DISPOSABLE_KEY = "org.aipycraft.disposable"
 _NETWORK_OWNER_KEY = "org.aipycraft.owner"
 
 
+def _kind_create_acceptance_basis(result: CommandResult) -> str | None:
+    """Allow the intentionally unpublished API only with later live verification."""
+
+    if result.returncode == 124:
+        return "timeout_pending_mandatory_in_container_api_verification"
+    detail = f"{result.stdout}\n{result.stderr}"
+    if result.returncode != 0 and "failed to get api server port" in detail:
+        return "expected_unpublished_api_port_error"
+    return None
+
+
 @dataclass
 class _AttemptOwnership:
     owner_token: str
@@ -1018,16 +1029,14 @@ spec:
             check=False,
             env={"KIND_EXPERIMENTAL_DOCKER_NETWORK": network},
         )
-        create_detail = f"{create_result.stdout}\n{create_result.stderr}"
-        accepted_unpublished_api = (
-            create_result.returncode != 0
-            and "failed to get api server port" in create_detail
-        )
+        acceptance_basis = _kind_create_acceptance_basis(create_result)
+        accepted_unpublished_api = acceptance_basis is not None
         _write_json(
             attempt_dir / "kind_create.json",
             {
                 "command": create_result.audit_dict(),
                 "accepted_unpublished_api_result": accepted_unpublished_api,
+                "acceptance_basis": acceptance_basis,
             },
         )
         if create_result.returncode != 0 and not accepted_unpublished_api:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
+
+from aipycraft_k8s.commands import CommandResult, CommandRunner
 
 
 class EvaluationError(RuntimeError):
@@ -88,6 +89,7 @@ class Kubectl:
         self.command_timeout = command_timeout
         self.executable = str(executable)
         self.command_prefix = list(command_prefix) if command_prefix else None
+        self.runner = CommandRunner()
 
     def _base(self) -> list[str]:
         command = list(self.command_prefix) if self.command_prefix else [self.executable]
@@ -102,22 +104,17 @@ class Kubectl:
         *,
         check: bool = True,
         timeout: int | None = None,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> CommandResult:
         command = [*self._base(), *args]
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout or self.command_timeout,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise EvaluationError("kubectl was not found on PATH") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise EvaluationError(f"command timed out: {' '.join(command)}") from exc
+        result = self.runner.run(
+            command,
+            timeout=timeout or self.command_timeout,
+            check=False,
+        )
+        if result.returncode == 127:
+            raise EvaluationError("kubectl was not found on PATH")
+        if result.returncode == 124:
+            raise EvaluationError(f"command timed out: {' '.join(command)}")
         if check and result.returncode:
             raise KubectlError(command, result.stdout, result.stderr, result.returncode)
         return result

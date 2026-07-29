@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
+from .commands import CommandRunner
 from .config import AppConfig, PROJECT_ROOT
 from .diagnostics import observe_runtime
 from .environment import EnvironmentError, IsolatedKindHarness
@@ -42,23 +42,16 @@ def _sha256_file(path: Path) -> str:
 
 def _git_provenance() -> dict[str, Any]:
     try:
-        commit = subprocess.run(
+        runner = CommandRunner()
+        commit = runner.run(
             ["git", "rev-parse", "HEAD"],
             cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=10,
             check=False,
         )
-        status = subprocess.run(
+        status = runner.run(
             ["git", "status", "--porcelain"],
             cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=10,
             check=False,
         )
