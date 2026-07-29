@@ -188,6 +188,51 @@ def _pod_summary(pod: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _failure_container_logs(
+    env: AttemptEnvironment, failures: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for failure in failures:
+        namespace = failure.get("namespace")
+        pod = failure.get("pod")
+        container = failure.get("container")
+        if not namespace or not pod or not container:
+            continue
+        identity = (namespace, pod, container)
+        if identity in seen or len(records) >= 20:
+            continue
+        seen.add(identity)
+        record: dict[str, Any] = {
+            "namespace": namespace,
+            "pod": pod,
+            "container": container,
+        }
+        for label, extra in (("current", []), ("previous", ["--previous"])):
+            result = env.kubectl(
+                [
+                    "logs",
+                    pod,
+                    "-n",
+                    namespace,
+                    "-c",
+                    container,
+                    *extra,
+                    "--tail=200",
+                ],
+                check=False,
+                timeout=env.command_timeout_seconds,
+            )
+            record[label] = {
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "duration_ms": result.duration_ms,
+            }
+        records.append(record)
+    return records
+
+
 def observe_runtime(
     env: AttemptEnvironment,
     *,
@@ -220,10 +265,12 @@ def observe_runtime(
         raise EnvironmentError(f"Could not inspect Kubernetes events: {exc}") from exc
     if not failures:
         failures = extract_event_failures(events, latest_pods)
+    container_logs = _failure_container_logs(env, failures) if failures else []
     return {
         "status": "execution_error" if failures else "no_concrete_execution_error",
         "observation_seconds": seconds,
         "failures": failures,
+        "container_logs": container_logs,
         "pods": [
             _pod_summary(pod)
             for pod in latest_pods

@@ -228,14 +228,15 @@ def run_execution_gate(
 
     This stage deliberately knows no requirement IDs or task-specific expected
     values. It checks only whether applied resources can become operational,
-    and its findings are never returned to the model for regeneration.
+    and its candidate-attributable findings may be returned for bounded
+    regeneration. Infrastructure errors and hidden requirements remain excluded.
     """
 
     report: dict[str, Any] = {
         "task_id": task.task_id,
         "namespace": task.namespace,
         "status": "running",
-        "repair_on_failure": False,
+        "repair_on_failure": True,
         "task_specific": False,
         "checks": [],
         "failures": [],

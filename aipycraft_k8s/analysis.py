@@ -8,6 +8,21 @@ _REGENERATION_RESULTS = {
     "incomplete_generation",
     "yaml_syntax_error",
     "ai_pre_validation_rejected",
+    "deployment_error",
+    "runtime_error",
+    "execution_gate_error",
+}
+
+_PRE_DEPLOYMENT_RESULTS = {
+    "incomplete_generation",
+    "yaml_syntax_error",
+    "ai_pre_validation_rejected",
+}
+
+_EXECUTION_RESULTS = {
+    "deployment_error",
+    "runtime_error",
+    "execution_gate_error",
 }
 
 
@@ -34,9 +49,9 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         value for value in attempt_results if value in _REGENERATION_RESULTS
     ]
     actual_regeneration_triggers = [
-        value
-        for index, value in enumerate(attempt_results)
-        if value in _REGENERATION_RESULTS and index < len(attempt_results) - 1
+        str(attempt.get("result", "unknown"))
+        for attempt in attempts
+        if attempt.get("regeneration_trigger")
     ]
     validator_statuses: list[str] = []
     runtime_failure_labels: list[str] = []
@@ -47,6 +62,7 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
     deployment_attempts = 0
     deployment_successes = 0
     runtime_observations = 0
+    runtime_container_log_records = 0
     execution_gate_runs = 0
     hidden_verifier_runs = 0
     hidden_passed = 0
@@ -54,6 +70,7 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
     hidden_total = 0
     init_diagnostic_pods = 0
     init_diagnostic_containers = 0
+    cluster_attempts = 0
 
     for attempt in attempts:
         pre_execution = attempt.get("pre_execution")
@@ -68,6 +85,7 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
 
         deployment = attempt.get("deployment")
         if isinstance(deployment, dict):
+            cluster_attempts += 1
             deployment_attempts += 1
             if deployment.get("returncode") == 0:
                 deployment_successes += 1
@@ -75,6 +93,9 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         runtime = attempt.get("runtime")
         if isinstance(runtime, dict):
             runtime_observations += 1
+            logs = runtime.get("container_logs", []) or []
+            if isinstance(logs, list):
+                runtime_container_log_records += len(logs)
             for failure in runtime.get("failures", []) or []:
                 if isinstance(failure, dict):
                     runtime_failure_labels.append(_failure_label(failure))
@@ -161,11 +182,23 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         "regeneration_eligible_failure_counts": _counts(
             eligible_regeneration_results
         ),
+        "pre_deployment_regenerations": sum(
+            value in _PRE_DEPLOYMENT_RESULTS
+            for value in actual_regeneration_triggers
+        ),
+        "execution_feedback_regenerations": sum(
+            value in _EXECUTION_RESULTS for value in actual_regeneration_triggers
+        ),
+        "validator_rejections": sum(
+            value == "ai_pre_validation_rejected" for value in attempt_results
+        ),
         "yaml_valid_candidates": yaml_valid_candidates,
         "validator_status_counts": _counts(validator_statuses),
+        "cluster_attempts": cluster_attempts,
         "deployment_attempts": deployment_attempts,
         "deployment_successes": deployment_successes,
         "runtime_observations": runtime_observations,
+        "runtime_container_log_records": runtime_container_log_records,
         "runtime_failure_counts": _counts(runtime_failure_labels),
         "execution_gate_runs": execution_gate_runs,
         "execution_gate_status_counts": _counts(execution_statuses),
@@ -178,6 +211,14 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         "hidden_failed": hidden_failed,
         "hidden_total": hidden_total,
         "hidden_failed_requirement_ids": sorted(hidden_failed_requirement_ids),
+        "accepted_attempt": next(
+            (
+                attempt.get("attempt")
+                for attempt in attempts
+                if attempt.get("result") == "accepted"
+            ),
+            None,
+        ),
         "model_responses": int(usage.get("requests") or 0),
         "generator_responses": int(generator_usage.get("requests") or 0),
         "validator_responses": int(validator_usage.get("requests") or 0),

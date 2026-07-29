@@ -30,7 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Generate, pre-validate, deploy, and evaluate Kubernetes YAML with "
-            "bounded pre-execution correction."
+            "bounded pre-execution and execution-feedback correction."
         )
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
@@ -112,10 +112,13 @@ def _plan(config: Any) -> dict[str, Any]:
                 "incomplete generation",
                 "YAML syntax error",
                 "AI-validator rejection",
+                "candidate-caused kubectl apply failure",
+                "concrete candidate runtime failure",
+                "generic execution-gate failure",
             ],
             "maximum_regenerations": config.pipeline.max_regenerations,
             "validator_repair_scope": (
-                "change only cited requirement/problem/correction defects"
+                "fix cited defects and required dependent changes only"
                 if config.ai_validator.feedback_mode == "detailed"
                 else "negative verdict provides no cited defect details"
             ),
@@ -150,7 +153,9 @@ def _plan(config: Any) -> dict[str, Any]:
                 "capture bounded init-container state, current logs, and previous "
                 "logs after restarts"
             ),
-            "failure_policy": "log as ground truth; never send to the model",
+            "failure_policy": (
+                "return candidate-attributable diagnostics for bounded regeneration"
+            ),
             "task_specific": False,
         },
         "deployment": "kubectl apply --validate=false with no namespace override",
@@ -160,7 +165,7 @@ def _plan(config: Any) -> dict[str, Any]:
         ),
         "post_execution_failure_policy": {
             "deployment_runtime_and_generic_execution": (
-                "log ground-truth failure; never regenerate"
+                "regenerate with bounded generic diagnostics when candidate-caused"
             ),
             "hidden_specification_oracle": (
                 "log discrepancy; never send to the model or regenerate"

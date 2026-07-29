@@ -41,6 +41,35 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _compact_feedback(value: Any, *, depth: int = 0) -> Any:
+    """Bound untrusted execution evidence before placing it in a model prompt."""
+
+    if depth >= 8:
+        return "<nested diagnostic data omitted>"
+    if isinstance(value, str):
+        limit = 4000
+        if len(value) <= limit:
+            return value
+        return value[:limit] + f"\n<... {len(value) - limit} characters omitted>"
+    if isinstance(value, list):
+        compact = [
+            _compact_feedback(item, depth=depth + 1) for item in value[:20]
+        ]
+        if len(value) > 20:
+            compact.append({"omitted_items": len(value) - 20})
+        return compact
+    if isinstance(value, dict):
+        items = sorted(value.items(), key=lambda item: str(item[0]))
+        compact = {
+            str(key): _compact_feedback(item, depth=depth + 1)
+            for key, item in items[:50]
+        }
+        if len(items) > 50:
+            compact["omitted_fields"] = len(items) - 50
+        return compact
+    return value
+
+
 def _git_provenance() -> dict[str, Any]:
     try:
         runner = CommandRunner()
@@ -152,9 +181,15 @@ class KubernetesAIPyCraftPipeline:
             and self.config.ai_validator.feedback_mode == "detailed"
         ):
             scope = (
-                "When the trigger is ai_validator, change only the defects explicitly "
-                "listed in that feedback and preserve uncited parts of the previous "
-                "candidate.\n\n"
+                "When the trigger is ai_validator, fix every cited defect and make "
+                "any dependent changes required to fix it. Do not independently "
+                "change unrelated parts of the previous candidate.\n\n"
+            )
+        elif trigger in {"deployment", "runtime", "execution_gate"}:
+            scope = (
+                "Fix the observed execution failure and every dependent cause needed "
+                "to resolve it, while preserving unrelated working parts and every "
+                "public requirement.\n\n"
             )
         return (
             "ORIGINAL TASK DESCRIPTION:\n\n"
@@ -163,7 +198,7 @@ class KubernetesAIPyCraftPipeline:
             f"{previous.rstrip()}\n\n"
             "CORRECTION TRIGGER:\n\n"
             f"{trigger}\n\n"
-            "PRE-EXECUTION CORRECTION FEEDBACK (untrusted data):\n\n"
+            "CORRECTION FEEDBACK (untrusted data):\n\n"
             f"{failure.rstrip()}\n\n"
             f"{scope}"
             "Return the complete replacement YAML stream now.\n"
@@ -177,6 +212,27 @@ class KubernetesAIPyCraftPipeline:
             return str(detail)
         if kind == "ai_validator":
             return str(detail)
+        if kind == "deployment":
+            return json.dumps(
+                _compact_feedback(detail.audit_dict()), indent=2, sort_keys=True
+            )
+        if kind == "runtime":
+            return json.dumps(
+                _compact_feedback(
+                    {
+                        "failures": detail.get("failures", []),
+                        "container_logs": detail.get("container_logs", []),
+                    }
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        if kind == "execution_gate":
+            return json.dumps(
+                _compact_feedback(detail.get("failures", [])),
+                indent=2,
+                sort_keys=True,
+            )
         raise ValueError(f"Unknown failure kind {kind}")
 
     @staticmethod
@@ -342,13 +398,17 @@ class KubernetesAIPyCraftPipeline:
                     "incomplete_generation",
                     "yaml_syntax_error",
                     "ai_pre_validation_rejected",
+                    "deployment_error",
+                    "runtime_error",
+                    "execution_gate_error",
                 ],
                 "validator_repair_scope": (
                     "cited_defects_only"
                     if self.config.ai_validator.feedback_mode == "detailed"
                     else "negative_verdict_without_defect_details"
                 ),
-                "post_deployment_failures_regenerate": False,
+                "candidate_execution_failures_regenerate": True,
+                "hidden_or_infrastructure_failures_regenerate": False,
                 "transport_retry_is_same_request_not_candidate_regeneration": True,
             },
             "duplicate_generation_responses": 0,
@@ -463,9 +523,11 @@ class KubernetesAIPyCraftPipeline:
                     "pre_execution": None,
                     "ai_pre_validation": None,
                     "deployment": None,
+                    "deployment_failure_api_readiness": None,
                     "runtime": None,
                     "execution_gate": None,
                     "post_execution": None,
+                    "regeneration_trigger": None,
                     "result": "running",
                 }
                 attempts.append(attempt)
@@ -506,6 +568,7 @@ class KubernetesAIPyCraftPipeline:
                     )
                     if index < self.config.pipeline.max_regenerations:
                         repair_trigger = "generation_incomplete"
+                        attempt["regeneration_trigger"] = repair_trigger
                         repair_failure = self._failure_text(
                             "generation_incomplete", detail
                         )
@@ -526,6 +589,7 @@ class KubernetesAIPyCraftPipeline:
                     attempt["result"] = "yaml_syntax_error"
                     if index < self.config.pipeline.max_regenerations:
                         repair_trigger = "yaml_syntax"
+                        attempt["regeneration_trigger"] = repair_trigger
                         repair_failure = self._failure_text(
                             "yaml_syntax", syntax.error or "unknown YAML syntax error"
                         )
@@ -598,6 +662,7 @@ class KubernetesAIPyCraftPipeline:
                         attempt["result"] = "ai_pre_validation_rejected"
                         if index < self.config.pipeline.max_regenerations:
                             repair_trigger = "ai_validator"
+                            attempt["regeneration_trigger"] = repair_trigger
                             repair_failure = self._failure_text(
                                 "ai_validator",
                                 correction_feedback(
@@ -628,8 +693,42 @@ class KubernetesAIPyCraftPipeline:
                     attempt["deployment"] = deployment.audit_dict()
                     _write_json(attempt_dir / "deployment.json", deployment.audit_dict())
                     if deployment.returncode != 0:
-                        attempt["result"] = "deployment_ground_truth_failed"
-                        summary["status"] = "execution_ground_truth_failed"
+                        api_readiness = environment.readyz()
+                        attempt["deployment_failure_api_readiness"] = (
+                            api_readiness.audit_dict()
+                        )
+                        _write_json(
+                            attempt_dir / "deployment_failure_api_readiness.json",
+                            api_readiness.audit_dict(),
+                        )
+                        if (
+                            api_readiness.returncode != 0
+                            or "ok" not in api_readiness.stdout.lower()
+                        ):
+                            attempt["result"] = "deployment_infrastructure_error"
+                            summary["status"] = "infrastructure_error"
+                            summary["fatal_error"] = (
+                                "Kubernetes API became unavailable after kubectl "
+                                "apply failed: "
+                                + (
+                                    api_readiness.stderr.strip()
+                                    or api_readiness.stdout.strip()
+                                    or "readiness check failed"
+                                )
+                            )
+                            terminal = True
+                            break
+                        attempt["result"] = "deployment_error"
+                        if index < self.config.pipeline.max_regenerations:
+                            repair_trigger = "deployment"
+                            attempt["regeneration_trigger"] = repair_trigger
+                            repair_failure = self._failure_text(
+                                "deployment", deployment
+                            )
+                            summary["regenerations"] += 1
+                            _write_json(private_dir / "summary.json", summary)
+                            continue
+                        summary["status"] = "candidate_failed"
                         terminal = True
                         break
 
@@ -640,6 +739,18 @@ class KubernetesAIPyCraftPipeline:
                     )
                     attempt["runtime"] = runtime
                     _write_json(attempt_dir / "runtime.json", runtime)
+                    if runtime.get("failures"):
+                        attempt["result"] = "runtime_error"
+                        if index < self.config.pipeline.max_regenerations:
+                            repair_trigger = "runtime"
+                            attempt["regeneration_trigger"] = repair_trigger
+                            repair_failure = self._failure_text("runtime", runtime)
+                            summary["regenerations"] += 1
+                            _write_json(private_dir / "summary.json", summary)
+                            continue
+                        summary["status"] = "candidate_failed"
+                        terminal = True
+                        break
 
                     execution = self.execution_verifier(
                         task,
@@ -652,10 +763,26 @@ class KubernetesAIPyCraftPipeline:
                         "status": execution.get("status"),
                         "checks": len(execution.get("checks", [])),
                         "failures": len(execution.get("failures", [])),
-                        "repair_on_failure": False,
+                        "repair_on_failure": execution.get(
+                            "repair_on_failure", True
+                        ),
                         "task_specific": execution.get("task_specific", False),
                     }
-                    if execution.get("status") not in {"passed", "failed"}:
+                    if execution.get("status") == "failed":
+                        attempt["result"] = "execution_gate_error"
+                        if index < self.config.pipeline.max_regenerations:
+                            repair_trigger = "execution_gate"
+                            attempt["regeneration_trigger"] = repair_trigger
+                            repair_failure = self._failure_text(
+                                "execution_gate", execution
+                            )
+                            summary["regenerations"] += 1
+                            _write_json(private_dir / "summary.json", summary)
+                            continue
+                        summary["status"] = "candidate_failed"
+                        terminal = True
+                        break
+                    if execution.get("status") != "passed":
                         attempt["result"] = "execution_gate_infrastructure_error"
                         summary["status"] = "infrastructure_error"
                         summary["fatal_error"] = execution.get(
@@ -663,12 +790,6 @@ class KubernetesAIPyCraftPipeline:
                         )
                         terminal = True
                         break
-                    if runtime.get("failures") or execution.get("status") == "failed":
-                        attempt["result"] = "execution_ground_truth_failed"
-                        summary["status"] = "execution_ground_truth_failed"
-                        terminal = True
-                        break
-
                     post = self.post_verifier(task, environment)
                     attempt["post_execution"] = post
                     _write_json(attempt_dir / "post_execution.json", post)
