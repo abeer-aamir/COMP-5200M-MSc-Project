@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import ipaddress
+import math
 import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -12,13 +13,8 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "benchmark" / "aipycraft_config.json"
 FROZEN_API_BASE = "https://openrouter.ai/api/v1"
-FROZEN_MODEL = "openai/gpt-5-mini"
-FROZEN_PROVIDERS = ("openai",)
-FROZEN_TEMPERATURE = None
-FROZEN_REASONING_EFFORT = "low"
-FROZEN_INPUT_PRICE = Decimal("0.25")
-FROZEN_OUTPUT_PRICE = Decimal("2.00")
 FROZEN_MAX_REGENERATIONS = 5
+FROZEN_API_LOSS_CONFIRMATION_REPLAYS = 1
 
 
 class ConfigError(ValueError):
@@ -41,6 +37,7 @@ class ApiConfig:
 @dataclass(frozen=True)
 class PipelineSettings:
     max_regenerations: int
+    candidate_api_loss_confirmation_replays: int
     runtime_observation_seconds: int
     runtime_poll_seconds: float
     command_timeout_seconds: int
@@ -51,6 +48,7 @@ class PipelineSettings:
 class AiValidatorConfig:
     enabled: bool
     feedback_mode: str
+    shadow_mode: bool
 
 
 @dataclass(frozen=True)
@@ -146,8 +144,22 @@ def _decimal(value: Any, label: str) -> Decimal:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
         raise ConfigError(f"{label} must be a decimal number") from exc
-    if result < 0:
-        raise ConfigError(f"{label} cannot be negative")
+    if not result.is_finite() or result < 0:
+        raise ConfigError(f"{label} must be a finite non-negative number")
+    return result
+
+
+def _positive_number(value: Any, label: str, *, integer: bool) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{label} must be a positive number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{label} must be a positive number") from exc
+    if not math.isfinite(result) or result <= 0:
+        raise ConfigError(f"{label} must be above zero")
+    if integer and not result.is_integer():
+        raise ConfigError(f"{label} must be a whole number")
     return result
 
 
@@ -316,7 +328,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         },
         "configuration",
     )
-    if raw["schema_version"] != 1:
+    if raw["schema_version"] != 2:
         raise ConfigError("Unsupported configuration schema_version")
 
     api = _exact_keys(
@@ -344,39 +356,50 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         raise ConfigError(
             "The live API base is locked to the official OpenRouter HTTPS endpoint"
         )
-    model = str(api["model"])
-    if model != FROZEN_MODEL:
-        raise ConfigError(f"The frozen baseline model must be {FROZEN_MODEL}")
+    model = str(api["model"]).strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+/[A-Za-z0-9._:-]+", model):
+        raise ConfigError("api.model must be an explicit provider/model slug")
     normalized_providers = tuple(item.strip().lower() for item in providers)
-    if normalized_providers != FROZEN_PROVIDERS:
-        raise ConfigError("The frozen treatment provider must be OpenAI only")
+    if len(normalized_providers) != 1:
+        raise ConfigError(
+            "Frozen experiments require exactly one explicit provider route"
+        )
     if api["allow_fallbacks"] is not False:
         raise ConfigError("Frozen experiments require allow_fallbacks=false")
     retries = api["transport_retries"]
     if isinstance(retries, bool) or retries not in {0, 1}:
         raise ConfigError("api.transport_retries must be 0 or 1")
     temperature_value = api["temperature"]
-    temperature = (
-        None if temperature_value is None else float(temperature_value)
-    )
-    if temperature is not FROZEN_TEMPERATURE:
-        raise ConfigError(
-            "The frozen GPT-5 Mini treatment omits unsupported temperature"
+    if isinstance(temperature_value, bool):
+        raise ConfigError("api.temperature must be null or a number from 0 to 2")
+    try:
+        temperature = (
+            None if temperature_value is None else float(temperature_value)
         )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "api.temperature must be null or a number from 0 to 2"
+        ) from exc
+    if temperature is not None and not 0 <= temperature <= 2:
+        raise ConfigError("api.temperature must be between 0 and 2")
     reasoning_effort = api["reasoning_effort"]
-    if reasoning_effort != FROZEN_REASONING_EFFORT:
-        raise ConfigError(
-            "The frozen GPT-5 Mini treatment requires reasoning_effort=low"
-        )
+    if reasoning_effort is not None and (
+        not isinstance(reasoning_effort, str) or not reasoning_effort.strip()
+    ):
+        raise ConfigError("api.reasoning_effort must be null or a non-empty string")
+    normalized_reasoning_effort = (
+        reasoning_effort.strip().lower()
+        if isinstance(reasoning_effort, str)
+        else None
+    )
     input_price = _decimal(api["input_usd_per_million"], "input token price")
     output_price = _decimal(api["output_usd_per_million"], "output token price")
-    if input_price != FROZEN_INPUT_PRICE or output_price != FROZEN_OUTPUT_PRICE:
-        raise ConfigError("The frozen baseline price snapshot was modified")
 
     pipeline = _exact_keys(
         raw["pipeline"],
         {
             "max_regenerations",
+            "candidate_api_loss_confirmation_replays",
             "runtime_observation_seconds",
             "runtime_poll_seconds",
             "command_timeout_seconds",
@@ -389,19 +412,42 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             "The baseline is locked to exactly "
             f"{FROZEN_MAX_REGENERATIONS} regenerations"
         )
-    for key in (
-        "runtime_observation_seconds",
-        "runtime_poll_seconds",
-        "command_timeout_seconds",
+    if (
+        isinstance(pipeline["candidate_api_loss_confirmation_replays"], bool)
+        or pipeline["candidate_api_loss_confirmation_replays"]
+        != FROZEN_API_LOSS_CONFIRMATION_REPLAYS
     ):
-        if isinstance(pipeline[key], bool) or float(pipeline[key]) <= 0:
-            raise ConfigError(f"pipeline.{key} must be above zero")
+        raise ConfigError(
+            "The baseline requires exactly one same-candidate confirmation "
+            "after candidate-time Kubernetes API loss"
+        )
+    runtime_observation_seconds = _positive_number(
+        pipeline["runtime_observation_seconds"],
+        "pipeline.runtime_observation_seconds",
+        integer=True,
+    )
+    runtime_poll_seconds = _positive_number(
+        pipeline["runtime_poll_seconds"],
+        "pipeline.runtime_poll_seconds",
+        integer=False,
+    )
+    command_timeout_seconds = _positive_number(
+        pipeline["command_timeout_seconds"],
+        "pipeline.command_timeout_seconds",
+        integer=True,
+    )
 
     ai_validator = _exact_keys(
-        raw["ai_validator"], {"enabled", "feedback_mode"}, "ai_validator"
+        raw["ai_validator"],
+        {"enabled", "feedback_mode", "shadow_mode"},
+        "ai_validator",
     )
     if not isinstance(ai_validator["enabled"], bool):
         raise ConfigError("ai_validator.enabled must be true or false")
+    if not isinstance(ai_validator["shadow_mode"], bool):
+        raise ConfigError("ai_validator.shadow_mode must be true or false")
+    if ai_validator["shadow_mode"] and not ai_validator["enabled"]:
+        raise ConfigError("ai_validator.shadow_mode requires ai_validator.enabled=true")
     feedback_mode = ai_validator["feedback_mode"]
     if feedback_mode not in {"detailed", "verdict_only"}:
         raise ConfigError(
@@ -435,16 +481,19 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             provider_only=normalized_providers,
             allow_fallbacks=False,
             temperature=temperature,
-            reasoning_effort=str(reasoning_effort),
+            reasoning_effort=normalized_reasoning_effort,
             transport_retries=int(retries),
             input_usd_per_million=input_price,
             output_usd_per_million=output_price,
         ),
         pipeline=PipelineSettings(
             max_regenerations=FROZEN_MAX_REGENERATIONS,
-            runtime_observation_seconds=int(pipeline["runtime_observation_seconds"]),
-            runtime_poll_seconds=float(pipeline["runtime_poll_seconds"]),
-            command_timeout_seconds=int(pipeline["command_timeout_seconds"]),
+            candidate_api_loss_confirmation_replays=(
+                FROZEN_API_LOSS_CONFIRMATION_REPLAYS
+            ),
+            runtime_observation_seconds=int(runtime_observation_seconds),
+            runtime_poll_seconds=runtime_poll_seconds,
+            command_timeout_seconds=int(command_timeout_seconds),
             output_root=_project_path(
                 pipeline["output_root"], "pipeline.output_root", must_exist=False
             ),
@@ -452,6 +501,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         ai_validator=AiValidatorConfig(
             enabled=ai_validator["enabled"],
             feedback_mode=str(feedback_mode),
+            shadow_mode=ai_validator["shadow_mode"],
         ),
         environment=EnvironmentConfig(
             lock=load_environment_lock(lock_path),
@@ -469,4 +519,25 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
                 "prompts.validator_verdict_only",
             ),
         ),
+    )
+
+
+def treatment_id(config: AppConfig) -> str:
+    """Return a readable treatment label; the config hash remains authoritative."""
+
+    model = re.sub(r"[^a-z0-9]+", "-", config.api.model.lower()).strip("-")
+    reasoning = config.api.reasoning_effort or "none"
+    temperature = (
+        "default"
+        if config.api.temperature is None
+        else format(config.api.temperature, "g")
+    )
+    if not config.ai_validator.enabled:
+        validator = "validator-off"
+    elif config.ai_validator.shadow_mode:
+        validator = f"validator-shadow-{config.ai_validator.feedback_mode}"
+    else:
+        validator = f"validator-active-{config.ai_validator.feedback_mode}"
+    return (
+        f"{model}__reasoning-{reasoning}__temperature-{temperature}__{validator}"
     )

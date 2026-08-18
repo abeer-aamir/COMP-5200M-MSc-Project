@@ -5,14 +5,20 @@ import json
 import sys
 from pathlib import Path
 
-from .core import EvaluationError, Kubectl
+from aipycraft_k8s.tasks import CANONICAL_TASK_NAMESPACES, load_tasks
+
+from .core import (
+    EvaluationError,
+    EvaluationInfrastructureError,
+    Kubectl,
+    SuiteExecutionError,
+)
 from .suites import run_suite
 
 
-TASK_NAMESPACES = {
-    "pilot-001": "order-system",
-    "pilot-002": "pipeline-ns",
-}
+TASK_NAMESPACES = {task_id: task.namespace for task_id, task in load_tasks().items()}
+if TASK_NAMESPACES != CANONICAL_TASK_NAMESPACES:
+    raise RuntimeError("task index and private evaluator registration differ")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -26,6 +32,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Exact kubectl context. An explicit context is required for safety.",
     )
     parser.add_argument("--kubeconfig", type=Path)
+    parser.add_argument(
+        "--candidate",
+        type=Path,
+        required=True,
+        help="Exact candidate manifest that was deployed into the target cluster.",
+    )
     parser.add_argument("--output", type=Path, help="Optional JSON report path")
     return parser.parse_args(argv)
 
@@ -38,12 +50,26 @@ def main(argv: list[str] | None = None) -> int:
             namespace=TASK_NAMESPACES[args.task],
             kubeconfig=args.kubeconfig,
         )
-        report = run_suite(args.task, kube)
-    except EvaluationError as exc:
+        report = run_suite(args.task, kube, args.candidate)
+    except SuiteExecutionError as exc:
+        report = exc.partial_report()
+    except EvaluationInfrastructureError as exc:
         report = {
             "task_id": args.task,
             "status": "infrastructure_error",
             "error": str(exc),
+        }
+    except EvaluationError as exc:
+        report = {
+            "task_id": args.task,
+            "status": "evaluator_error",
+            "error": str(exc),
+        }
+    except Exception as exc:
+        report = {
+            "task_id": args.task,
+            "status": "evaluator_error",
+            "error": f"{type(exc).__name__}: {exc}",
         }
     encoded = json.dumps(report, indent=2, sort_keys=True)
     print(encoded)

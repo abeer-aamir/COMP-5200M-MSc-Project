@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
+from pathlib import Path
 from typing import Any, Callable
+
+import yaml
 
 from .core import (
     EvaluationError,
+    EvaluationInfrastructureError,
     Kubectl,
+    RequirementFailure,
     ResultCollector,
     all_containers,
     assert_claim,
@@ -27,6 +33,39 @@ from .core import (
 EXPECTED_REQUIREMENTS = {
     "pilot-001": {f"R{number:02d}" for number in range(1, 15)},
     "pilot-002": {f"R{number:02d}" for number in range(1, 15)},
+    "pilot-003": {f"R{number:02d}" for number in range(1, 12)},
+}
+
+_FRESH_CLUSTER_NAMESPACES = {
+    "default",
+    "kube-node-lease",
+    "kube-public",
+    "kube-system",
+    "local-path-storage",
+}
+
+_DEFAULT_NAMESPACE_BASELINE = {
+    "configmaps": {"kube-root-ca.crt"},
+    "serviceaccounts": {"default"},
+    "services": {"kubernetes"},
+}
+
+_DEFAULT_NAMESPACE_EMPTY_KINDS = {
+    "cronjobs",
+    "daemonsets",
+    "deployments",
+    "jobs",
+    "networkpolicies",
+    "persistentvolumeclaims",
+    "poddisruptionbudgets",
+    "pods",
+    "replicasets",
+    "replicationcontrollers",
+    "resourcequotas",
+    "rolebindings",
+    "roles",
+    "secrets",
+    "statefulsets",
 }
 
 
@@ -48,7 +87,114 @@ def _service_port(service: dict[str, Any], port: int) -> dict[str, Any]:
     for candidate in service.get("spec", {}).get("ports", []):
         if candidate.get("port") == port:
             return candidate
-    raise EvaluationError(f"Service does not expose port {port}")
+    raise RequirementFailure(f"Service does not expose port {port}")
+
+
+def _resolved_target_port(
+    service_port: dict[str, Any], workload: dict[str, Any]
+) -> str:
+    target = service_port.get("targetPort", service_port.get("port"))
+    if isinstance(target, str) and not target.isdigit():
+        matches = {
+            item.get("containerPort")
+            for container in pod_spec(workload).get("containers", [])
+            for item in container.get("ports", [])
+            if item.get("name") == target
+        }
+        require(
+            len(matches) == 1,
+            f"named targetPort {target!r} does not resolve unambiguously",
+        )
+        target = matches.pop()
+    return int_or_string(target)
+
+
+def _container_exposes_configmap_keys(
+    container: dict[str, Any], configmap_name: str, keys: set[str]
+) -> bool:
+    for source in container.get("envFrom", []) or []:
+        if not isinstance(source, dict) or source.get("prefix"):
+            continue
+        if source.get("configMapRef", {}).get("name") == configmap_name:
+            return True
+
+    mappings: dict[str, tuple[str | None, str | None]] = {}
+    for item in container.get("env", []) or []:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        ref = item.get("valueFrom", {}).get("configMapKeyRef", {})
+        mappings[item["name"]] = (ref.get("name"), ref.get("key"))
+    return all(mappings.get(key) == (configmap_name, key) for key in keys)
+
+
+def _decode_secret_value(encoded: Any, key: str) -> str:
+    try:
+        return base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, TypeError, UnicodeDecodeError, ValueError) as exc:
+        raise RequirementFailure(f"Secret key {key} is not valid base64 UTF-8") from exc
+
+
+def _container_exposes_secret_key(
+    container: dict[str, Any], secret_name: str, key: str, env_name: str
+) -> bool:
+    explicit = [
+        item
+        for item in container.get("env", []) or []
+        if isinstance(item, dict) and item.get("name") == env_name
+    ]
+    explicit_match = False
+    if len(explicit) == 1:
+        ref = explicit[0].get("valueFrom", {}).get("secretKeyRef", {})
+        explicit_match = ref.get("name") == secret_name and ref.get("key") == key
+
+    env_from = [
+        item
+        for item in container.get("envFrom", []) or []
+        if isinstance(item, dict)
+        and not item.get("prefix")
+        and item.get("secretRef", {}).get("name") == secret_name
+    ]
+    return (explicit_match and not env_from) or (not explicit and len(env_from) == 1)
+
+
+def _assert_secret_not_in_environment(
+    spec: dict[str, Any], secret_name: str
+) -> None:
+    for container in all_containers(spec):
+        label = container.get("name", "<unnamed>")
+        for item in container.get("env", []) or []:
+            if not isinstance(item, dict):
+                continue
+            require(
+                item.get("valueFrom", {})
+                .get("secretKeyRef", {})
+                .get("name")
+                != secret_name,
+                f"Secret {secret_name} is exposed in container {label} through env",
+            )
+        for item in container.get("envFrom", []) or []:
+            if not isinstance(item, dict):
+                continue
+            require(
+                item.get("secretRef", {}).get("name") != secret_name,
+                f"Secret {secret_name} is exposed in container {label} through envFrom",
+            )
+
+
+def _startup_probe_window_seconds(probe: dict[str, Any]) -> int:
+    values = {
+        "initialDelaySeconds": probe.get("initialDelaySeconds", 0),
+        "failureThreshold": probe.get("failureThreshold", 3),
+        "periodSeconds": probe.get("periodSeconds", 10),
+    }
+    for name, value in values.items():
+        require(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+            f"startupProbe {name} must be a non-negative integer",
+        )
+    return values["initialDelaySeconds"] + (
+        values["failureThreshold"] * values["periodSeconds"]
+    )
 
 
 def _volume_for_mount(spec: dict[str, Any], container: dict[str, Any], path: str) -> dict[str, Any]:
@@ -65,7 +211,7 @@ def _policy_selecting(kube: Kubectl, role: str, direction: str) -> dict[str, Any
         policy_types = set(policy.get("spec", {}).get("policyTypes", []))
         if selector.get("role") == role and direction in policy_types:
             return policy
-    raise EvaluationError(f"no {direction} NetworkPolicy selects role={role}")
+    raise RequirementFailure(f"no {direction} NetworkPolicy selects role={role}")
 
 
 def _pdb_for_role(kube: Kubectl, role: str) -> dict[str, Any]:
@@ -73,7 +219,7 @@ def _pdb_for_role(kube: Kubectl, role: str) -> dict[str, Any]:
         labels = pdb.get("spec", {}).get("selector", {}).get("matchLabels", {})
         if labels.get("role") == role:
             return pdb
-    raise EvaluationError(f"no PodDisruptionBudget selects role={role}")
+    raise RequirementFailure(f"no PodDisruptionBudget selects role={role}")
 
 
 def _wait_deployment_ready(kube: Kubectl, name: str, replicas: int, timeout: int = 180) -> None:
@@ -139,14 +285,110 @@ def _assert_no_secret_volume(spec: dict[str, Any], secret_name: str) -> None:
             )
 
 
-def _check_namespace(kube: Kubectl, expected: str) -> str:
+def _manifest_resources(document: Any) -> list[dict[str, Any]]:
+    """Flatten Kubernetes List documents without consulting live cluster baselines."""
+
+    require(isinstance(document, dict), "candidate contains a non-object YAML document")
+    kind = document.get("kind")
+    require(isinstance(kind, str) and bool(kind.strip()), "candidate resource has no kind")
+    if kind == "List" or kind.endswith("List"):
+        items = document.get("items")
+        require(isinstance(items, list), f"{kind} resource has no items list")
+        flattened: list[dict[str, Any]] = []
+        for item in items:
+            flattened.extend(_manifest_resources(item))
+        return flattened
+    return [document]
+
+
+def _assert_candidate_manifest_scope(
+    kube: Kubectl, candidate_path: Path, expected: str
+) -> str:
+    """Require every candidate-declared object to belong to the task namespace."""
+
+    try:
+        with candidate_path.open("r", encoding="utf-8") as handle:
+            documents = list(yaml.safe_load_all(handle))
+    except OSError as exc:
+        raise EvaluationInfrastructureError(
+            f"cannot read the deployed candidate manifest: {exc}"
+        ) from exc
+    except yaml.YAMLError as exc:
+        raise RequirementFailure(f"candidate manifest cannot be parsed: {exc}") from exc
+
+    resources = [
+        resource
+        for document in documents
+        if document is not None
+        for resource in _manifest_resources(document)
+    ]
+    require(bool(resources), "candidate manifest declares no Kubernetes resources")
+
+    for resource in resources:
+        kind = resource["kind"]
+        api_version = resource.get("apiVersion")
+        metadata = resource.get("metadata")
+        require(isinstance(metadata, dict), f"{kind} resource has no metadata object")
+        name = metadata.get("name", "<unnamed>")
+        declared_namespace = metadata.get("namespace")
+        namespaced = kube.resource_is_namespaced(api_version, kind)
+        if not namespaced:
+            require(
+                api_version == "v1"
+                and kind == "Namespace"
+                and name == expected
+                and declared_namespace is None,
+                f"candidate cluster-scoped {api_version}/{kind} {name!r} is not "
+                f"the allowed Namespace {expected!r}",
+            )
+            continue
+        require(
+            declared_namespace == expected,
+            f"candidate {kind} {name!r} declares namespace "
+            f"{declared_namespace or '<default>'!r}; expected {expected!r}",
+        )
+
+    return f"all {len(resources)} candidate resources are scoped to {expected}"
+
+
+def _check_namespace(kube: Kubectl, expected: str, candidate_path: Path) -> str:
     namespace = kube.get("namespace", expected, namespace=False)
     require(namespace.get("metadata", {}).get("name") == expected, "namespace is absent")
     require(namespace.get("status", {}).get("phase") == "Active", "namespace is not Active")
-    return f"namespace {expected} is Active"
+    scope = _assert_candidate_manifest_scope(kube, candidate_path, expected)
+
+    namespace_names = {
+        item.get("metadata", {}).get("name")
+        for item in kube.list("namespaces", namespace=False)
+    }
+    unexpected_namespaces = namespace_names - (_FRESH_CLUSTER_NAMESPACES | {expected})
+    require(
+        not unexpected_namespaces,
+        f"unexpected namespaces exist: {sorted(unexpected_namespaces)}",
+    )
+    for kind, allowed_names in _DEFAULT_NAMESPACE_BASELINE.items():
+        actual_names = {
+            item.get("metadata", {}).get("name")
+            for item in kube.list(kind, namespace="default")
+        }
+        require(
+            actual_names <= allowed_names,
+            f"unexpected {kind} exist in default: "
+            f"{sorted(actual_names - allowed_names)}",
+        )
+    for kind in sorted(_DEFAULT_NAMESPACE_EMPTY_KINDS):
+        items = kube.list(kind, namespace="default")
+        require(
+            not items,
+            f"unexpected {kind} exist in default: "
+            f"{sorted(item.get('metadata', {}).get('name') for item in items)}",
+        )
+    return f"namespace {expected} is Active; {scope}; live isolation is preserved"
 
 
-def _task1_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None]]]:
+def _task1_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
     def r02() -> str:
         statefulset = kube.get("statefulset", "cache")
         service = kube.get("service", "cache-headless")
@@ -189,14 +431,16 @@ def _task1_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
         }
         require(config.get("data") == expected, f"api-config data differs: {config.get('data')}")
         encoded = secret.get("data", {}).get("API_KEY", "")
-        require(base64.b64decode(encoded).decode() == "pilot-token", "API_KEY placeholder differs")
+        require(
+            _decode_secret_value(encoded, "API_KEY") == "pilot-token",
+            "API_KEY placeholder differs",
+        )
         spec = pod_spec(deployment)
         container = _main_container(deployment)
-        refs = {
-            item.get("configMapRef", {}).get("name")
-            for item in container.get("envFrom", [])
-        }
-        require("api-config" in refs, "api-config is not exposed with envFrom")
+        require(
+            _container_exposes_configmap_keys(container, "api-config", set(expected)),
+            "api-config is not exposed as the requested environment variables",
+        )
         volume = _volume_for_mount(spec, container, "/etc/api/secrets")
         projected = volume.get("projected", {})
         require(projected.get("defaultMode") == 0o440, "projected Secret mode is not 0440")
@@ -204,11 +448,7 @@ def _task1_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
             source.get("secret", {}).get("name") for source in projected.get("sources", [])
         }
         require("api-credentials" in names, "api-credentials is not projected")
-        for item in container.get("env", []):
-            require(
-                item.get("valueFrom", {}).get("secretKeyRef", {}).get("name") != "api-credentials",
-                "api-credentials must not also be an environment variable",
-            )
+        _assert_secret_not_in_environment(spec, "api-credentials")
         return "ConfigMap environment and projected Secret are wired correctly"
 
     def r05() -> str:
@@ -225,7 +465,10 @@ def _task1_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
         service = kube.get("service", "api-svc")
         require(service["spec"].get("type", "ClusterIP") == "ClusterIP", "api-svc is not ClusterIP")
         port = _service_port(service, 80)
-        require(int_or_string(port.get("targetPort")) == "8080", "api-svc targetPort is not 8080")
+        require(
+            _resolved_target_port(port, kube.get("deployment", "api")) == "8080",
+            "api-svc targetPort does not resolve to 8080",
+        )
         probe = kube.run_probe_pod(
             "aipc-eval-api-service",
             "wget -q -T 5 -O /dev/null http://api-svc:80/health",
@@ -351,7 +594,15 @@ def _task1_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
         return f"quota is correct and current pod use is {used_pods}/10"
 
     return [
-        ("R01", "isolated order-system namespace", lambda: _check_namespace(kube, "order-system")),
+        (
+            "R01",
+            "isolated order-system namespace",
+            lambda: _check_namespace(
+                kube,
+                "order-system",
+                _require_candidate_path(candidate_path),
+            ),
+        ),
         ("R02", "cache StatefulSet, Service, and storage", r02),
         ("R03", "API replicas, port, and dependency readiness", r03),
         ("R04", "API configuration and Secret projection", r04),
@@ -368,7 +619,9 @@ def _task1_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
     ]
 
 
-def _task2_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None]]]:
+def _task2_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
     def r02() -> str:
         config = kube.get("configmap", "pipeline-config")
         require(config.get("data") == {"WORKER_COUNT": "3", "POLL_INTERVAL": "5"}, "pipeline-config data differs")
@@ -382,20 +635,40 @@ def _task2_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
     def r03() -> str:
         secret = kube.get("secret", "pipeline-secret")
         encoded = secret.get("data", {}).get("API_TOKEN", "")
-        require(base64.b64decode(encoded).decode() == "pilot-token", "API_TOKEN placeholder differs")
+        require(
+            _decode_secret_value(encoded, "API_TOKEN") == "pilot-token",
+            "API_TOKEN placeholder differs",
+        )
         controller = kube.get("deployment", "controller")
-        env_refs = [
-            item.get("valueFrom", {}).get("secretKeyRef", {})
-            for item in _main_container(controller).get("env", [])
-        ]
-        require(any(ref.get("name") == "pipeline-secret" and ref.get("key") == "API_TOKEN" for ref in env_refs), "controller API_TOKEN is not sourced from pipeline-secret")
+        controller_spec = pod_spec(controller)
+        controller_container = _main_container(controller)
+        require(
+            _container_exposes_secret_key(
+                controller_container,
+                "pipeline-secret",
+                "API_TOKEN",
+                "API_TOKEN",
+            ),
+            "controller API_TOKEN is not sourced exactly once from pipeline-secret",
+        )
+        _assert_no_secret_volume(controller_spec, "pipeline-secret")
+        for container in all_containers(controller_spec):
+            if container is controller_container:
+                continue
+            _assert_secret_not_in_environment(
+                {"containers": [container]}, "pipeline-secret"
+            )
         for workload in (
-            controller,
             kube.get("statefulset", "worker"),
             kube.get("cronjob", "marker-job"),
         ):
-            spec = _cron_spec(workload) if workload.get("kind") == "CronJob" else pod_spec(workload)
+            spec = (
+                _cron_spec(workload)
+                if workload.get("kind") == "CronJob"
+                else pod_spec(workload)
+            )
             _assert_no_secret_volume(spec, "pipeline-secret")
+            _assert_secret_not_in_environment(spec, "pipeline-secret")
         return "API_TOKEN is controller-only environment data and is never mounted"
 
     def r04() -> str:
@@ -404,6 +677,11 @@ def _task2_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
         require(service["spec"].get("selector", {}).get("role") == "worker", "worker-svc does not select workers")
         port = _service_port(service, 8080)
         require(port.get("protocol", "TCP") == "TCP", "worker-svc port is not TCP")
+        require(
+            _resolved_target_port(port, kube.get("statefulset", "worker"))
+            == "8080",
+            "worker-svc targetPort does not resolve to 8080",
+        )
         return "headless worker Service selects worker pods on TCP 8080"
 
     def r05() -> str:
@@ -467,7 +745,6 @@ def _task2_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
             "/health",
         ):
             require(value in text, f"controller readiness does not reference {value}")
-        require("-ge 2" in text or ">= 2" in text, "controller readiness does not require at least two successes")
         _wait_deployment_ready(kube, "controller", 1)
         return "controller is Ready and its in-pod probe counts three stable worker endpoints"
 
@@ -564,7 +841,15 @@ def _task2_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
         return "controller became NotReady at one worker and recovered after restoring three"
 
     return [
-        ("R01", "isolated pipeline-ns namespace", lambda: _check_namespace(kube, "pipeline-ns")),
+        (
+            "R01",
+            "isolated pipeline-ns namespace",
+            lambda: _check_namespace(
+                kube,
+                "pipeline-ns",
+                _require_candidate_path(candidate_path),
+            ),
+        ),
         ("R02", "shared pipeline ConfigMap volume", r02),
         ("R03", "controller-only Secret environment", r03),
         ("R04", "headless worker Service", r04),
@@ -581,11 +866,304 @@ def _task2_checks(kube: Kubectl) -> list[tuple[str, str, Callable[[], str | None
     ]
 
 
-def run_suite(task_id: str, kube: Kubectl) -> dict[str, Any]:
+def _task3_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def r02() -> str:
+        deployment = kube.get("deployment", "status-web")
+        require(
+            not pod_spec(deployment).get("initContainers"),
+            "status-web must not have init containers",
+        )
+        require(
+            len(pod_spec(deployment).get("containers", [])) == 1,
+            "status-web must have exactly one application container",
+        )
+        deployment_names = {
+            item.get("metadata", {}).get("name")
+            for item in kube.list("deployments")
+        }
+        require(
+            deployment_names == {"status-web"},
+            f"unexpected Deployments exist: {sorted(deployment_names)}",
+        )
+        service_names = {
+            item.get("metadata", {}).get("name") for item in kube.list("services")
+        }
+        require(
+            service_names == {"status-web-svc"},
+            f"unexpected Services exist: {sorted(service_names)}",
+        )
+        replica_sets = kube.list("replicasets")
+        allowed_replica_sets = {
+            item.get("metadata", {}).get("name")
+            for item in replica_sets
+            if any(
+                owner.get("kind") == "Deployment"
+                and owner.get("name") == "status-web"
+                for owner in item.get("metadata", {}).get("ownerReferences", [])
+            )
+        }
+        require(
+            len(allowed_replica_sets) == len(replica_sets),
+            "a ReplicaSet is not owned by status-web",
+        )
+        for pod in kube.list("pods"):
+            owners = pod.get("metadata", {}).get("ownerReferences", [])
+            require(
+                any(
+                    owner.get("kind") == "ReplicaSet"
+                    and owner.get("name") in allowed_replica_sets
+                    for owner in owners
+                ),
+                f"pod {pod.get('metadata', {}).get('name')} is not owned by status-web",
+            )
+            require(
+                not pod.get("spec", {}).get("initContainers"),
+                "an application pod has an init container",
+            )
+        forbidden = {
+            "StatefulSets": kube.list("statefulsets"),
+            "DaemonSets": kube.list("daemonsets"),
+            "ReplicationControllers": kube.list("replicationcontrollers"),
+            "persistent volume claims": kube.list("persistentvolumeclaims"),
+            "Jobs": kube.list("jobs"),
+            "CronJobs": kube.list("cronjobs"),
+        }
+        present = [label for label, items in forbidden.items() if items]
+        require(not present, f"forbidden workload/storage resources exist: {present}")
+        headless = [
+            item.get("metadata", {}).get("name", "")
+            for item in kube.list("services")
+            if item.get("spec", {}).get("clusterIP") == "None"
+        ]
+        require(not headless, f"headless Services are forbidden: {headless}")
+        return "the application has no dependency-gating or stateful topology"
+
+    def r03() -> str:
+        config = kube.get("configmap", "site-content")
+        expected = {
+            "index.html": "AIPyCraft pilot service\n",
+            "health": "ok\n",
+        }
+        require(config.get("data") == expected, f"site-content data differs: {config.get('data')}")
+        deployment = kube.get("deployment", "status-web")
+        spec = pod_spec(deployment)
+        container = _main_container(deployment)
+        mount = find_mount(container, "/www")
+        require(mount is not None, "site-content is not mounted at /www")
+        volume = find_volume(spec, mount.get("name", ""))
+        require(volume is not None, f"volume {mount.get('name')!r} does not exist")
+        require(
+            volume.get("configMap", {}).get("name") == "site-content",
+            "/www is not backed by site-content",
+        )
+        return "exact site content is mounted read-only at /www"
+
+    def r04() -> str:
+        secret = kube.get("secret", "site-secret")
+        encoded = secret.get("data", {}).get("RELEASE_CHANNEL", "")
+        require(
+            _decode_secret_value(encoded, "RELEASE_CHANNEL") == "pilot",
+            "RELEASE_CHANNEL placeholder differs",
+        )
+        deployment = kube.get("deployment", "status-web")
+        spec = pod_spec(deployment)
+        container = _main_container(deployment)
+        require(
+            _container_exposes_secret_key(
+                container,
+                "site-secret",
+                "RELEASE_CHANNEL",
+                "RELEASE_CHANNEL",
+            ),
+            "RELEASE_CHANNEL is not sourced exactly once from site-secret",
+        )
+        _assert_no_secret_volume(spec, "site-secret")
+        return "site-secret is exposed only through the requested environment variable"
+
+    def r05() -> str:
+        deployment = kube.get("deployment", "status-web")
+        require(deployment.get("spec", {}).get("replicas") == 2, "status-web must have 2 replicas")
+        labels = pod_labels(deployment)
+        require(labels.get("app") == "status-web", "pod label app=status-web is missing")
+        _assert_pod_label_and_service_account(deployment, "web", "status-web-sa")
+        selector = deployment.get("spec", {}).get("selector", {}).get("matchLabels", {})
+        require(selector.get("app") == "status-web", "Deployment selector does not match app=status-web")
+        container = _main_container(deployment)
+        require(container.get("image") == "busybox:1.36.1", "web image must be busybox:1.36.1")
+        ports = {item.get("containerPort") for item in container.get("ports", [])}
+        require(8080 in ports, "web container does not expose port 8080")
+        text = command_text(container)
+        for value in ("httpd", "-f", "8080", "/www"):
+            require(value in text, f"web command does not reference {value}")
+        strategy = deployment.get("spec", {}).get("strategy", {})
+        require(strategy.get("type", "RollingUpdate") == "RollingUpdate", "status-web must use RollingUpdate")
+        rolling = strategy.get("rollingUpdate", {})
+        require(int_or_string(rolling.get("maxUnavailable")) == "0", "maxUnavailable must be 0")
+        require(int_or_string(rolling.get("maxSurge")) == "1", "maxSurge must be 1")
+        kube.rollout("deployment", "status-web", timeout_seconds=120)
+        return "two status-web replicas serve /www with the requested rollout strategy"
+
+    def r06() -> str:
+        container = _main_container(kube.get("deployment", "status-web"))
+        named_ports = {
+            item.get("name"): item.get("containerPort")
+            for item in container.get("ports", [])
+            if item.get("name")
+        }
+
+        def assert_http_probe(name: str) -> dict[str, Any]:
+            probe = container.get(name, {})
+            http_get = probe.get("httpGet", {})
+            require(http_get.get("path") == "/health", f"{name} path must be /health")
+            port = http_get.get("port")
+            resolved = named_ports.get(port, port)
+            require(int_or_string(resolved) == "8080", f"{name} must target port 8080")
+            return probe
+
+        startup = assert_http_probe("startupProbe")
+        readiness = assert_http_probe("readinessProbe")
+        liveness = assert_http_probe("livenessProbe")
+        startup_window = _startup_probe_window_seconds(startup)
+        require(startup_window >= 30, "startup probe allows less than 30 seconds")
+        for name, probe in (("readinessProbe", readiness), ("livenessProbe", liveness)):
+            require(probe.get("periodSeconds", 10) <= 10, f"{name} runs less often than every 10 seconds")
+        return "startup, readiness, and liveness HTTP probes use /health on port 8080"
+
+    def r07() -> str:
+        service = kube.get("service", "status-web-svc")
+        require(service.get("spec", {}).get("type", "ClusterIP") == "ClusterIP", "status-web-svc is not ClusterIP")
+        require(service.get("spec", {}).get("clusterIP") not in {None, "", "None"}, "status-web-svc has no ClusterIP")
+        require(service.get("spec", {}).get("selector", {}).get("app") == "status-web", "Service does not select app=status-web")
+        port = _service_port(service, 80)
+        require(port.get("protocol", "TCP") == "TCP", "Service port is not TCP")
+        require(
+            _resolved_target_port(port, kube.get("deployment", "status-web"))
+            == "8080",
+            "Service targetPort does not resolve to 8080",
+        )
+        cluster_ip = service["spec"]["clusterIP"]
+        probe = kube.run_probe_pod(
+            "aipc-eval-status-web",
+            "set -eu; "
+            f"test \"$(wget -q -T 5 -O - http://{cluster_ip}:80/)\" = \"AIPyCraft pilot service\"; "
+            f"test \"$(wget -q -T 5 -O - http://{cluster_ip}:80/health)\" = ok",
+        )
+        return f"ClusterIP Service returns the exact index and health content; {probe}"
+
+    def r08() -> str:
+        deployment = kube.get("deployment", "status-web")
+        require(
+            pod_spec(deployment).get("serviceAccountName") == "status-web-sa",
+            "status-web does not use status-web-sa",
+        )
+        role = role_bound_to_service_account(kube, "status-web-sa")
+        assert_exact_role(role, {"get", "list"}, {"configmaps"})
+        allowed = all(
+            kube.auth_can_i("status-web-sa", verb, "configmaps")
+            for verb in ("get", "list")
+        )
+        denied = all(
+            not kube.auth_can_i("status-web-sa", verb, resource)
+            for verb, resource in (
+                ("watch", "configmaps"),
+                ("create", "configmaps"),
+                ("get", "secrets"),
+                ("get", "pods"),
+                ("get", "deployments"),
+            )
+        )
+        require(allowed and denied, "status-web-sa live authorization differs")
+        for pod in kube.list("pods"):
+            if pod.get("spec", {}).get("serviceAccountName") == "status-web-sa":
+                require(
+                    pod.get("metadata", {}).get("labels", {}).get("app") == "status-web",
+                    "status-web-sa is used by a non-status-web pod",
+                )
+        return "status-web-sa has exactly get/list access to ConfigMaps"
+
+    def r09() -> str:
+        deployment = kube.get("deployment", "status-web")
+        assert_hardened(deployment, "status-web")
+        for container in all_containers(pod_spec(deployment)):
+            require(
+                container.get("securityContext", {}).get("allowPrivilegeEscalation") is False,
+                "status-web must disable privilege escalation",
+            )
+        return "the web container is non-root, read-only, and capability-free"
+
+    def r10() -> str:
+        pdb = kube.get("poddisruptionbudget", "status-web-pdb")
+        selector = pdb.get("spec", {}).get("selector", {}).get("matchLabels", {})
+        require(selector.get("role") == "web", "status-web-pdb does not select role=web")
+        require(int_or_string(pdb.get("spec", {}).get("minAvailable")) == "1", "status-web-pdb minAvailable differs")
+        return "status-web-pdb keeps at least one web pod available"
+
+    def r11() -> str:
+        quota = kube.get("resourcequota", "status-page-quota")
+        hard = quota.get("status", {}).get("hard", quota.get("spec", {}).get("hard", {}))
+        require(hard.get("pods") == "5", f"pod quota must be 5, got {hard.get('pods')}")
+        deployment = kube.get("deployment", "status-web")
+        replicas = int(deployment.get("spec", {}).get("replicas", 1))
+        surge = int_or_string(
+            deployment.get("spec", {})
+            .get("strategy", {})
+            .get("rollingUpdate", {})
+            .get("maxSurge", 1)
+        )
+        require(surge.isdigit(), "maxSurge must be an integer for quota-fit analysis")
+        peak_with_probe = replicas + int(surge) + 1
+        require(
+            peak_with_probe <= 5,
+            f"rollout plus evaluator probe needs {peak_with_probe} pods, exceeding quota 5",
+        )
+        used_pods = int(quota.get("status", {}).get("used", {}).get("pods", "0"))
+        return (
+            f"pod quota is 5; computed rollout-plus-probe peak is "
+            f"{peak_with_probe}, current use is {used_pods}/5"
+        )
+
+    return [
+        (
+            "R01",
+            "isolated status-page namespace",
+            lambda: _check_namespace(
+                kube,
+                "status-page",
+                _require_candidate_path(candidate_path),
+            ),
+        ),
+        ("R02", "simple dependency-free topology", r02),
+        ("R03", "exact read-only site content", r03),
+        ("R04", "environment-only release Secret", r04),
+        ("R05", "web Deployment identity and rollout", r05),
+        ("R06", "HTTP startup, readiness, and liveness probes", r06),
+        ("R07", "live ClusterIP Service responses", r07),
+        ("R08", "least-privilege web RBAC", r08),
+        ("R09", "web-container security context", r09),
+        ("R10", "web disruption budget", r10),
+        ("R11", "namespace pod quota and live fit", r11),
+    ]
+
+
+def _require_candidate_path(candidate_path: Path | None) -> Path:
+    if candidate_path is None:
+        raise EvaluationInfrastructureError(
+            "the private evaluator was not given the deployed candidate manifest"
+        )
+    return candidate_path
+
+
+def run_suite(
+    task_id: str, kube: Kubectl, candidate_path: Path | None = None
+) -> dict[str, Any]:
     if task_id == "pilot-001":
-        checks = _task1_checks(kube)
+        checks = _task1_checks(kube, candidate_path)
     elif task_id == "pilot-002":
-        checks = _task2_checks(kube)
+        checks = _task2_checks(kube, candidate_path)
+    elif task_id == "pilot-003":
+        checks = _task3_checks(kube, candidate_path)
     else:
         raise EvaluationError(f"unknown task id {task_id!r}")
     actual_ids = {requirement_id for requirement_id, _, _ in checks}

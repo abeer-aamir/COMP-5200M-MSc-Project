@@ -223,12 +223,7 @@ def _failure_container_logs(
                 check=False,
                 timeout=env.command_timeout_seconds,
             )
-            record[label] = {
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "duration_ms": result.duration_ms,
-            }
+            record[label] = result.audit_dict()
         records.append(record)
     return records
 
@@ -263,8 +258,18 @@ def observe_runtime(
         )
     except Exception as exc:
         raise EnvironmentError(f"Could not inspect Kubernetes events: {exc}") from exc
-    if not failures:
-        failures = extract_event_failures(events, latest_pods)
+    event_failures = extract_event_failures(events, latest_pods)
+    seen_failures = {
+        tuple(sorted((str(key), str(value)) for key, value in failure.items()))
+        for failure in failures
+    }
+    for failure in event_failures:
+        identity = tuple(
+            sorted((str(key), str(value)) for key, value in failure.items())
+        )
+        if identity not in seen_failures:
+            failures.append(failure)
+            seen_failures.add(identity)
     container_logs = _failure_container_logs(env, failures) if failures else []
     return {
         "status": "execution_error" if failures else "no_concrete_execution_error",

@@ -1,0 +1,62 @@
+Please build a small, self-contained status-page service in a namespace called
+`status-page`. Keep every namespaced resource in that namespace, apart from the
+Namespace object itself. This will run on a single-node kind Kubernetes 1.35
+cluster without workload internet access. Use only normal built-in Kubernetes
+resources and the already-loaded `busybox:1.36.1` image.
+
+Keep the topology deliberately simple. Do not create init containers,
+StatefulSets, DaemonSets, headless Services, persistent volume claims, Jobs, or
+CronJobs. The web pods must not wait for, discover, or depend on another
+application workload before starting.
+
+Create exactly this one Deployment and one application Service. Do not add
+sidecars, standalone Pods, or any other application workload or Service.
+
+Create a ConfigMap named `site-content` with exactly these two entries; preserve
+the final newline in each value:
+
+```text
+index.html=AIPyCraft pilot service
+health=ok
+```
+
+Mount the ConfigMap read-only at `/www` in the web container so those keys are
+available as `/www/index.html` and `/www/health`.
+
+Create a Secret named `site-secret` containing the placeholder value
+`RELEASE_CHANNEL=pilot`. Expose that key to the web container as an environment
+variable named `RELEASE_CHANNEL`. Do not mount this Secret as a file.
+
+Run the site in a Deployment named `status-web` with exactly 2 replicas. Its pod
+template must have both `app=status-web` and `role=web` labels and use the
+ServiceAccount `status-web-sa`. Use `busybox:1.36.1`, expose container port 8080,
+and run BusyBox httpd in the foreground on that port with `/www` as its document
+root. Use a RollingUpdate strategy with `maxUnavailable: 0` and `maxSurge: 1`.
+
+Give the web container startup, readiness, and liveness probes. Each must use an
+HTTP GET of `/health` on port 8080. The startup probe should allow at least 30
+seconds for startup, while readiness and liveness should each run at least once
+every 10 seconds.
+
+Expose the pods with a ClusterIP Service named `status-web-svc`. It should
+select `app=status-web`, expose TCP port 80, and target the container's port
+8080. Requests to `/` must return `AIPyCraft pilot service`, and requests to
+`/health` must return `ok`.
+
+Create `status-web-sa` plus a namespaced Role and RoleBinding. The Role must
+allow exactly `get` and `list` for ConfigMaps, with no permissions for Secrets,
+workload resources, or write operations. Do not use `status-web-sa` for any pod
+other than the `status-web` pods.
+
+Run the web container as non-root user 1000, with a read-only root filesystem.
+Disallow privilege escalation and drop all Linux capabilities. The service must
+remain operational with those settings.
+
+Add a PodDisruptionBudget named `status-web-pdb` which selects `role=web` and
+uses `minAvailable: 1`.
+
+Add a ResourceQuota named `status-page-quota` which caps Pods in the namespace
+at 5. The two-replica Deployment, a normal rolling update, and one temporary
+test pod must all fit within the quota.
+
+Return one complete multi-document YAML configuration and no explanation.

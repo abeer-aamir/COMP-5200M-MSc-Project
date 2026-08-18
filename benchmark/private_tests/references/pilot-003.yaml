@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: status-page
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: site-content
+  namespace: status-page
+data:
+  index.html: |
+    AIPyCraft pilot service
+  health: |
+    ok
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: site-secret
+  namespace: status-page
+type: Opaque
+stringData:
+  RELEASE_CHANNEL: pilot
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: status-web-sa
+  namespace: status-page
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: status-web-config-reader
+  namespace: status-page
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: status-web-config-reader
+  namespace: status-page
+subjects:
+  - kind: ServiceAccount
+    name: status-web-sa
+    namespace: status-page
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: status-web-config-reader
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: status-web
+  namespace: status-page
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: status-web
+  template:
+    metadata:
+      labels:
+        app: status-web
+        role: web
+    spec:
+      serviceAccountName: status-web-sa
+      securityContext:
+        runAsUser: 1000
+      containers:
+        - name: web
+          image: busybox:1.36.1
+          imagePullPolicy: Never
+          command: ["httpd", "-f", "-p", "8080", "-h", "/www"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: RELEASE_CHANNEL
+              valueFrom:
+                secretKeyRef:
+                  name: site-secret
+                  key: RELEASE_CHANNEL
+          volumeMounts:
+            - name: site-content
+              mountPath: /www
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+      volumes:
+        - name: site-content
+          configMap:
+            name: site-content
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: status-web-svc
+  namespace: status-page
+spec:
+  type: ClusterIP
+  selector:
+    app: status-web
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: status-web-pdb
+  namespace: status-page
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      role: web
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: status-page-quota
+  namespace: status-page
+spec:
+  hard:
+    pods: "5"

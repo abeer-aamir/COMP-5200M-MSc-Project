@@ -11,7 +11,7 @@ from typing import Any
 from task_authoring.config import load_env_file
 
 from .commands import CommandError
-from .config import DEFAULT_CONFIG_PATH, ConfigError, load_config
+from .config import DEFAULT_CONFIG_PATH, ConfigError, load_config, treatment_id
 from .environment import EnvironmentError, EnvironmentPreparer, IsolatedKindHarness
 from .openrouter import (
     OpenRouterTextClient,
@@ -78,11 +78,15 @@ def _select_tasks(selection: str) -> list[Any]:
 def _plan(config: Any) -> dict[str, Any]:
     lock = config.environment.lock
     max_generations = config.pipeline.max_regenerations + 1
+    max_cluster_attempts = max_generations * (
+        config.pipeline.candidate_api_loss_confirmation_replays + 1
+    )
     max_validator_responses = max_generations if config.ai_validator.enabled else 0
     max_model_responses = max_generations + max_validator_responses
     return {
         "status": "planned",
         "paid_calls_made": False,
+        "treatment_id": treatment_id(config),
         "model": config.api.model,
         "provider_only": list(config.api.provider_only),
         "allow_fallbacks": config.api.allow_fallbacks,
@@ -93,6 +97,10 @@ def _plan(config: Any) -> dict[str, Any]:
         "max_model_responses_per_task": max_model_responses,
         "max_http_post_attempts_per_task": (
             max_model_responses * (config.api.transport_retries + 1)
+        ),
+        "max_candidate_clusters_per_task": max_cluster_attempts,
+        "candidate_api_loss_confirmation_replays": (
+            config.pipeline.candidate_api_loss_confirmation_replays
         ),
         "application_spend_cap_usd": None,
         "pricing_usd_per_million": {
@@ -115,6 +123,7 @@ def _plan(config: Any) -> dict[str, Any]:
                 "candidate-caused kubectl apply failure",
                 "concrete candidate runtime failure",
                 "generic execution-gate failure",
+                "confirmed repeated candidate-associated Kubernetes API loss",
             ],
             "maximum_regenerations": config.pipeline.max_regenerations,
             "validator_repair_scope": (
@@ -129,6 +138,10 @@ def _plan(config: Any) -> dict[str, Any]:
         },
         "ai_validator": {
             "enabled": config.ai_validator.enabled,
+            "shadow_mode": config.ai_validator.shadow_mode,
+            "intervention_active": (
+                config.ai_validator.enabled and not config.ai_validator.shadow_mode
+            ),
             "model": config.api.model,
             "provider_only": list(config.api.provider_only),
             "feedback_mode": config.ai_validator.feedback_mode,
@@ -136,10 +149,23 @@ def _plan(config: Any) -> dict[str, Any]:
                 "clear missing or contradicted requirement only; runtime uncertainty "
                 "alone passes"
             ),
-            "rejection_policy": "regenerate before deployment",
+            "rejection_policy": (
+                "log verdict and deploy unchanged"
+                if config.ai_validator.shadow_mode
+                else "regenerate before deployment"
+            ),
+            "shadow_error_policy": (
+                "log validator/provider error and continue unchanged candidate"
+                if config.ai_validator.shadow_mode
+                else "not applicable"
+            ),
         },
         "generic_execution_gate": {
             "timing": "after apply and initial runtime observation",
+            "wait_strategy": (
+                "failed-aware polling for Jobs and controllers under one shared "
+                "deadline; terminal failure stops the wait immediately"
+            ),
             "checks": [
                 "declared CronJobs complete when exercised once",
                 "controllers and direct Jobs become operational",
@@ -150,11 +176,13 @@ def _plan(config: Any) -> dict[str, Any]:
                 "standalone Pods become Ready or Succeeded",
             ],
             "rollout_failure_diagnostics": (
-                "capture bounded init-container state, current logs, and previous "
-                "logs after restarts"
+                "capture bounded main/init container commands, states, current and "
+                "previous logs, Pod events, Service endpoints, and NetworkPolicy "
+                "context before disposable probe cleanup"
             ),
             "failure_policy": (
-                "return candidate-attributable diagnostics for bounded regeneration"
+                "persist full evidence privately and send an exact, whole-payload-"
+                "bounded candidate-attributable subset for regeneration"
             ),
             "task_specific": False,
         },
@@ -169,6 +197,13 @@ def _plan(config: Any) -> dict[str, Any]:
             ),
             "hidden_specification_oracle": (
                 "log discrepancy; never send to the model or regenerate"
+            ),
+            "candidate_time_api_loss": (
+                "replay the exact candidate once in a fresh cluster without a model "
+                "call; regenerate only after repeated candidate-associated loss"
+            ),
+            "confirmed_infrastructure_failure": (
+                "mark the trial inconclusive; never send it to the model"
             ),
         },
         "environment": {
@@ -227,7 +262,9 @@ def _exit_for(results: list[dict[str, Any]]) -> int:
     statuses = {item["status"] for item in results}
     if statuses == {"completed"}:
         return 0
-    if statuses & {"provider_error", "infrastructure_error"}:
+    if "interrupted" in statuses:
+        return 130
+    if statuses & {"provider_error", "validator_error", "infrastructure_error"}:
         return 3
     return 2
 
@@ -254,7 +291,13 @@ def main(argv: list[str] | None = None) -> int:
             harness = IsolatedKindHarness(
                 config.environment,
                 command_timeout_seconds=config.pipeline.command_timeout_seconds,
-                max_attempts=config.pipeline.max_regenerations + 1,
+                max_attempts=(
+                    (config.pipeline.max_regenerations + 1)
+                    * (
+                        config.pipeline.candidate_api_loss_confirmation_replays
+                        + 1
+                    )
+                ),
             )
             _print(harness.smoke())
             return 0
@@ -263,7 +306,12 @@ def main(argv: list[str] | None = None) -> int:
         harness = IsolatedKindHarness(
             config.environment,
             command_timeout_seconds=config.pipeline.command_timeout_seconds,
-            max_attempts=config.pipeline.max_regenerations + 1,
+            max_attempts=(
+                (config.pipeline.max_regenerations + 1)
+                * (
+                    config.pipeline.candidate_api_loss_confirmation_replays + 1
+                )
+            ),
         )
         key_supplier = None
         if args.command == "run":

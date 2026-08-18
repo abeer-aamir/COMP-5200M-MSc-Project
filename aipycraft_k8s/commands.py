@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -17,6 +18,12 @@ class CommandResult:
     stdout: str
     stderr: str
     duration_ms: int
+    started_at: str | None = None
+    finished_at: str | None = None
+    timeout_seconds: int | None = None
+    deadline_overrun_ms: int = 0
+    deadline_overrun: bool = False
+    host_pause_suspected: bool = False
 
     def audit_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -102,8 +109,29 @@ class CommandRunner:
         if env:
             child_env.update(env)
         started = time.monotonic()
+        started_at = datetime.now(timezone.utc).isoformat()
         timed_out = False
         termination_notes: list[str] = []
+
+        def result_metadata() -> dict[str, object]:
+            duration_ms = round((time.monotonic() - started) * 1000)
+            overrun_ms = max(duration_ms - (timeout * 1000), 0)
+            # A few seconds of termination/OS scheduling overhead is normal.
+            # A command that returns normally far beyond its stated timeout is
+            # not: on Windows this can happen when the host sleeps or the Docker
+            # VM pauses while the OS wait timeout is suspended.
+            deadline_overrun = overrun_ms > 5_000
+            return {
+                "duration_ms": duration_ms,
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "timeout_seconds": timeout,
+                "deadline_overrun_ms": overrun_ms,
+                "deadline_overrun": deadline_overrun,
+                "host_pause_suspected": (
+                    deadline_overrun and not timed_out and overrun_ms > 60_000
+                ),
+            }
         try:
             with (
                 tempfile.TemporaryFile() as stdout_file,
@@ -142,7 +170,7 @@ class CommandRunner:
                 returncode=127,
                 stdout="",
                 stderr=f"command was not found: {rendered[0]}",
-                duration_ms=round((time.monotonic() - started) * 1000),
+                **result_metadata(),
             )
             if check:
                 raise CommandError(result) from exc
@@ -160,7 +188,7 @@ class CommandRunner:
                     if stderr
                     else timeout_message
                 ),
-                duration_ms=round((time.monotonic() - started) * 1000),
+                **result_metadata(),
             )
             if check:
                 raise CommandError(result)
@@ -170,7 +198,7 @@ class CommandRunner:
             returncode=int(process.returncode),
             stdout=stdout,
             stderr=stderr,
-            duration_ms=round((time.monotonic() - started) * 1000),
+            **result_metadata(),
         )
         if check and result.returncode:
             raise CommandError(result)

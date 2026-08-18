@@ -32,10 +32,16 @@ def _sha256_file(path: Path) -> str:
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 @dataclass(frozen=True)
@@ -447,6 +453,37 @@ class AttemptEnvironment:
         content = source.read_text(encoding="utf-8")
         return content, _sha256_file(source), len(content.encode("utf-8"))
 
+    def _journal_kubectl_result(
+        self,
+        result: CommandResult,
+        input_audit: dict[str, Any] | None,
+    ) -> None:
+        """Persist one exact audit record for a completed kubectl invocation."""
+
+        command_audit = result.audit_dict()
+        journal_path = self.attempt_dir / "command_journal.jsonl"
+        with journal_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "source": "kubectl",
+                        "command": command_audit,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        if input_audit is not None:
+            transfer_path = self.attempt_dir / "environment_file_transfers.jsonl"
+            with transfer_path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {**input_audit, "command": command_audit},
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+
     def kubectl(
         self,
         args: list[str | Path],
@@ -471,21 +508,23 @@ class AttemptEnvironment:
                 }
             else:
                 rendered_args.append(item)
-        result = self.runner.run(
-            [*self.kubectl_prefix(), *rendered_args],
-            timeout=timeout or self.command_timeout_seconds,
-            check=check,
-            input_text=input_text,
-        )
-        if input_audit is not None:
-            input_audit["command"] = result.audit_dict()
-            transfer_path = self.attempt_dir / "environment_file_transfers.jsonl"
-            with transfer_path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(input_audit, sort_keys=True) + "\n")
+        try:
+            result = self.runner.run(
+                [*self.kubectl_prefix(), *rendered_args],
+                timeout=timeout or self.command_timeout_seconds,
+                check=check,
+                input_text=input_text,
+            )
+        except CommandError as exc:
+            self._journal_kubectl_result(exc.result, input_audit)
+            raise
+        self._journal_kubectl_result(result, input_audit)
         return result
 
-    def kubectl_json(self, args: list[str]) -> dict[str, Any]:
-        result = self.kubectl([*args, "-o", "json"])
+    def kubectl_json(
+        self, args: list[str], *, timeout: int | None = None
+    ) -> dict[str, Any]:
+        result = self.kubectl([*args, "-o", "json"], timeout=timeout)
         try:
             value = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
@@ -983,12 +1022,21 @@ spec:
         attempt_dir: Path,
         ownership: _AttemptOwnership,
     ) -> AttemptEnvironment:
+        setup_started = time.monotonic()
+        setup_stages: dict[str, Any] = {
+            "schema_version": 1,
+            "status": "running",
+            "current_stage": "precheck_and_network",
+        }
+        setup_stages_path = attempt_dir / "setup_stages.json"
+        _write_json(setup_stages_path, setup_stages)
         cluster, network = self._names(run_id, attempt_number)
         cache = self.preparer.cache_paths()
         kubeconfig = attempt_dir / "kubeconfig"
         context = f"kind-{cluster}"
+        stage_started = time.monotonic()
         self._precheck_absent(cluster, network, cache.kind)
-        self.runner.run(
+        network_create = self.runner.run(
             [
                 "docker",
                 "network",
@@ -1008,6 +1056,12 @@ spec:
             ],
             timeout=30,
         )
+        setup_stages["precheck_and_network"] = {
+            "duration_ms": round((time.monotonic() - stage_started) * 1000),
+            "network_create": network_create.audit_dict(),
+        }
+        setup_stages["current_stage"] = "kind_create"
+        _write_json(setup_stages_path, setup_stages)
         ownership.network_acquired = True
         ownership.cluster_create_started = True
         create_result = self.runner.run(
@@ -1031,6 +1085,13 @@ spec:
         )
         acceptance_basis = _kind_create_acceptance_basis(create_result)
         accepted_unpublished_api = acceptance_basis is not None
+        setup_stages["kind_create"] = {
+            "duration_ms": create_result.duration_ms,
+            "command": create_result.audit_dict(),
+            "accepted": create_result.returncode == 0 or accepted_unpublished_api,
+            "acceptance_basis": acceptance_basis,
+        }
+        _write_json(setup_stages_path, setup_stages)
         _write_json(
             attempt_dir / "kind_create.json",
             {
@@ -1041,6 +1102,9 @@ spec:
         )
         if create_result.returncode != 0 and not accepted_unpublished_api:
             raise CommandError(create_result)
+        setup_stages["current_stage"] = "api_and_isolation"
+        _write_json(setup_stages_path, setup_stages)
+        stage_started = time.monotonic()
         context_result = self.runner.run(
             [
                 "docker",
@@ -1088,7 +1152,16 @@ spec:
                 "The unexposed Kubernetes API was not ready through docker exec: "
                 + (ready.stderr.strip() or ready.stdout.strip() or "no output")
             )
-        self.runner.run(
+        setup_stages["api_and_isolation"] = {
+            "duration_ms": round((time.monotonic() - stage_started) * 1000),
+            "context_discovery": context_result.audit_dict(),
+            "readyz": ready.audit_dict(),
+            "isolation": env.isolation_inspection,
+        }
+        setup_stages["current_stage"] = "image_load"
+        _write_json(setup_stages_path, setup_stages)
+        stage_started = time.monotonic()
+        image_load = self.runner.run(
             [
                 cache.kind,
                 "load",
@@ -1100,6 +1173,13 @@ spec:
             timeout=180,
             env={"KIND_EXPERIMENTAL_DOCKER_NETWORK": network},
         )
+        setup_stages["image_load"] = {
+            "duration_ms": round((time.monotonic() - stage_started) * 1000),
+            "command": image_load.audit_dict(),
+        }
+        setup_stages["current_stage"] = "cluster_components_ready"
+        _write_json(setup_stages_path, setup_stages)
+        stage_started = time.monotonic()
         env.kubectl(["create", "-f", cache.calico_manifest], timeout=120)
         env.kubectl(
             [
@@ -1158,7 +1238,22 @@ spec:
             or annotations.get("storageclass.kubernetes.io/is-default-class") != "true"
         ):
             raise EnvironmentError("The locked default dynamic StorageClass is unavailable")
+        setup_stages["cluster_components_ready"] = {
+            "duration_ms": round((time.monotonic() - stage_started) * 1000),
+        }
+        setup_stages["current_stage"] = "environment_smoke"
+        _write_json(setup_stages_path, setup_stages)
+        stage_started = time.monotonic()
         smoke = self._smoke_test(env)
+        setup_stages["environment_smoke"] = {
+            "duration_ms": round((time.monotonic() - stage_started) * 1000),
+        }
+        setup_stages["total"] = {
+            "duration_ms": round((time.monotonic() - setup_started) * 1000),
+        }
+        setup_stages["current_stage"] = None
+        setup_stages["status"] = "passed"
+        _write_json(setup_stages_path, setup_stages)
         _write_json(attempt_dir / "environment_smoke.json", smoke)
         _write_json(attempt_dir / "environment.json", env.metadata(self.lock))
         return env
@@ -1347,6 +1442,26 @@ spec:
             yield env
         except BaseException as exc:
             primary_error = exc
+            setup_path = attempt_dir / "setup_stages.json"
+            if setup_path.is_file():
+                try:
+                    setup = json.loads(setup_path.read_text(encoding="utf-8"))
+                    if setup.get("status") == "running":
+                        setup["status"] = "failed"
+                        setup["error"] = f"{type(exc).__name__}: {exc}"
+                        completed_ms = sum(
+                            int(value.get("duration_ms", 0) or 0)
+                            for key, value in setup.items()
+                            if key not in {"total"}
+                            and isinstance(value, dict)
+                        )
+                        setup["completed_stage_duration_ms"] = completed_ms
+                        _write_json(setup_path, setup)
+                except Exception as checkpoint_exc:
+                    exc.add_note(
+                        "Could not finalize setup timing checkpoint: "
+                        f"{type(checkpoint_exc).__name__}: {checkpoint_exc}"
+                    )
             raise
         finally:
             try:

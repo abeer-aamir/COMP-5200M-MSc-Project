@@ -14,6 +14,12 @@
       "namespace": "pipeline-ns",
       "description": "benchmark/tasks/pilot-002/description.txt",
       "post_execution_suite": "pilot-002"
+    },
+    {
+      "task_id": "pilot-003",
+      "namespace": "status-page",
+      "description": "benchmark/tasks/pilot-003/description.txt",
+      "post_execution_suite": "pilot-003"
     }
   ]
 }

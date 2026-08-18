@@ -10,9 +10,10 @@ its requirement/problem/correction records, including any dependent changes
 required to resolve it. Do not independently alter unrelated working parts or
 make speculative improvements.
 
-When CORRECTION TRIGGER is deployment, runtime, or execution_gate, repair the
-observed candidate-caused failure and its dependent causes. Preserve unrelated
-working parts and do not infer hidden requirements from generic diagnostics.
+When CORRECTION TRIGGER is deployment, runtime, execution_gate, or
+candidate_api_disruption, repair the observed candidate-caused failure and its
+dependent causes. Preserve unrelated working parts and do not infer hidden
+requirements from generic diagnostics.
 
 The target is Kubernetes 1.35 on a single-node kind cluster. Workloads have no
 internet access, and busybox:1.36.1 is preloaded.
