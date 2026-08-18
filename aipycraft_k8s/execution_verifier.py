@@ -5,6 +5,7 @@ import re
 import time
 import uuid
 from typing import Any
+from urllib.parse import urlparse
 
 from .environment import AttemptEnvironment, EnvironmentError
 from .tasks import BenchmarkTask
@@ -273,6 +274,87 @@ def _pod_events(
     return {"status": "captured", "items": items}
 
 
+_DNS_TARGET = re.compile(
+    r"\b(?:nslookup|getent\s+hosts)\s+([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)\b",
+    re.IGNORECASE,
+)
+_HTTP_TARGET = re.compile(r"https?://[^\s'\";|&<>]+", re.IGNORECASE)
+
+
+def _dependency_targets(container_spec: dict[str, Any]) -> tuple[list[str], list[str]]:
+    text = " ".join(
+        str(value)
+        for field in ("command", "args")
+        for value in (container_spec.get(field, []) or [])
+    )
+    hosts = list(dict.fromkeys(match.group(1) for match in _DNS_TARGET.finditer(text)))
+    urls: list[str] = []
+    for raw in _HTTP_TARGET.findall(text):
+        candidate = raw.rstrip(").,]")
+        parsed = urlparse(candidate)
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and re.fullmatch(r"[a-z0-9.-]+", parsed.hostname, re.IGNORECASE)
+        ):
+            urls.append(candidate)
+    return hosts[:4], list(dict.fromkeys(urls))[:4]
+
+
+def _active_dependency_diagnostics(
+    env: AttemptEnvironment,
+    namespace: str,
+    pod_name: str,
+    container_name: str,
+    container_spec: dict[str, Any],
+    *,
+    command_timeout: int,
+) -> dict[str, Any] | None:
+    """Split opaque init loops into safe, bounded DNS and HTTP observations."""
+
+    hosts, urls = _dependency_targets(container_spec)
+    if not hosts and not urls:
+        return None
+    timeout = min(command_timeout, 15)
+
+    def execute(command: list[str]) -> dict[str, Any]:
+        result = env.kubectl(
+            [
+                "exec",
+                pod_name,
+                "-n",
+                namespace,
+                "-c",
+                container_name,
+                "--",
+                *command,
+            ],
+            check=False,
+            timeout=timeout,
+        )
+        return _command_detail(result)
+
+    return {
+        "schema_version": 1,
+        "safety": (
+            "Read-only probes derived from strictly validated targets in the "
+            "candidate's currently running init-container command."
+        ),
+        "resolv_conf": execute(["cat", "/etc/resolv.conf"]),
+        "dns": [
+            {"target": host, "command": execute(["nslookup", host])}
+            for host in hosts
+        ],
+        "http": [
+            {
+                "target": url,
+                "command": execute(["wget", "-S", "-O", "/dev/null", url]),
+            }
+            for url in urls
+        ],
+    }
+
+
 def _pod_execution_diagnostics(
     env: AttemptEnvironment,
     namespace: str,
@@ -358,6 +440,19 @@ def _pod_execution_diagnostics(
                 "last_state": container_status.get("lastState"),
                 "logs": _command_detail(current),
             }
+            if container_type == "init" and isinstance(
+                container_status.get("state", {}).get("running"), dict
+            ):
+                active = _active_dependency_diagnostics(
+                    env,
+                    namespace,
+                    pod_name,
+                    name,
+                    container_spec,
+                    command_timeout=command_timeout,
+                )
+                if active is not None:
+                    record["active_dependency_diagnostics"] = active
             restart_count = container_status.get("restartCount")
             if isinstance(restart_count, int) and restart_count > 0:
                 previous = env.kubectl(
@@ -564,6 +659,49 @@ def _failed_command_attribution(
 
 
 def _repair_feedback(report: dict[str, Any]) -> dict[str, Any]:
+    def compact_finding(finding: dict[str, Any]) -> dict[str, Any]:
+        compact = {
+            key: finding.get(key)
+            for key in ("type", "resource", "reason", "state", "message")
+            if finding.get(key) is not None
+        }
+        diagnostics = finding.get("pod_diagnostics", {}) or {}
+        representative_pods = []
+        for pod in (diagnostics.get("pods", []) or [])[:2]:
+            containers = []
+            for container in (pod.get("containers", []) or [])[:4]:
+                containers.append(
+                    {
+                        key: container.get(key)
+                        for key in (
+                            "container",
+                            "container_type",
+                            "command",
+                            "args",
+                            "state",
+                            "last_state",
+                            "output_suppressed_by_candidate_command",
+                            "logs",
+                            "previous_logs",
+                            "active_dependency_diagnostics",
+                        )
+                        if container.get(key) is not None
+                    }
+                )
+            representative_pods.append(
+                {
+                    "pod": pod.get("pod"),
+                    "phase": pod.get("phase"),
+                    "reason": pod.get("reason"),
+                    "conditions": pod.get("conditions"),
+                    "containers": containers,
+                    "events": pod.get("events"),
+                }
+            )
+        if representative_pods:
+            compact["representative_pod_diagnostics"] = representative_pods
+        return compact
+
     suppressed = []
     for collection_name in ("failures", "correlated_observations"):
         for finding in report.get(collection_name, []) or []:
@@ -587,10 +725,15 @@ def _repair_feedback(report: dict[str, Any]) -> dict[str, Any]:
             "Use the captured command, container state, exit reason, events, and dependency context."
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "message": "The deployed candidate failed generic operational checks.",
-        "failures": report.get("failures", []),
-        "correlated_observations": report.get("correlated_observations", []),
+        "primary_failures": [
+            compact_finding(item) for item in (report.get("failures", []) or [])[:6]
+        ],
+        "downstream_correlated_observations": [
+            compact_finding(item)
+            for item in (report.get("correlated_observations", []) or [])[:4]
+        ],
         "namespace_failure_context": report.get("namespace_failure_context"),
         "candidate_output_suppression_detected": bool(suppressed),
         "containers_suppressing_output": suppressed,

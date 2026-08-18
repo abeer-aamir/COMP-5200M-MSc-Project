@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .analysis import build_analysis_record
+from .candidate_bank import CandidateBankEntry
+from .candidate_diff import candidate_semantic_diff
 from .commands import CommandError, CommandRunner
 from .config import AppConfig, PROJECT_ROOT, treatment_id
 from .diagnostics import observe_runtime
@@ -37,6 +39,33 @@ from .yaml_check import check_yaml_syntax
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _artifact_integrity(root: Path) -> dict[str, Any]:
+    excluded = {"summary.json", "artifact_integrity.json"}
+    files = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if relative in excluded:
+            continue
+        files.append(
+            {
+                "path": relative,
+                "size_bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    aggregate = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": 1,
+        "scope": "all run artifacts except mutable summaries and this manifest",
+        "excluded": sorted(excluded),
+        "file_count": len(files),
+        "aggregate_sha256": aggregate,
+        "files": files,
+    }
 
 
 def _sha256_file(path: Path) -> str:
@@ -772,7 +801,12 @@ class KubernetesAIPyCraftPipeline:
             )
         return evaluation
 
-    def run(self, task: BenchmarkTask) -> PipelineRun:
+    def run(
+        self,
+        task: BenchmarkTask,
+        *,
+        initial_candidate: CandidateBankEntry | None = None,
+    ) -> PipelineRun:
         run_id = _run_id()
         run_dir = self.config.pipeline.output_root / run_id
         private_dir = run_dir / "private"
@@ -787,7 +821,7 @@ class KubernetesAIPyCraftPipeline:
         }
         unknown_cost_by_role = {role_generator: 0, role_validator: 0}
         terminal_transport_by_role = {role_generator: 0, role_validator: 0}
-        aipycraft_generations: list[GenerationResult] = []
+        aipycraft_response_hashes: list[str] = []
         attempts: list[dict[str, Any]] = []
         attempt_start_times: dict[int, float] = {}
         current_attempt_dir: Path | None = None
@@ -825,6 +859,14 @@ class KubernetesAIPyCraftPipeline:
             "transport_retries": self.config.api.transport_retries,
             "api_base": self.config.api.base_url,
             "response_format": "raw_text",
+            "initial_candidate_source": (
+                "candidate_bank" if initial_candidate is not None else "model_request"
+            ),
+            "candidate_bank": (
+                initial_candidate.provenance()
+                if initial_candidate is not None
+                else None
+            ),
             "max_output_tokens": None,
             "input_usd_per_million": str(
                 self.config.api.input_usd_per_million
@@ -1023,6 +1065,7 @@ class KubernetesAIPyCraftPipeline:
             summary["validator_prompt"] = str(validator_path)
             summary["validator_prompt_sha256"] = _sha256_text(validator_system)
             previous = ""
+            previous_valid_candidate: str | None = None
             repair_trigger = ""
             repair_failure = ""
             terminal = False
@@ -1057,6 +1100,7 @@ class KubernetesAIPyCraftPipeline:
                     "user_prompt_sha256": _sha256_text(user_prompt),
                     "generation": None,
                     "pre_execution": None,
+                    "candidate_semantic_diff": None,
                     "ai_pre_validation": None,
                     "deployment": None,
                     "deployment_failure_api_readiness": None,
@@ -1076,41 +1120,78 @@ class KubernetesAIPyCraftPipeline:
                 attempts.append(attempt)
                 _write_json(private_dir / "summary.json", summary)
                 generation_started = time.monotonic()
-                try:
-                    generation = self.client.complete(system_prompt, user_prompt)
-                finally:
-                    attempt["stage_timings_ms"]["generator_request"] = round(
+                banked_initial = index == 0 and initial_candidate is not None
+                if banked_initial:
+                    raw_text = initial_candidate.raw_text
+                    finish_reason = initial_candidate.finish_reason
+                    attempt["stage_timings_ms"]["candidate_bank_load"] = round(
                         (time.monotonic() - generation_started) * 1000
                     )
-                record_model_result(role_generator, generation)
-                raw_response_sha256 = _sha256_text(generation.raw_text)
+                    generation_audit = {
+                        "source": "candidate_bank",
+                        "candidate_id": initial_candidate.candidate_id,
+                        "candidate_record": str(initial_candidate.record_path),
+                        "candidate_record_sha256": initial_candidate.provenance()[
+                            "record_sha256"
+                        ],
+                        "raw_response_sha256": initial_candidate.raw_response_sha256,
+                        "finish_reason": finish_reason,
+                        "shared_initial_generation_usage": (
+                            initial_candidate.metadata.get("generation")
+                        ),
+                        "charged_to_treatment_run": False,
+                        "local_prompt_metrics": {
+                            "system_characters": len(system_prompt),
+                            "system_utf8_bytes": len(system_prompt.encode("utf-8")),
+                            "system_lines": len(system_prompt.splitlines()),
+                            "user_characters": len(user_prompt),
+                            "user_utf8_bytes": len(user_prompt.encode("utf-8")),
+                            "user_lines": len(user_prompt.splitlines()),
+                        },
+                    }
+                else:
+                    try:
+                        generation = self.client.complete(system_prompt, user_prompt)
+                    finally:
+                        attempt["stage_timings_ms"]["generator_request"] = round(
+                            (time.monotonic() - generation_started) * 1000
+                        )
+                    record_model_result(role_generator, generation)
+                    raw_text = generation.raw_text
+                    finish_reason = generation.finish_reason
+                    generation_audit = self._model_audit(
+                        generation, system_prompt, user_prompt
+                    )
+                raw_response_sha256 = _sha256_text(raw_text)
                 duplicate_of_attempt = next(
                     (
                         prior_index + 1
-                        for prior_index, prior in enumerate(aipycraft_generations)
-                        if _sha256_text(prior.raw_text) == raw_response_sha256
+                        for prior_index, prior_hash in enumerate(
+                            aipycraft_response_hashes
+                        )
+                        if prior_hash == raw_response_sha256
                     ),
                     None,
                 )
-                aipycraft_generations.append(generation)
+                aipycraft_response_hashes.append(raw_response_sha256)
                 if duplicate_of_attempt is not None:
                     summary["duplicate_generation_responses"] += 1
-                previous = generation.raw_text
+                previous = raw_text
                 (attempt_dir / "raw_response.txt").write_text(
-                    generation.raw_text, encoding="utf-8"
+                    raw_text, encoding="utf-8"
                 )
                 attempt["generation"] = {
-                    **self._model_audit(generation, system_prompt, user_prompt),
+                    **generation_audit,
                     "duplicate_of_attempt": duplicate_of_attempt,
                 }
                 _write_json(attempt_dir / "generation.json", attempt["generation"])
                 _write_json(private_dir / "summary.json", summary)
 
-                if generation.finish_reason != "stop":
+                if finish_reason != "stop":
                     attempt["result"] = "incomplete_generation"
                     detail = (
                         "The provider returned finish_reason="
-                        f"{generation.finish_reason or '<missing>'}; the response may be "
+                        f"{finish_reason or '<missing>'}; the response may be "
                         "incomplete and was not treated as a candidate manifest."
                     )
                     _write_json(
@@ -1136,7 +1217,7 @@ class KubernetesAIPyCraftPipeline:
                     terminal = True
                     break
 
-                syntax = check_yaml_syntax(generation.raw_text)
+                syntax = check_yaml_syntax(raw_text)
                 attempt["pre_execution"] = syntax.audit_dict()
                 _write_json(attempt_dir / "pre_execution.json", syntax.audit_dict())
                 (attempt_dir / "candidate.yaml").write_text(
@@ -1165,6 +1246,13 @@ class KubernetesAIPyCraftPipeline:
                     summary["status"] = "candidate_failed"
                     terminal = True
                     break
+
+                semantic_diff = candidate_semantic_diff(
+                    previous_valid_candidate, syntax.candidate
+                )
+                previous_valid_candidate = syntax.candidate
+                attempt["candidate_semantic_diff"] = semantic_diff
+                _write_json(attempt_dir / "candidate_semantic_diff.json", semantic_diff)
 
                 validation_decision_satisfies: bool | None = None
                 if self.config.ai_validator.enabled:
@@ -1982,5 +2070,17 @@ class KubernetesAIPyCraftPipeline:
                 )
             except Exception as exc:
                 summary["analysis_record_error"] = f"{type(exc).__name__}: {exc}"
+            try:
+                integrity = _artifact_integrity(private_dir)
+                _write_json(private_dir / "artifact_integrity.json", integrity)
+                summary["artifact_integrity"] = {
+                    "artifact": "artifact_integrity.json",
+                    "file_count": integrity["file_count"],
+                    "aggregate_sha256": integrity["aggregate_sha256"],
+                }
+            except Exception as exc:
+                summary["artifact_integrity_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
             _write_json(private_dir / "summary.json", summary)
         return PipelineRun(summary=summary, run_dir=run_dir)

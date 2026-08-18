@@ -34,6 +34,9 @@ def run_post_execution_verifier(
             kubeconfig=env.container_kubeconfig,
             command_timeout=env.command_timeout_seconds,
             command_prefix=["docker", "exec", "-i", env.node_name, "kubectl"],
+            journal_callback=lambda result: env.journal_external_command(
+                result, source="hidden_specification_oracle"
+            ),
         )
         return run_suite(task.post_execution_suite, kube, candidate_path)
     except SuiteExecutionError as exc:

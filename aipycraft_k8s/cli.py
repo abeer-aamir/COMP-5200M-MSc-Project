@@ -10,6 +10,7 @@ from typing import Any
 
 from task_authoring.config import load_env_file
 
+from .candidate_bank import CandidateBankError, load_entry
 from .commands import CommandError
 from .config import DEFAULT_CONFIG_PATH, ConfigError, load_config, treatment_id
 from .environment import EnvironmentError, EnvironmentPreparer, IsolatedKindHarness
@@ -53,12 +54,18 @@ def _parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="Run the paid OpenRouter pipeline.")
     run.add_argument("--task", default="all")
     run.add_argument("--confirm-paid-calls", required=True)
+    run.add_argument(
+        "--initial-candidate",
+        type=Path,
+        help="Immutable candidate.json to use for attempt 1 instead of a model call.",
+    )
 
     replay = subparsers.add_parser(
         "replay", help="Use ordered local .txt responses instead of an API."
     )
     replay.add_argument("--task", default="all")
     replay.add_argument("--fixtures", type=Path, required=True)
+    replay.add_argument("--initial-candidate", type=Path)
     return parser
 
 
@@ -177,8 +184,9 @@ def _plan(config: Any) -> dict[str, Any]:
             ],
             "rollout_failure_diagnostics": (
                 "capture bounded main/init container commands, states, current and "
-                "previous logs, Pod events, Service endpoints, and NetworkPolicy "
-                "context before disposable probe cleanup"
+                "previous logs, Pod events, Service endpoints, NetworkPolicy "
+                "context, and safe active init dependency probes before disposable "
+                "probe cleanup"
             ),
             "failure_policy": (
                 "persist full evidence privately and send an exact, whole-payload-"
@@ -328,14 +336,25 @@ def main(argv: list[str] | None = None) -> int:
             client = ReplayTextClient(args.fixtures, config.api.model)
 
         public_results: list[dict[str, Any]] = []
+        if args.initial_candidate is not None and len(tasks) != 1:
+            raise CandidateBankError(
+                "--initial-candidate requires exactly one explicitly selected task"
+            )
         for task in tasks:
+            initial_candidate = (
+                load_entry(args.initial_candidate, task=task, config=config)
+                if args.initial_candidate is not None
+                else None
+            )
             pipeline = KubernetesAIPyCraftPipeline(
                 config,
                 client,
                 harness,
                 key_context_supplier=key_supplier,
             )
-            public_results.append(pipeline.run(task).public_summary())
+            public_results.append(
+                pipeline.run(task, initial_candidate=initial_candidate).public_summary()
+            )
         output = {
             "status": (
                 "completed"
@@ -347,7 +366,14 @@ def main(argv: list[str] | None = None) -> int:
         }
         _print(output)
         return _exit_for(public_results)
-    except (ConfigError, TaskError, ProviderError, EnvironmentError, CommandError) as exc:
+    except (
+        CandidateBankError,
+        ConfigError,
+        TaskError,
+        ProviderError,
+        EnvironmentError,
+        CommandError,
+    ) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 3
 

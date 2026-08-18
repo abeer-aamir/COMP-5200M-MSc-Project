@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from .config import PilotConfig
+from .config import PROJECT_ROOT, PilotConfig
 from .openrouter import BudgetLedger, ChatResult, CompletionClient
 from .schemas import (
     ROLE_SCHEMAS,
@@ -36,6 +37,61 @@ def _write_json(path: Path, value: Any) -> None:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _artifact_integrity(root: Path) -> dict[str, Any]:
+    files = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if relative in {"summary.json", "artifact_integrity.json"}:
+            continue
+        files.append(
+            {
+                "path": relative,
+                "size_bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "excluded": ["artifact_integrity.json", "summary.json"],
+        "file_count": len(files),
+        "aggregate_sha256": hashlib.sha256(
+            _canonical_json(files).encode("utf-8")
+        ).hexdigest(),
+        "files": files,
+    }
+
+
+def _source_state(config: PilotConfig) -> dict[str, Any]:
+    paths = set((PROJECT_ROOT / "task_authoring").glob("*.py"))
+    paths.add(config.path)
+    paths.update(role.prompt_path for role in config.roles.values())
+    files = []
+    for path in sorted(paths, key=lambda item: str(item).lower()):
+        content = path.read_text(encoding="utf-8")
+        try:
+            display_path = path.resolve().relative_to(
+                PROJECT_ROOT.resolve()
+            ).as_posix()
+        except ValueError:
+            display_path = str(path.resolve())
+        files.append(
+            {
+                "path": display_path,
+                "sha256": _sha256_text(content),
+                "utf8_bytes": len(content.encode("utf-8")),
+                "content": content,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "file_count": len(files),
+        "aggregate_sha256": _sha256_text(
+            "\n".join(f"{item['path']}\0{item['sha256']}" for item in files)
+        ),
+        "files": files,
+    }
 
 
 class TaskAuthoringPipeline:
@@ -74,6 +130,7 @@ class TaskAuthoringPipeline:
             "completion_tokens": 0,
             "reasoning_tokens": 0,
             "cached_tokens": 0,
+            "latency_ms": 0,
             "cost_usd": Decimal("0"),
         }
 
@@ -84,6 +141,7 @@ class TaskAuthoringPipeline:
             total["completion_tokens"] += result.completion_tokens
             total["reasoning_tokens"] += result.reasoning_tokens
             total["cached_tokens"] += result.cached_tokens
+            total["latency_ms"] += result.latency_ms
             total["cost_usd"] += result.cost_usd
 
     @staticmethod
@@ -95,6 +153,7 @@ class TaskAuthoringPipeline:
             "total_tokens": total["prompt_tokens"] + total["completion_tokens"],
             "reasoning_tokens": total["reasoning_tokens"],
             "cached_tokens": total["cached_tokens"],
+            "latency_ms": total["latency_ms"],
             "cost_usd": str(total["cost_usd"]),
         }
 
@@ -250,6 +309,7 @@ class TaskAuthoringPipeline:
         }
 
     def _generate_task(self, task_index: int, brief: str) -> dict[str, Any]:
+        task_started = time.monotonic()
         task_id = f"pilot-{task_index:03d}"
         task_dir = self.private_dir / task_id
         spec_revision_context: dict[str, Any] | None = None
@@ -353,6 +413,7 @@ class TaskAuthoringPipeline:
                         assignment["category"]
                         for assignment in critic["category_assignments"]
                     ],
+                    "duration_ms": round((time.monotonic() - task_started) * 1000),
                 }
 
             spec_revision_context = {
@@ -372,11 +433,22 @@ class TaskAuthoringPipeline:
             "status": "rejected",
             "round": self.config.max_revision_rounds,
             "errors": last_errors,
+            "duration_ms": round((time.monotonic() - task_started) * 1000),
         }
 
     def run(self, brief: str) -> dict[str, Any]:
+        started = time.monotonic()
+        started_at = datetime.now(timezone.utc).isoformat()
         self.private_dir.mkdir(parents=True, exist_ok=True)
-        _write_json(self.private_dir / "provenance.json", self._provenance(brief))
+        source_state = _source_state(self.config)
+        _write_json(self.private_dir / "source_state.json", source_state)
+        provenance = self._provenance(brief)
+        provenance["source_state"] = {
+            "artifact": "source_state.json",
+            "file_count": source_state["file_count"],
+            "aggregate_sha256": source_state["aggregate_sha256"],
+        }
+        _write_json(self.private_dir / "provenance.json", provenance)
         task_results: list[dict[str, Any]] = []
         status = "completed"
         fatal_error: dict[str, str] | None = None
@@ -390,6 +462,9 @@ class TaskAuthoringPipeline:
             "run_id": self.run_id,
             "status": status,
             "mode": "paid" if self.client.billable else "offline-replay",
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "duration_ms": round((time.monotonic() - started) * 1000),
             "budget_cap_usd": (
                 None if self.ledger.cap_usd is None else str(self.ledger.cap_usd)
             ),
@@ -407,6 +482,16 @@ class TaskAuthoringPipeline:
             "tasks": task_results,
             "fatal_error": fatal_error,
         }
+        try:
+            integrity = _artifact_integrity(self.run_dir)
+            _write_json(self.private_dir / "artifact_integrity.json", integrity)
+            summary["artifact_integrity"] = {
+                "artifact": str(self.private_dir / "artifact_integrity.json"),
+                "file_count": integrity["file_count"],
+                "aggregate_sha256": integrity["aggregate_sha256"],
+            }
+        except Exception as exc:
+            summary["artifact_integrity_error"] = f"{type(exc).__name__}: {exc}"
         _write_json(self.private_dir / "summary.json", summary)
         if fatal_error:
             raise PipelineError(

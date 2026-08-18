@@ -113,6 +113,10 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
     environment_attempts_started = 0
     environment_cleanup_failures = 0
     host_pause_suspected = False
+    semantic_diff_added_resources = 0
+    semantic_diff_removed_resources = 0
+    semantic_diff_modified_resources = 0
+    semantic_diff_changed_field_paths = 0
 
     for stage, duration in (summary.get("stage_timings_ms", {}) or {}).items():
         if (
@@ -123,6 +127,20 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
             stage_timing_totals[stage] += round(duration)
 
     for attempt in attempts:
+        semantic_diff = attempt.get("candidate_semantic_diff")
+        if isinstance(semantic_diff, dict) and semantic_diff.get("basis") != "initial_candidate":
+            semantic_diff_added_resources += len(
+                semantic_diff.get("added_resources", []) or []
+            )
+            semantic_diff_removed_resources += len(
+                semantic_diff.get("removed_resources", []) or []
+            )
+            semantic_diff_modified_resources += len(
+                semantic_diff.get("modified_resources", []) or []
+            )
+            semantic_diff_changed_field_paths += int(
+                semantic_diff.get("changed_field_path_count") or 0
+            )
         environment_records = attempt.get("environment_attempts", []) or []
         if isinstance(environment_records, list):
             for environment_record in environment_records:
@@ -353,6 +371,16 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         "terminal_attempt_result": attempt_results[-1] if attempt_results else None,
         "mode": summary.get("mode"),
         "treatment_id": summary.get("treatment_id"),
+        "initial_candidate_source": summary.get("initial_candidate_source"),
+        "candidate_bank_id": (summary.get("candidate_bank") or {}).get(
+            "candidate_id"
+        ),
+        "candidate_bank_record_sha256": (summary.get("candidate_bank") or {}).get(
+            "record_sha256"
+        ),
+        "candidate_bank_raw_response_sha256": (
+            summary.get("candidate_bank") or {}
+        ).get("raw_response_sha256"),
         "started_at": summary.get("started_at"),
         "finished_at": summary.get("finished_at"),
         "duration_ms": summary.get("duration_ms"),
@@ -510,6 +538,10 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         "repair_feedback_source_utf8_bytes": feedback_source_utf8_bytes,
         "repair_feedback_omitted_utf8_bytes": feedback_omitted_utf8_bytes,
         "repair_feedback_payloads_truncated": feedback_truncated,
+        "semantic_diff_added_resources": semantic_diff_added_resources,
+        "semantic_diff_removed_resources": semantic_diff_removed_resources,
+        "semantic_diff_modified_resources": semantic_diff_modified_resources,
+        "semantic_diff_changed_field_paths": semantic_diff_changed_field_paths,
         "stage_timing_totals_ms": dict(sorted(stage_timing_totals.items())),
         "accepted_attempt": next(
             (

@@ -135,6 +135,7 @@ class Kubectl:
         command_timeout: int = 45,
         executable: str | Path = "kubectl",
         command_prefix: Sequence[str] | None = None,
+        journal_callback: Callable[[CommandResult], None] | None = None,
     ):
         if not context.strip():
             raise EvaluationError("an explicit kubectl context is required")
@@ -147,6 +148,7 @@ class Kubectl:
         self.executable = str(executable)
         self.command_prefix = list(command_prefix) if command_prefix else None
         self.runner = CommandRunner()
+        self.journal_callback = journal_callback
         self._api_resource_scope_cache: dict[str, dict[str, bool]] = {}
 
     def _base(self) -> list[str]:
@@ -169,6 +171,8 @@ class Kubectl:
             timeout=timeout or self.command_timeout,
             check=False,
         )
+        if self.journal_callback is not None:
+            self.journal_callback(result)
         missing_executable = (
             result.returncode == 127
             and (

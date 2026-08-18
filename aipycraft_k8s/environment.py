@@ -484,6 +484,21 @@ class AttemptEnvironment:
                     + "\n"
                 )
 
+    def journal_external_command(
+        self, result: CommandResult, *, source: str
+    ) -> None:
+        """Include verifier-owned commands in the attempt's append-only journal."""
+
+        journal_path = self.attempt_dir / "command_journal.jsonl"
+        with journal_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {"source": source, "command": result.audit_dict()},
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
     def kubectl(
         self,
         args: list[str | Path],
