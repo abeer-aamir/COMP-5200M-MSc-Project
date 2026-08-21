@@ -112,6 +112,9 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
     environment_setup_statuses: list[str] = []
     environment_attempts_started = 0
     environment_cleanup_failures = 0
+    cleanup_verified_environment_retries = 0
+    docker_network_subnets: list[str] = []
+    docker_network_selection_bases: list[str] = []
     host_pause_suspected = False
     semantic_diff_added_resources = 0
     semantic_diff_removed_resources = 0
@@ -155,11 +158,22 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
                     setup_status = setup_record.get("status")
                     if isinstance(setup_status, str):
                         environment_setup_statuses.append(setup_status)
+                    network_selection = setup_record.get("docker_network_selection")
+                    if isinstance(network_selection, dict):
+                        selected_subnet = network_selection.get("selected_subnet")
+                        selection_basis = network_selection.get("selection_basis")
+                        if isinstance(selected_subnet, str):
+                            docker_network_subnets.append(selected_subnet)
+                        if isinstance(selection_basis, str):
+                            docker_network_selection_bases.append(selection_basis)
                 cleanup_record = environment_record.get("cleanup")
                 if isinstance(cleanup_record, dict):
                     errors = cleanup_record.get("errors", []) or []
                     if isinstance(errors, list) and errors:
                         environment_cleanup_failures += 1
+                cleanup_verified_environment_retries += int(
+                    environment_record.get("retry_same_candidate") is True
+                )
                 host_pause_suspected = host_pause_suspected or _nested_truthy_key(
                     environment_record, "host_pause_suspected"
                 )
@@ -395,6 +409,9 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         "candidate_api_loss_confirmation_replays_per_candidate": summary.get(
             "candidate_api_loss_confirmation_replays"
         ),
+        "environment_setup_retries_per_environment": summary.get(
+            "environment_setup_retries"
+        ),
         "runtime_observation_seconds": summary.get("runtime_observation_seconds"),
         "runtime_poll_seconds": summary.get("runtime_poll_seconds"),
         "command_timeout_seconds": summary.get("command_timeout_seconds"),
@@ -512,6 +529,13 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         ),
         "environment_setup_status_counts": _counts(environment_setup_statuses),
         "environment_cleanup_failures": environment_cleanup_failures,
+        "cleanup_verified_environment_retries": (
+            cleanup_verified_environment_retries
+        ),
+        "docker_network_subnet_counts": _counts(docker_network_subnets),
+        "docker_network_selection_basis_counts": _counts(
+            docker_network_selection_bases
+        ),
         "host_pause_suspected": host_pause_suspected,
         "candidate_api_loss_events": candidate_api_loss_events,
         "api_loss_confirmation_replays": api_loss_confirmation_replays,

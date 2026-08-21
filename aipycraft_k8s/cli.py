@@ -10,10 +10,15 @@ from typing import Any
 
 from task_authoring.config import load_env_file
 
-from .candidate_bank import CandidateBankError, load_entry
+from .candidate_bank import CandidateBankError, load_initial_candidate
 from .commands import CommandError
 from .config import DEFAULT_CONFIG_PATH, ConfigError, load_config, treatment_id
-from .environment import EnvironmentError, EnvironmentPreparer, IsolatedKindHarness
+from .environment import (
+    NETWORK_FALLBACK_SUBNETS,
+    EnvironmentError,
+    EnvironmentPreparer,
+    IsolatedKindHarness,
+)
 from .openrouter import (
     OpenRouterTextClient,
     ProviderError,
@@ -57,7 +62,10 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--initial-candidate",
         type=Path,
-        help="Immutable candidate.json to use for attempt 1 instead of a model call.",
+        help=(
+            "Immutable candidate.json or saved .yaml/.yml/.txt response to use for "
+            "attempt 1 instead of a model call."
+        ),
     )
 
     replay = subparsers.add_parser(
@@ -87,7 +95,7 @@ def _plan(config: Any) -> dict[str, Any]:
     max_generations = config.pipeline.max_regenerations + 1
     max_cluster_attempts = max_generations * (
         config.pipeline.candidate_api_loss_confirmation_replays + 1
-    )
+    ) * (config.pipeline.environment_setup_retries + 1)
     max_validator_responses = max_generations if config.ai_validator.enabled else 0
     max_model_responses = max_generations + max_validator_responses
     return {
@@ -220,6 +228,15 @@ def _plan(config: Any) -> dict[str, Any]:
             "calico": lock.calico_version,
             "internal_docker_network_per_attempt": True,
             "fresh_cluster_per_deployment_attempt": True,
+            "preferred_docker_subnet": lock.docker_network_subnet,
+            "bounded_fallback_subnets": list(NETWORK_FALLBACK_SUBNETS),
+            "fallback_policy": "only_after_confirmed_docker_ipam_overlap",
+            "environment_setup_retries": (
+                config.pipeline.environment_setup_retries
+            ),
+            "setup_retry_policy": (
+                "same candidate before evaluation and only after verified cleanup"
+            ),
             "configured_extra_mounts": False,
             "configured_extra_port_mappings": False,
             "api_server_host_published": False,
@@ -305,6 +322,7 @@ def main(argv: list[str] | None = None) -> int:
                         config.pipeline.candidate_api_loss_confirmation_replays
                         + 1
                     )
+                    * (config.pipeline.environment_setup_retries + 1)
                 ),
             )
             _print(harness.smoke())
@@ -319,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
                 * (
                     config.pipeline.candidate_api_loss_confirmation_replays + 1
                 )
+                * (config.pipeline.environment_setup_retries + 1)
             ),
         )
         key_supplier = None
@@ -342,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         for task in tasks:
             initial_candidate = (
-                load_entry(args.initial_candidate, task=task, config=config)
+                load_initial_candidate(args.initial_candidate, task=task, config=config)
                 if args.initial_candidate is not None
                 else None
             )

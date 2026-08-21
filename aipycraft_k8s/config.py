@@ -15,6 +15,7 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "benchmark" / "aipycraft_config.json"
 FROZEN_API_BASE = "https://openrouter.ai/api/v1"
 FROZEN_MAX_REGENERATIONS = 5
 FROZEN_API_LOSS_CONFIRMATION_REPLAYS = 1
+FROZEN_ENVIRONMENT_SETUP_RETRIES = 2
 
 
 class ConfigError(ValueError):
@@ -38,6 +39,7 @@ class ApiConfig:
 class PipelineSettings:
     max_regenerations: int
     candidate_api_loss_confirmation_replays: int
+    environment_setup_retries: int
     runtime_observation_seconds: int
     runtime_poll_seconds: float
     command_timeout_seconds: int
@@ -491,6 +493,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             candidate_api_loss_confirmation_replays=(
                 FROZEN_API_LOSS_CONFIRMATION_REPLAYS
             ),
+            environment_setup_retries=FROZEN_ENVIRONMENT_SETUP_RETRIES,
             runtime_observation_seconds=int(runtime_observation_seconds),
             runtime_poll_seconds=runtime_poll_seconds,
             command_timeout_seconds=int(command_timeout_seconds),

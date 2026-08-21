@@ -873,7 +873,9 @@ class KubernetesAIPyCraftPipeline:
             "api_base": self.config.api.base_url,
             "response_format": "raw_text",
             "initial_candidate_source": (
-                "candidate_bank" if initial_candidate is not None else "model_request"
+                initial_candidate.source
+                if initial_candidate is not None
+                else "model_request"
             ),
             "candidate_bank": (
                 initial_candidate.provenance()
@@ -890,6 +892,9 @@ class KubernetesAIPyCraftPipeline:
             "max_regenerations": self.config.pipeline.max_regenerations,
             "candidate_api_loss_confirmation_replays": (
                 self.config.pipeline.candidate_api_loss_confirmation_replays
+            ),
+            "environment_setup_retries": (
+                self.config.pipeline.environment_setup_retries
             ),
             "runtime_observation_seconds": (
                 self.config.pipeline.runtime_observation_seconds
@@ -919,6 +924,7 @@ class KubernetesAIPyCraftPipeline:
                 "candidate_execution_failures_regenerate": True,
                 "confirmed_candidate_api_disruption_regenerates": True,
                 "same_candidate_api_loss_confirmation_is_not_regeneration": True,
+                "cleanup_verified_environment_setup_retry_is_not_regeneration": True,
                 "hidden_or_confirmed_infrastructure_failures_regenerate": False,
                 "transport_retry_is_same_request_not_candidate_regeneration": True,
             },
@@ -1091,7 +1097,7 @@ class KubernetesAIPyCraftPipeline:
             repair_trigger = ""
             repair_failure = ""
             terminal = False
-            confirmation_cluster_count = 0
+            auxiliary_cluster_count = 0
             for index in range(self.config.pipeline.max_regenerations + 1):
                 number = index + 1
                 attempt_start_times[number] = time.monotonic()
@@ -1131,6 +1137,7 @@ class KubernetesAIPyCraftPipeline:
                     "post_execution": None,
                     "candidate_evaluations": [],
                     "environment_attempts": [],
+                    "environment_setup_retries": 0,
                     "api_loss_confirmation_replays": 0,
                     "validator_ground_truth": None,
                     "validator_outcome_agreement": None,
@@ -1146,11 +1153,11 @@ class KubernetesAIPyCraftPipeline:
                 if banked_initial:
                     raw_text = initial_candidate.raw_text
                     finish_reason = initial_candidate.finish_reason
-                    attempt["stage_timings_ms"]["candidate_bank_load"] = round(
+                    attempt["stage_timings_ms"]["initial_candidate_load"] = round(
                         (time.monotonic() - generation_started) * 1000
                     )
                     generation_audit = {
-                        "source": "candidate_bank",
+                        "source": initial_candidate.source,
                         "candidate_id": initial_candidate.candidate_id,
                         "candidate_record": str(initial_candidate.record_path),
                         "candidate_record_sha256": initial_candidate.provenance()[
@@ -1509,30 +1516,44 @@ class KubernetesAIPyCraftPipeline:
                 maximum_confirmations = (
                     self.config.pipeline.candidate_api_loss_confirmation_replays
                 )
-                for evaluation_index in range(maximum_confirmations + 1):
-                    if evaluation_index == 0:
+                evaluation_index = 0
+                setup_retry_index = 0
+                while evaluation_index <= maximum_confirmations:
+                    if evaluation_index == 0 and setup_retry_index == 0:
                         cluster_attempt_number = number
                         evidence_dir = attempt_dir
                     else:
-                        confirmation_cluster_count += 1
+                        auxiliary_cluster_count += 1
                         cluster_attempt_number = (
                             self.config.pipeline.max_regenerations
                             + 1
-                            + confirmation_cluster_count
+                            + auxiliary_cluster_count
                         )
-                        evidence_dir = (
-                            attempt_dir
-                            / f"api-loss-confirmation-{evaluation_index:02d}"
-                        )
+                        if evaluation_index == 0:
+                            evidence_name = (
+                                f"environment-retry-{setup_retry_index:02d}"
+                            )
+                        elif setup_retry_index == 0:
+                            evidence_name = (
+                                f"api-loss-confirmation-{evaluation_index:02d}"
+                            )
+                        else:
+                            evidence_name = (
+                                f"api-loss-confirmation-{evaluation_index:02d}-"
+                                f"environment-retry-{setup_retry_index:02d}"
+                            )
+                        evidence_dir = attempt_dir / evidence_name
                         evidence_dir.mkdir(parents=True, exist_ok=False)
                         (evidence_dir / "candidate.yaml").write_text(
                             syntax.candidate, encoding="utf-8"
                         )
-                        attempt["api_loss_confirmation_replays"] += 1
+                        if evaluation_index > 0 and setup_retry_index == 0:
+                            attempt["api_loss_confirmation_replays"] += 1
 
                     cluster_started = time.monotonic()
                     environment_record: dict[str, Any] = {
                         "evaluation_number": evaluation_index + 1,
+                        "environment_setup_retry_number": setup_retry_index,
                         "cluster_attempt_number": cluster_attempt_number,
                         "evidence_dir": str(evidence_dir.relative_to(private_dir)),
                         "started_at": _utc_now(),
@@ -1546,12 +1567,15 @@ class KubernetesAIPyCraftPipeline:
                         attempt["environment_attempts"],
                     )
                     evaluation_finished: float | None = None
+                    environment_ready = False
+                    environment_error: BaseException | None = None
                     try:
                         with self.harness.attempt(
                             run_id,
                             cluster_attempt_number,
                             evidence_dir,
                         ) as environment:
+                            environment_ready = True
                             setup_finished = time.monotonic()
                             evaluation = self._evaluate_candidate_once(
                                 task,
@@ -1586,7 +1610,7 @@ class KubernetesAIPyCraftPipeline:
                         environment_record["error"] = (
                             f"{type(exc).__name__}: {exc}"
                         )
-                        raise
+                        environment_error = exc
                     finally:
                         cluster_finished = time.monotonic()
                         environment_record["finished_at"] = _utc_now()
@@ -1617,6 +1641,14 @@ class KubernetesAIPyCraftPipeline:
                                     ),
                                     "host_pause_suspected": _nested_truthy_key(
                                         setup_detail, "host_pause_suspected"
+                                    ),
+                                    "docker_network_selection": (
+                                        (
+                                            setup_detail.get(
+                                                "precheck_and_network"
+                                            )
+                                            or {}
+                                        ).get("network_selection")
                                     ),
                                 }
                             except Exception as checkpoint_exc:
@@ -1667,6 +1699,56 @@ class KubernetesAIPyCraftPipeline:
                             attempt["environment_attempts"],
                         )
                         _write_json(private_dir / "summary.json", summary)
+                    if environment_error is not None:
+                        cleanup_record = environment_record.get("cleanup")
+                        cleanup_verified = (
+                            isinstance(cleanup_record, dict)
+                            and not cleanup_record.get("read_error")
+                            and cleanup_record.get("errors") == []
+                        )
+                        retry_eligible = (
+                            not environment_ready
+                            and isinstance(
+                                environment_error, (EnvironmentError, CommandError)
+                            )
+                            and cleanup_verified
+                            and setup_retry_index
+                            < self.config.pipeline.environment_setup_retries
+                        )
+                        environment_record["cleanup_verified_for_retry"] = (
+                            cleanup_verified
+                        )
+                        environment_record["retry_same_candidate"] = retry_eligible
+                        if retry_eligible:
+                            environment_record["retry_reason"] = (
+                                "environment_setup_failed_before_candidate_evaluation"
+                            )
+                            setup_retry_index += 1
+                            attempt["environment_setup_retries"] += 1
+                            _write_json(
+                                attempt_dir / "environment_attempts.json",
+                                attempt["environment_attempts"],
+                            )
+                            _write_json(private_dir / "summary.json", summary)
+                            continue
+                        if environment_ready:
+                            environment_record["retry_reason"] = (
+                                "candidate_evaluation_had_started"
+                            )
+                        elif not cleanup_verified:
+                            environment_record["retry_reason"] = (
+                                "cleanup_not_verified"
+                            )
+                        else:
+                            environment_record["retry_reason"] = (
+                                "environment_setup_retry_limit_reached"
+                            )
+                        _write_json(
+                            attempt_dir / "environment_attempts.json",
+                            attempt["environment_attempts"],
+                        )
+                        _write_json(private_dir / "summary.json", summary)
+                        raise environment_error
                     if evaluation_finished is None:
                         raise EnvironmentError(
                             "Candidate environment ended before evaluation started"
@@ -1686,6 +1768,8 @@ class KubernetesAIPyCraftPipeline:
                         evaluation["result"] == "candidate_api_loss"
                         and evaluation_index < maximum_confirmations
                     ):
+                        evaluation_index += 1
+                        setup_retry_index = 0
                         continue
                     candidate_evaluation = evaluation
                     break

@@ -45,6 +45,7 @@ class CandidateBankEntry:
     finish_reason: str | None
     raw_response_sha256: str
     metadata: dict[str, Any]
+    source: str = "candidate_bank"
 
     def provenance(self) -> dict[str, Any]:
         return {
@@ -54,6 +55,7 @@ class CandidateBankEntry:
             "record_sha256": _hash_file(self.record_path),
             "raw_response_sha256": self.raw_response_sha256,
             "task_id": self.task_id,
+            "source": self.source,
             "shared_initial_generation_usage": self.metadata.get("generation"),
         }
 
@@ -234,3 +236,54 @@ def load_entry(
         raw_response_sha256=raw_hash,
         metadata=record,
     )
+
+
+def load_saved_yaml(path: Path, *, task: BenchmarkTask) -> CandidateBankEntry:
+    """Load a user-supplied saved response without claiming bank provenance."""
+
+    candidate_path = path.resolve()
+    try:
+        size_bytes = candidate_path.stat().st_size
+        if size_bytes > 10 * 1024 * 1024:
+            raise CandidateBankError("Saved initial YAML exceeds the 10 MiB safety limit")
+        raw_text = candidate_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CandidateBankError(f"Could not read saved initial YAML {path}: {exc}") from exc
+    if not raw_text.strip():
+        raise CandidateBankError("Saved initial YAML is empty")
+    raw_hash = _hash_text(raw_text)
+    return CandidateBankEntry(
+        record_path=candidate_path,
+        candidate_id=f"saved-{task.task_id}-{raw_hash[:12]}",
+        task_id=task.task_id,
+        raw_text=raw_text,
+        finish_reason="stop",
+        raw_response_sha256=raw_hash,
+        metadata={
+            "schema_version": 1,
+            "source": "saved_yaml",
+            "task_id": task.task_id,
+            "task_description_sha256": _hash_text(task.description),
+            "raw_response_sha256": raw_hash,
+            "size_bytes": size_bytes,
+            "generation": None,
+            "accounting_policy": (
+                "Generation usage is unknown and excluded from treatment totals; "
+                "use an immutable candidate-bank record for final paired studies."
+            ),
+        },
+        source="saved_yaml",
+    )
+
+
+def load_initial_candidate(
+    path: Path,
+    *,
+    task: BenchmarkTask,
+    config: AppConfig,
+) -> CandidateBankEntry:
+    """Accept an immutable bank record or a directly saved YAML/text response."""
+
+    if path.suffix.lower() == ".json":
+        return load_entry(path, task=task, config=config)
+    return load_saved_yaml(path, task=task)

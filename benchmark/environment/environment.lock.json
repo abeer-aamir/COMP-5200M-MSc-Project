@@ -19,7 +19,7 @@
     "node_image_dockerfile": "benchmark/environment/kind-node-internal.Dockerfile",
     "node_image_dockerfile_sha256": "1de2ab734bf85284d1b4f1524f6a9dca9d1e33666b47d1f45a6572a49b25a3a8",
     "node_image_entrypoint": "benchmark/environment/kind-internal-entrypoint.sh",
-    "node_image_entrypoint_sha256": "9d3314dc3baf3d3285efb83271fbfe183ee38a4522272acb8d0e01f89408d80d",
+    "node_image_entrypoint_sha256": "a69576d745afa03fb164fea33c8077d19b3ea6d834589d5cc0458b2c467427a4",
     "kind_config_sha256": "692535fbf60a8dc679ba67b78afba9221ceac1e3ae1ff633a555fe1ba3e62b03",
     "docker_network_subnet": "172.31.250.0/24",
     "docker_network_gateway": "172.31.250.1"

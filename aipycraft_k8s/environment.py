@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import platform
 import re
@@ -644,6 +645,12 @@ class AttemptEnvironment:
         return self.kubectl(["get", "--raw=/readyz"], check=False, timeout=30)
 
     def metadata(self, lock: EnvironmentLock) -> dict[str, Any]:
+        actual_subnet = self.isolation_inspection.get(
+            "network_subnet", lock.docker_network_subnet
+        )
+        actual_gateway = self.isolation_inspection.get(
+            "network_gateway", lock.docker_network_gateway
+        )
         return {
             "cluster_name": self.cluster_name,
             "network_name": self.network_name,
@@ -659,8 +666,13 @@ class AttemptEnvironment:
             "kubernetes_minor": lock.kubernetes_minor,
             "kind_config_sha256": lock.kind_config_sha256,
             "environment_lock_sha256": _sha256_file(lock.path),
-            "docker_network_subnet": lock.docker_network_subnet,
-            "docker_network_gateway": lock.docker_network_gateway,
+            "docker_network_subnet": actual_subnet,
+            "docker_network_gateway": actual_gateway,
+            "docker_network_preferred_subnet": lock.docker_network_subnet,
+            "docker_network_preferred_gateway": lock.docker_network_gateway,
+            "docker_network_selection_basis": self.isolation_inspection.get(
+                "network_selection_basis"
+            ),
             "calico_version": lock.calico_version,
             "calico_manifest_sha256": lock.calico_manifest_sha256,
             "preload_images": [image.tag for image in lock.preload_images],
@@ -671,6 +683,12 @@ _SAFE_CLUSTER = re.compile(r"\Aaipc-[a-z0-9-]{1,42}-a[1-9][0-9]*\Z")
 _SAFE_NETWORK = re.compile(r"\Aaipc-[a-z0-9-]{1,42}-a[1-9][0-9]*-net\Z")
 _NETWORK_DISPOSABLE_KEY = "org.aipycraft.disposable"
 _NETWORK_OWNER_KEY = "org.aipycraft.owner"
+NETWORK_FALLBACK_SUBNETS = (
+    "172.31.249.0/24",
+    "172.31.248.0/24",
+    "10.255.250.0/24",
+    "10.255.249.0/24",
+)
 
 
 def _kind_create_acceptance_basis(result: CommandResult) -> str | None:
@@ -993,6 +1011,113 @@ spec:
                 timeout=70,
             )
 
+    def _select_network_subnet(self) -> dict[str, Any]:
+        """Choose the preferred /24 unless Docker proves that it overlaps."""
+
+        list_result = self.runner.run(
+            ["docker", "network", "ls", "--format", "{{.ID}}"], timeout=30
+        )
+        network_ids = [line.strip() for line in list_result.stdout.splitlines() if line.strip()]
+        inspect_result: CommandResult | None = None
+        network_rows: list[dict[str, Any]] = []
+        if network_ids:
+            inspect_result = self.runner.run(
+                ["docker", "network", "inspect", *network_ids], timeout=30
+            )
+            try:
+                raw_rows = json.loads(inspect_result.stdout)
+            except json.JSONDecodeError as exc:
+                raise EnvironmentError(
+                    "Docker network inventory returned malformed JSON"
+                ) from exc
+            if not isinstance(raw_rows, list) or not all(
+                isinstance(item, dict) for item in raw_rows
+            ):
+                raise EnvironmentError("Docker network inventory was not a list of objects")
+            network_rows = raw_rows
+
+        existing: list[dict[str, str]] = []
+        parsed_existing: list[tuple[ipaddress.IPv4Network, dict[str, str]]] = []
+        for row in network_rows:
+            configs = (row.get("IPAM") or {}).get("Config") or []
+            if not isinstance(configs, list):
+                raise EnvironmentError("Docker network IPAM inventory was malformed")
+            for config in configs:
+                if not isinstance(config, dict) or not config.get("Subnet"):
+                    continue
+                raw_subnet = str(config["Subnet"])
+                try:
+                    parsed = ipaddress.ip_network(raw_subnet, strict=False)
+                except ValueError as exc:
+                    raise EnvironmentError(
+                        f"Docker reported an invalid network subnet {raw_subnet!r}"
+                    ) from exc
+                if not isinstance(parsed, ipaddress.IPv4Network):
+                    continue
+                record = {
+                    "id": str(row.get("Id") or row.get("ID") or ""),
+                    "name": str(row.get("Name") or ""),
+                    "subnet": str(parsed),
+                }
+                existing.append(record)
+                parsed_existing.append((parsed, record))
+
+        candidates = [self.lock.docker_network_subnet, *NETWORK_FALLBACK_SUBNETS]
+        candidates = list(dict.fromkeys(candidates))
+        decisions: list[dict[str, Any]] = []
+        selected: ipaddress.IPv4Network | None = None
+        for index, raw_candidate in enumerate(candidates):
+            try:
+                candidate = ipaddress.ip_network(raw_candidate, strict=True)
+            except ValueError as exc:  # locked/frozen source, but fail closed if corrupted
+                raise EnvironmentError(
+                    f"Invalid frozen Docker subnet candidate {raw_candidate!r}"
+                ) from exc
+            if not isinstance(candidate, ipaddress.IPv4Network) or candidate.prefixlen != 24:
+                raise EnvironmentError("Every Docker subnet candidate must be an IPv4 /24")
+            overlaps = [
+                record for network, record in parsed_existing if candidate.overlaps(network)
+            ]
+            decisions.append(
+                {
+                    "subnet": str(candidate),
+                    "preferred": index == 0,
+                    "overlaps": overlaps,
+                    "available": not overlaps,
+                }
+            )
+            if not overlaps:
+                selected = candidate
+                break
+
+        if selected is None:
+            raise EnvironmentError(
+                "Every bounded Docker subnet candidate overlaps an existing network"
+            )
+        selected_gateway = ipaddress.ip_address(int(selected.network_address) + 1)
+        preferred_used = str(selected) == self.lock.docker_network_subnet
+        return {
+            "schema_version": 1,
+            "preferred_subnet": self.lock.docker_network_subnet,
+            "preferred_gateway": self.lock.docker_network_gateway,
+            "fallback_subnets": list(NETWORK_FALLBACK_SUBNETS),
+            "selection_basis": (
+                "preferred_subnet_available"
+                if preferred_used
+                else "preferred_overlap_confirmed_bounded_fallback"
+            ),
+            "selected_subnet": str(selected),
+            "selected_gateway": str(selected_gateway),
+            "existing_ipv4_subnets": existing,
+            "decisions": decisions,
+            "commands": {
+                "network_list": list_result.audit_dict(),
+                "network_inspect": (
+                    inspect_result.audit_dict() if inspect_result is not None else None
+                ),
+            },
+        }
+
     def _precheck_absent(self, cluster: str, network: str, kind_path: Path) -> None:
         def definitely_missing(result: CommandResult) -> bool:
             detail = f"{result.stdout}\n{result.stderr}".lower()
@@ -1029,7 +1154,14 @@ spec:
             raise EnvironmentError(f"Refusing existing kind cluster {cluster}")
 
     def _inspect_isolation(
-        self, cluster: str, network: str, owner_token: str
+        self,
+        cluster: str,
+        network: str,
+        owner_token: str,
+        *,
+        expected_subnet: str,
+        expected_gateway: str,
+        selection_basis: str,
     ) -> dict[str, Any]:
         network_result = self.runner.run(
             ["docker", "network", "inspect", network], timeout=30
@@ -1047,8 +1179,8 @@ spec:
         labels = network_data.get("Labels") or {}
         ipam_configs = (network_data.get("IPAM") or {}).get("Config") or []
         subnet_match = any(
-            item.get("Subnet") == self.lock.docker_network_subnet
-            and item.get("Gateway") == self.lock.docker_network_gateway
+            item.get("Subnet") == expected_subnet
+            and item.get("Gateway") == expected_gateway
             for item in ipam_configs
         )
         if (
@@ -1101,8 +1233,9 @@ spec:
             )
         return {
             "network_internal": True,
-            "network_subnet": self.lock.docker_network_subnet,
-            "network_gateway": self.lock.docker_network_gateway,
+            "network_subnet": expected_subnet,
+            "network_gateway": expected_gateway,
+            "network_selection_basis": selection_basis,
             "node_networks": sorted(attached_networks),
             "requested_host_port_bindings": requested_bindings,
             "published_ports": published_ports,
@@ -1138,6 +1271,8 @@ spec:
         context = f"kind-{cluster}"
         stage_started = time.monotonic()
         self._precheck_absent(cluster, network, cache.kind)
+        network_selection = self._select_network_subnet()
+        _write_json(attempt_dir / "docker_network_selection.json", network_selection)
         network_create = self.runner.run(
             [
                 "docker",
@@ -1147,9 +1282,9 @@ spec:
                 "bridge",
                 "--internal",
                 "--subnet",
-                self.lock.docker_network_subnet,
+                network_selection["selected_subnet"],
                 "--gateway",
-                self.lock.docker_network_gateway,
+                network_selection["selected_gateway"],
                 "--label",
                 f"{_NETWORK_DISPOSABLE_KEY}=true",
                 "--label",
@@ -1160,6 +1295,7 @@ spec:
         )
         setup_stages["precheck_and_network"] = {
             "duration_ms": round((time.monotonic() - stage_started) * 1000),
+            "network_selection": network_selection,
             "network_create": network_create.audit_dict(),
         }
         setup_stages["current_stage"] = "kind_create"
@@ -1246,7 +1382,12 @@ spec:
             command_timeout_seconds=self.command_timeout_seconds,
         )
         env.isolation_inspection = self._inspect_isolation(
-            cluster, network, ownership.owner_token
+            cluster,
+            network,
+            ownership.owner_token,
+            expected_subnet=network_selection["selected_subnet"],
+            expected_gateway=network_selection["selected_gateway"],
+            selection_basis=network_selection["selection_basis"],
         )
         ready = env.readyz()
         if ready.returncode != 0 or "ok" not in ready.stdout.lower():
