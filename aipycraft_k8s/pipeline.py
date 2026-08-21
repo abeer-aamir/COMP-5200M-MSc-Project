@@ -594,6 +594,16 @@ class KubernetesAIPyCraftPipeline:
                 bool(item.usage_consistency_issues()) for item in results
             ),
             "latency_ms": sum(item.latency_ms for item in results),
+            "transport_attempt_duration_ms": sum(
+                int(attempt.get("duration_ms", 0) or 0)
+                for item in results
+                for attempt in item.transport_attempt_log
+            ),
+            "transport_retry_sleep_duration_ms": sum(
+                int(attempt.get("retry_sleep_duration_ms", 0) or 0)
+                for item in results
+                for attempt in item.transport_attempt_log
+            ),
             "cost_usd": str(cost),
             "provider_cost_complete": all(
                 item.provider_cost_complete for item in results
@@ -601,7 +611,10 @@ class KubernetesAIPyCraftPipeline:
             and unknown_cost_failures == 0,
             "usage_complete": all(item.usage_complete for item in results)
             and unknown_cost_failures == 0,
-            "unobserved_billable_attempts": unknown_cost_failures,
+            "unobserved_billable_attempts": sum(
+                item.unobserved_billable_attempts for item in results
+            )
+            + unknown_cost_failures,
         }
 
     @staticmethod
@@ -999,6 +1012,7 @@ class KubernetesAIPyCraftPipeline:
             detail: Any,
             evidence_artifacts: list[str],
         ) -> str:
+            feedback_started = time.monotonic()
             payload = self._failure_payload(failure_kind, detail)
             feedback_text = str(payload.pop("text"))
             record = {
@@ -1026,6 +1040,9 @@ class KubernetesAIPyCraftPipeline:
                 attempt["duration_ms"] = round(
                     (time.monotonic() - started_at) * 1000
                 )
+            attempt["stage_timings_ms"]["regeneration_feedback_preparation"] = round(
+                (time.monotonic() - feedback_started) * 1000
+            )
             _write_json(attempt_dir / "regeneration_feedback.json", record)
             summary["regenerations"] += 1
             _write_json(private_dir / "summary.json", summary)
@@ -1044,10 +1061,15 @@ class KubernetesAIPyCraftPipeline:
             )
             _write_json(private_dir / "environment_preflight.json", preflight)
             if self.key_context_supplier:
+                key_before_started = time.monotonic()
                 try:
                     summary["openrouter_key_before"] = self.key_context_supplier()
                 except Exception as exc:
                     summary["openrouter_key_before_error"] = str(exc)
+                finally:
+                    summary["stage_timings_ms"]["openrouter_key_before"] = round(
+                        (time.monotonic() - key_before_started) * 1000
+                    )
 
             generate_system = self.config.prompts.generate.read_text(encoding="utf-8")
             repair_system = self.config.prompts.regenerate.read_text(encoding="utf-8")
@@ -1217,7 +1239,11 @@ class KubernetesAIPyCraftPipeline:
                     terminal = True
                     break
 
+                syntax_started = time.monotonic()
                 syntax = check_yaml_syntax(raw_text)
+                attempt["stage_timings_ms"]["yaml_pre_execution"] = round(
+                    (time.monotonic() - syntax_started) * 1000
+                )
                 attempt["pre_execution"] = syntax.audit_dict()
                 _write_json(attempt_dir / "pre_execution.json", syntax.audit_dict())
                 (attempt_dir / "candidate.yaml").write_text(
@@ -1247,8 +1273,12 @@ class KubernetesAIPyCraftPipeline:
                     terminal = True
                     break
 
+                semantic_diff_started = time.monotonic()
                 semantic_diff = candidate_semantic_diff(
                     previous_valid_candidate, syntax.candidate
+                )
+                attempt["stage_timings_ms"]["candidate_semantic_diff"] = round(
+                    (time.monotonic() - semantic_diff_started) * 1000
                 )
                 previous_valid_candidate = syntax.candidate
                 attempt["candidate_semantic_diff"] = semantic_diff
@@ -1310,6 +1340,9 @@ class KubernetesAIPyCraftPipeline:
                             "error": str(exc),
                             "model_call": rejected_call,
                             "transport_attempts": exc.transport_attempts,
+                            "transport_attempt_log": list(
+                                exc.transport_attempt_log
+                            ),
                             "unknown_cost_attempts": exc.unknown_cost_attempts,
                         }
                         attempt["ai_pre_validation"] = validation_record
@@ -1344,6 +1377,7 @@ class KubernetesAIPyCraftPipeline:
                         _write_json(
                             attempt_dir / "ai_pre_validation.json", validation_record
                         )
+                        validator_parse_started = time.monotonic()
                         try:
                             if validation_result.finish_reason != "stop":
                                 raise AiValidationError(
@@ -1451,6 +1485,12 @@ class KubernetesAIPyCraftPipeline:
                                 summary["status"] = "candidate_failed"
                                 terminal = True
                                 break
+                        finally:
+                            attempt["stage_timings_ms"][
+                                "ai_pre_validator_decision_parse"
+                            ] = round(
+                                (time.monotonic() - validator_parse_started) * 1000
+                            )
                 else:
                     disabled_record = {
                         "enabled": False,
@@ -1599,6 +1639,9 @@ class KubernetesAIPyCraftPipeline:
                                     "artifact": str(
                                         cleanup_path.relative_to(attempt_dir)
                                     ),
+                                    "started_at": cleanup_detail.get("started_at"),
+                                    "finished_at": cleanup_detail.get("finished_at"),
+                                    "duration_ms": cleanup_detail.get("duration_ms"),
                                     "errors": cleanup_detail.get(
                                         "cleanup_errors", []
                                     ),
@@ -1963,6 +2006,7 @@ class KubernetesAIPyCraftPipeline:
                 "stage": provider_stage,
                 "attempt": attempts[-1].get("attempt") if attempts else None,
                 "transport_attempts": exc.transport_attempts,
+                "transport_attempt_log": list(exc.transport_attempt_log),
                 "unknown_cost_attempts": exc.unknown_cost_attempts,
             }
         except AiValidationError as exc:
@@ -2041,10 +2085,15 @@ class KubernetesAIPyCraftPipeline:
                 if attempt.get("result") == "running":
                     attempt["result"] = "pipeline_terminated_without_result"
             if self.key_context_supplier:
+                key_after_started = time.monotonic()
                 try:
                     summary["openrouter_key_after"] = self.key_context_supplier()
                 except Exception as exc:
                     summary["openrouter_key_after_error"] = str(exc)
+                finally:
+                    summary["stage_timings_ms"]["openrouter_key_after"] = round(
+                        (time.monotonic() - key_after_started) * 1000
+                    )
             summary["unknown_cost_failures"] = sum(unknown_cost_by_role.values())
             summary["usage_totals"] = self._usage_totals(
                 model_results,
@@ -2063,6 +2112,8 @@ class KubernetesAIPyCraftPipeline:
             }
             summary["finished_at"] = finished_marker
             summary["duration_ms"] = round((time.monotonic() - started) * 1000)
+            finalization_timings: dict[str, int] = {}
+            analysis_started = time.monotonic()
             try:
                 summary["analysis_record"] = build_analysis_record(summary)
                 _write_json(
@@ -2070,6 +2121,11 @@ class KubernetesAIPyCraftPipeline:
                 )
             except Exception as exc:
                 summary["analysis_record_error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                finalization_timings["analysis_record"] = round(
+                    (time.monotonic() - analysis_started) * 1000
+                )
+            integrity_started = time.monotonic()
             try:
                 integrity = _artifact_integrity(private_dir)
                 _write_json(private_dir / "artifact_integrity.json", integrity)
@@ -2082,5 +2138,10 @@ class KubernetesAIPyCraftPipeline:
                 summary["artifact_integrity_error"] = (
                     f"{type(exc).__name__}: {exc}"
                 )
+            finally:
+                finalization_timings["artifact_integrity"] = round(
+                    (time.monotonic() - integrity_started) * 1000
+                )
+            summary["finalization_timings_ms"] = finalization_timings
             _write_json(private_dir / "summary.json", summary)
         return PipelineRun(summary=summary, run_dir=run_dir)

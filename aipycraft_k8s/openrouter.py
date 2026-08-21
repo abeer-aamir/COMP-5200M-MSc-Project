@@ -5,6 +5,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
@@ -20,12 +21,14 @@ class ProviderError(RuntimeError):
         transport_attempts: int = 0,
         unknown_cost_attempts: int = 0,
         audit_result: GenerationResult | None = None,
+        transport_attempt_log: tuple[dict[str, Any], ...] = (),
     ):
         super().__init__(message)
         self.transport_attempts = transport_attempts
         self.unknown_cost_attempts = unknown_cost_attempts
         self.unknown_cost_possible = unknown_cost_attempts > 0
         self.audit_result = audit_result
+        self.transport_attempt_log = transport_attempt_log
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,7 @@ class GenerationResult:
     transport_retries: int
     unobserved_billable_attempts: int
     billable: bool
+    transport_attempt_log: tuple[dict[str, Any], ...] = ()
 
     def usage_consistency_issues(self) -> list[str]:
         """Return conservative local checks without replacing provider accounting."""
@@ -161,14 +165,29 @@ class OpenRouterTextClient:
 
     def _request_json(
         self, method: str, path: str, payload: dict[str, Any] | None = None
-    ) -> tuple[dict[str, Any], int, int, str | None, int]:
+    ) -> tuple[
+        dict[str, Any],
+        int,
+        int,
+        str | None,
+        int,
+        tuple[dict[str, Any], ...],
+    ]:
         url = f"{self.config.base_url}/{path.lstrip('/')}"
         encoded = None if payload is None else json.dumps(payload).encode("utf-8")
         started = time.monotonic()
         last_error: Exception | None = None
         uncertain_attempts = 0
+        attempt_log: list[dict[str, Any]] = []
         attempts = self.config.transport_retries + 1
         for attempt in range(attempts):
+            attempt_started = time.monotonic()
+            attempt_record: dict[str, Any] = {
+                "attempt": attempt + 1,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "method": method.upper(),
+                "path": path,
+            }
             request = urllib.request.Request(
                 url,
                 data=encoded,
@@ -190,12 +209,26 @@ class OpenRouterTextClient:
                 result = json.loads(decoded)
                 if not isinstance(result, dict):
                     raise json.JSONDecodeError("response was not an object", decoded, 0)
+                attempt_record.update(
+                    {
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                        "duration_ms": round(
+                            (time.monotonic() - attempt_started) * 1000
+                        ),
+                        "outcome": "completed",
+                        "http_status": getattr(response, "status", None),
+                        "retry_scheduled": False,
+                        "retry_delay_ms": 0,
+                    }
+                )
+                attempt_log.append(attempt_record)
                 return (
                     result,
                     round((time.monotonic() - started) * 1000),
                     attempt,
                     request_id,
                     uncertain_attempts,
+                    tuple(attempt_log),
                 )
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
@@ -207,27 +240,58 @@ class OpenRouterTextClient:
                     except ValueError:
                         retry_after = 1.0
                 if exc.code not in {408, 409, 429, 500, 502, 503, 504}:
-                    break
+                    retry_after = 0
                 if method.upper() == "POST" and exc.code == 408:
                     uncertain_attempts += 1
+                attempt_record.update(
+                    {
+                        "outcome": "http_error",
+                        "http_status": exc.code,
+                        "error_type": type(last_error).__name__,
+                    }
+                )
             except (urllib.error.URLError, TimeoutError) as exc:
                 last_error = exc
                 uncertain_attempts += int(method.upper() == "POST")
+                attempt_record.update(
+                    {"outcome": "transport_error", "error_type": type(exc).__name__}
+                )
             except json.JSONDecodeError as exc:
                 last_error = exc
                 uncertain_attempts += int(method.upper() == "POST")
-            if attempt + 1 < attempts:
+                attempt_record.update(
+                    {"outcome": "response_parse_error", "error_type": type(exc).__name__}
+                )
+            retry_scheduled = attempt + 1 < attempts and retry_after > 0
+            attempt_record.update(
+                {
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "duration_ms": round(
+                        (time.monotonic() - attempt_started) * 1000
+                    ),
+                    "retry_scheduled": retry_scheduled,
+                    "retry_delay_ms": round(retry_after * 1000) if retry_scheduled else 0,
+                }
+            )
+            attempt_log.append(attempt_record)
+            if retry_scheduled:
+                retry_sleep_started = time.monotonic()
                 time.sleep(retry_after)
+                attempt_record["retry_sleep_duration_ms"] = round(
+                    (time.monotonic() - retry_sleep_started) * 1000
+                )
+            else:
+                break
         raise ProviderError(
             f"OpenRouter request failed after {min(attempt + 1, attempts)} attempt(s): "
             f"{last_error}",
             transport_attempts=min(attempt + 1, attempts),
             unknown_cost_attempts=uncertain_attempts,
+            transport_attempt_log=tuple(attempt_log),
         ) from last_error
 
     def get_key_status(self) -> dict[str, Any]:
-        data, _, _, _, _ = self._request_json("GET", "/key")
-        return data
+        return self._request_json("GET", "/key")[0]
 
     def request_payload(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -258,6 +322,7 @@ class OpenRouterTextClient:
         retries: int,
         header_request_id: str | None,
         uncertain_attempts: int,
+        transport_attempt_log: tuple[dict[str, Any], ...],
     ) -> GenerationResult:
         choices = response.get("choices")
         choice = (
@@ -365,12 +430,17 @@ class OpenRouterTextClient:
             transport_retries=retries,
             unobserved_billable_attempts=uncertain_attempts,
             billable=True,
+            transport_attempt_log=transport_attempt_log,
         )
 
     def complete(self, system_prompt: str, user_prompt: str) -> GenerationResult:
         payload = self.request_payload(system_prompt, user_prompt)
-        response, latency_ms, retries, header_request_id, uncertain_attempts = self._request_json(
-            "POST", "/chat/completions", payload
+        request_result = self._request_json("POST", "/chat/completions", payload)
+        response, latency_ms, retries, header_request_id, uncertain_attempts = (
+            request_result[:5]
+        )
+        transport_attempt_log = (
+            request_result[5] if len(request_result) > 5 else ()
         )
         audit = self._audit_response(
             response,
@@ -378,6 +448,7 @@ class OpenRouterTextClient:
             retries=retries,
             header_request_id=header_request_id,
             uncertain_attempts=uncertain_attempts,
+            transport_attempt_log=transport_attempt_log,
         )
 
         def reject(message: str) -> None:
@@ -385,6 +456,7 @@ class OpenRouterTextClient:
                 message,
                 transport_attempts=retries + 1,
                 audit_result=audit,
+                transport_attempt_log=audit.transport_attempt_log,
             )
 
         if response.get("error"):

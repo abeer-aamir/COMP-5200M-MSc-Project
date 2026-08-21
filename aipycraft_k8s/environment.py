@@ -11,6 +11,7 @@ import urllib.error
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -301,6 +302,86 @@ class EnvironmentPreparer:
             "server_arch": server_arch,
         }
 
+    @staticmethod
+    def _docker_json_lines(result: CommandResult, label: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for line_number, line in enumerate(result.stdout.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise EnvironmentError(
+                    f"Docker returned invalid JSON for {label} at line {line_number}"
+                ) from exc
+            if not isinstance(value, dict):
+                raise EnvironmentError(f"Docker {label} row was not an object")
+            rows.append(value)
+        return rows
+
+    def _experiment_cleanliness(self) -> dict[str, Any]:
+        """Refuse hidden Docker contention before a timed experiment starts."""
+
+        running_result = self.runner.run(
+            ["docker", "ps", "--format", "{{json .}}"], timeout=30
+        )
+        kind_result = self.runner.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "label=io.x-k8s.kind.cluster",
+                "--format",
+                "{{json .}}",
+            ],
+            timeout=30,
+        )
+        network_result = self.runner.run(
+            [
+                "docker",
+                "network",
+                "ls",
+                "--filter",
+                f"label={_NETWORK_DISPOSABLE_KEY}=true",
+                "--format",
+                "{{json .}}",
+            ],
+            timeout=30,
+        )
+        running = self._docker_json_lines(running_result, "running-container inventory")
+        kind = self._docker_json_lines(kind_result, "kind-container inventory")
+        disposable_networks = self._docker_json_lines(
+            network_result, "disposable-network inventory"
+        )
+        report = {
+            "clean": not running and not kind and not disposable_networks,
+            "policy": (
+                "No running Docker containers, retained kind nodes, or retained "
+                "AIPyCraft disposable networks may exist before a timed run."
+            ),
+            "running_containers": running,
+            "kind_containers": kind,
+            "disposable_networks": disposable_networks,
+            "commands": {
+                "running_containers": running_result.audit_dict(),
+                "kind_containers": kind_result.audit_dict(),
+                "disposable_networks": network_result.audit_dict(),
+            },
+        }
+        if not report["clean"]:
+            names = sorted(
+                {
+                    str(item.get("Names") or item.get("Name") or item.get("ID"))
+                    for item in [*running, *kind, *disposable_networks]
+                }
+            )
+            raise EnvironmentError(
+                "Experiment environment is not clean; stop or remove these Docker "
+                f"resources before a timed or paid run: {names}"
+            )
+        return report
+
     def doctor(self) -> dict[str, Any]:
         """Verify local prerequisites without downloading or making model calls."""
 
@@ -338,6 +419,7 @@ class EnvironmentPreparer:
             [paths.kubectl, "version", "--client", "-o", "json"], timeout=30
         )
         checks["docker"] = self._docker_identity()
+        checks["experiment_cleanliness"] = self._experiment_cleanliness()
         try:
             checks["kubectl_client"] = json.loads(kubectl.stdout)
         except json.JSONDecodeError:
@@ -640,6 +722,8 @@ class IsolatedKindHarness:
     def smoke(self) -> dict[str, Any]:
         """Create, test, and delete a real cluster without making a model call."""
 
+        smoke_started = time.monotonic()
+        started_at = datetime.now(timezone.utc).isoformat()
         preflight = self.preflight()
         run_id = f"smoke-{uuid.uuid4().hex[:16]}"
         output_dir = self.config.cache_root / "smoke-runs" / run_id
@@ -656,6 +740,9 @@ class IsolatedKindHarness:
         return {
             "status": "passed",
             "paid_calls_made": False,
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "duration_ms": round((time.monotonic() - smoke_started) * 1000),
             "preflight": preflight,
             "environment": metadata,
             "artifacts": str(output_dir),
@@ -1284,10 +1371,12 @@ spec:
     ) -> dict[str, Any]:
         if not _SAFE_CLUSTER.fullmatch(cluster) or not _SAFE_NETWORK.fullmatch(network):
             raise EnvironmentError("Refusing cleanup outside disposable name prefixes")
+        cleanup_started = time.monotonic()
         cache = self.preparer.cache_paths()
         report: dict[str, Any] = {
             "cluster": cluster,
             "network": network,
+            "started_at": datetime.now(timezone.utc).isoformat(),
             "network_acquired": ownership.network_acquired,
             "cluster_create_started": ownership.cluster_create_started,
             "warnings": [],
@@ -1433,6 +1522,8 @@ spec:
                     "Docker network absence or ownership could not be established"
                 )
 
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report["duration_ms"] = round((time.monotonic() - cleanup_started) * 1000)
         _write_json(attempt_dir / "cleanup.json", report)
         return report
 

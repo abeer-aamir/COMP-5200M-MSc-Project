@@ -88,6 +88,9 @@ def create_entry(
     record = {
         "schema_version": CANDIDATE_BANK_SCHEMA_VERSION,
         "candidate_id": candidate_id,
+        "started_at": started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        # Retained for schema-1 readers that used created_at as the request start.
         "created_at": started_at,
         "duration_ms": duration_ms,
         "task_id": task.task_id,
@@ -168,7 +171,12 @@ def load_entry(
         "generation",
         "accounting_policy",
     }
-    if not isinstance(record, dict) or set(record) != required:
+    optional = {"started_at", "finished_at"}
+    if (
+        not isinstance(record, dict)
+        or not required.issubset(record)
+        or not set(record).issubset(required | optional)
+    ):
         raise CandidateBankError("Malformed or unsupported candidate-bank record")
     if record["schema_version"] != CANDIDATE_BANK_SCHEMA_VERSION:
         raise CandidateBankError("Unsupported candidate-bank schema version")

@@ -120,6 +120,9 @@ def generate_candidate(
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "transport_attempts": getattr(exc, "transport_attempts", None),
+                "transport_attempt_log": list(
+                    getattr(exc, "transport_attempt_log", ())
+                ),
                 "unknown_cost_attempts": getattr(exc, "unknown_cost_attempts", None),
                 "audit_result": (
                     audit_result.audit_dict() if audit_result is not None else None
@@ -272,6 +275,7 @@ def _initial_state(manifest_path: Path, manifest: dict[str, Any]) -> dict[str, A
         "rows": {
             row["row_id"]: {
                 "status": "pending",
+                "pending_since": _utc_now(),
                 "task_id": row["task_id"],
                 "treatment_id": row["treatment_id"],
                 "candidate_id": row["candidate_id"],
@@ -403,6 +407,7 @@ def run_manifest(manifest_path: Path, *, only_row: str | None = None) -> dict[st
                 "--confirm-paid-calls",
                 PAID_CONFIRMATION,
             ]
+            invocation_started_at = _utc_now()
             started = time.monotonic()
             try:
                 process = subprocess.Popen(
@@ -419,8 +424,10 @@ def run_manifest(manifest_path: Path, *, only_row: str | None = None) -> dict[st
                 )
                 invocation = {
                     "invocation": invocation_number,
+                    "started_at": invocation_started_at,
                     "finished_at": _utc_now(),
                     "duration_ms": duration_ms,
+                    "process_launch_duration_ms": duration_ms,
                     "exit_code": None,
                     "pipeline_status": "infrastructure_error",
                     "run_id": None,
@@ -448,13 +455,15 @@ def run_manifest(manifest_path: Path, *, only_row: str | None = None) -> dict[st
                 row_state["status"] = "infrastructure_error"
                 _write_json_atomic(state_path, state)
                 break
+            process_launched = time.monotonic()
             row_state.update(
                 {
                     "status": "running",
                     "child_pid": process.pid,
-                    "started_at": _utc_now(),
+                    "last_started_at": _utc_now(),
                 }
             )
+            row_state.setdefault("first_started_at", row_state["last_started_at"])
             state["updated_at"] = _utc_now()
             _write_json_atomic(state_path, state)
             _append_event(
@@ -467,7 +476,9 @@ def run_manifest(manifest_path: Path, *, only_row: str | None = None) -> dict[st
                 },
             )
             stdout, stderr = process.communicate()
-            duration_ms = round((time.monotonic() - started) * 1000)
+            process_finished = time.monotonic()
+            child_process_duration_ms = round((process_finished - started) * 1000)
+            scheduler_postprocess_started = time.monotonic()
             stdout_path.write_text(stdout, encoding="utf-8")
             stderr_path.write_text(stderr, encoding="utf-8")
             result = _public_result(stdout)
@@ -481,10 +492,23 @@ def run_manifest(manifest_path: Path, *, only_row: str | None = None) -> dict[st
             )
             observed_cost += cost
             observed_treatment_cost += cost
+            scheduler_postprocess_duration_ms = round(
+                (time.monotonic() - scheduler_postprocess_started) * 1000
+            )
+            duration_ms = round((time.monotonic() - started) * 1000)
             invocation = {
                 "invocation": invocation_number,
+                "started_at": invocation_started_at,
                 "finished_at": _utc_now(),
                 "duration_ms": duration_ms,
+                "process_launch_duration_ms": round(
+                    (process_launched - started) * 1000
+                ),
+                "child_process_duration_ms": child_process_duration_ms,
+                "process_execution_duration_ms": round(
+                    (process_finished - process_launched) * 1000
+                ),
+                "scheduler_postprocess_duration_ms": scheduler_postprocess_duration_ms,
                 "exit_code": process.returncode,
                 "pipeline_status": status,
                 "run_id": (result or {}).get("run_id"),

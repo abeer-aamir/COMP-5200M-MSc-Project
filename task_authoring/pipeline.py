@@ -131,6 +131,8 @@ class TaskAuthoringPipeline:
             "reasoning_tokens": 0,
             "cached_tokens": 0,
             "latency_ms": 0,
+            "transport_attempt_duration_ms": 0,
+            "transport_retry_sleep_duration_ms": 0,
             "cost_usd": Decimal("0"),
         }
 
@@ -142,6 +144,14 @@ class TaskAuthoringPipeline:
             total["reasoning_tokens"] += result.reasoning_tokens
             total["cached_tokens"] += result.cached_tokens
             total["latency_ms"] += result.latency_ms
+            total["transport_attempt_duration_ms"] += sum(
+                int(attempt.get("duration_ms", 0) or 0)
+                for attempt in result.transport_attempt_log
+            )
+            total["transport_retry_sleep_duration_ms"] += sum(
+                int(attempt.get("retry_sleep_duration_ms", 0) or 0)
+                for attempt in result.transport_attempt_log
+            )
             total["cost_usd"] += result.cost_usd
 
     @staticmethod
@@ -154,6 +164,12 @@ class TaskAuthoringPipeline:
             "reasoning_tokens": total["reasoning_tokens"],
             "cached_tokens": total["cached_tokens"],
             "latency_ms": total["latency_ms"],
+            "transport_attempt_duration_ms": total[
+                "transport_attempt_duration_ms"
+            ],
+            "transport_retry_sleep_duration_ms": total[
+                "transport_retry_sleep_duration_ms"
+            ],
             "cost_usd": str(total["cost_usd"]),
         }
 
@@ -176,6 +192,8 @@ class TaskAuthoringPipeline:
         round_number: int,
         user_data: dict[str, Any],
     ) -> ChatResult:
+        call_started = time.monotonic()
+        call_started_at = datetime.now(timezone.utc).isoformat()
         role = self.config.roles[role_name]
         system_prompt = role.prompt_path.read_text(encoding="utf-8")
         user_prompt = json.dumps(user_data, ensure_ascii=False, indent=2)
@@ -226,6 +244,9 @@ class TaskAuthoringPipeline:
                     "cost_usd": str(audit_result.cost_usd),
                     "latency_ms": audit_result.latency_ms,
                     "retries": audit_result.retries,
+                    "transport_attempt_log": list(
+                        audit_result.transport_attempt_log
+                    ),
                     "invalid_response_path": str(invalid_path),
                     "invalid_response_sha256": _sha256_text(invalid_text),
                 }
@@ -237,6 +258,11 @@ class TaskAuthoringPipeline:
                     "round": round_number,
                     "role": role_name,
                     "status": "failed",
+                    "started_at": call_started_at,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "wall_duration_ms": round(
+                        (time.monotonic() - call_started) * 1000
+                    ),
                     "requested_model": role.model,
                     "prompt_sha256": prompt_hash,
                     "reservation_usd": (
@@ -246,6 +272,9 @@ class TaskAuthoringPipeline:
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:1000],
                     "cost_unknown": self.client.billable and audit_result is None,
+                    "transport_attempt_log": list(
+                        getattr(exc, "transport_attempt_log", ())
+                    ),
                     **failure_usage,
                 }
             )
@@ -259,6 +288,11 @@ class TaskAuthoringPipeline:
                 "round": round_number,
                 "role": role_name,
                 "status": "completed",
+                "started_at": call_started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "wall_duration_ms": round(
+                    (time.monotonic() - call_started) * 1000
+                ),
                 "billable": result.billable,
                 "requested_model": result.requested_model,
                 "response_model": result.response_model,
@@ -275,6 +309,7 @@ class TaskAuthoringPipeline:
                 "spent_so_far_usd": str(self.ledger.spent_usd),
                 "latency_ms": result.latency_ms,
                 "retries": result.retries,
+                "transport_attempt_log": list(result.transport_attempt_log),
                 "parse_mode": result.parse_mode,
             }
         )
@@ -310,6 +345,7 @@ class TaskAuthoringPipeline:
 
     def _generate_task(self, task_index: int, brief: str) -> dict[str, Any]:
         task_started = time.monotonic()
+        task_started_at = datetime.now(timezone.utc).isoformat()
         task_id = f"pilot-{task_index:03d}"
         task_dir = self.private_dir / task_id
         spec_revision_context: dict[str, Any] | None = None
@@ -406,6 +442,8 @@ class TaskAuthoringPipeline:
                 return {
                     "task_id": task_id,
                     "status": "accepted",
+                    "started_at": task_started_at,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
                     "round": round_number,
                     "public_path": str(public_path),
                     "hardness_score": critic["hardness_score"],
@@ -431,6 +469,8 @@ class TaskAuthoringPipeline:
         return {
             "task_id": task_id,
             "status": "rejected",
+            "started_at": task_started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
             "round": self.config.max_revision_rounds,
             "errors": last_errors,
             "duration_ms": round((time.monotonic() - task_started) * 1000),
@@ -439,9 +479,15 @@ class TaskAuthoringPipeline:
     def run(self, brief: str) -> dict[str, Any]:
         started = time.monotonic()
         started_at = datetime.now(timezone.utc).isoformat()
+        stage_timings_ms: dict[str, int] = {}
         self.private_dir.mkdir(parents=True, exist_ok=True)
+        source_started = time.monotonic()
         source_state = _source_state(self.config)
         _write_json(self.private_dir / "source_state.json", source_state)
+        stage_timings_ms["source_snapshot"] = round(
+            (time.monotonic() - source_started) * 1000
+        )
+        provenance_started = time.monotonic()
         provenance = self._provenance(brief)
         provenance["source_state"] = {
             "artifact": "source_state.json",
@@ -449,15 +495,23 @@ class TaskAuthoringPipeline:
             "aggregate_sha256": source_state["aggregate_sha256"],
         }
         _write_json(self.private_dir / "provenance.json", provenance)
+        stage_timings_ms["provenance"] = round(
+            (time.monotonic() - provenance_started) * 1000
+        )
         task_results: list[dict[str, Any]] = []
         status = "completed"
         fatal_error: dict[str, str] | None = None
+        task_generation_started = time.monotonic()
         try:
             for task_index in range(1, self.config.task_count + 1):
                 task_results.append(self._generate_task(task_index, brief))
         except Exception as exc:
             status = "failed"
             fatal_error = {"type": type(exc).__name__, "message": str(exc)}
+        finally:
+            stage_timings_ms["task_generation"] = round(
+                (time.monotonic() - task_generation_started) * 1000
+            )
         summary = {
             "run_id": self.run_id,
             "status": status,
@@ -465,6 +519,7 @@ class TaskAuthoringPipeline:
             "started_at": started_at,
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "duration_ms": round((time.monotonic() - started) * 1000),
+            "stage_timings_ms": stage_timings_ms,
             "budget_cap_usd": (
                 None if self.ledger.cap_usd is None else str(self.ledger.cap_usd)
             ),
@@ -482,6 +537,7 @@ class TaskAuthoringPipeline:
             "tasks": task_results,
             "fatal_error": fatal_error,
         }
+        integrity_started = time.monotonic()
         try:
             integrity = _artifact_integrity(self.run_dir)
             _write_json(self.private_dir / "artifact_integrity.json", integrity)
@@ -492,6 +548,12 @@ class TaskAuthoringPipeline:
             }
         except Exception as exc:
             summary["artifact_integrity_error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            summary["finalization_timings_ms"] = {
+                "artifact_integrity": round(
+                    (time.monotonic() - integrity_started) * 1000
+                )
+            }
         _write_json(self.private_dir / "summary.json", summary)
         if fatal_error:
             raise PipelineError(

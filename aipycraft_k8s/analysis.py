@@ -561,6 +561,12 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         "cached_tokens": int(usage.get("cached_tokens") or 0),
         "total_tokens": int(usage.get("total_tokens") or 0),
         "model_latency_ms": int(usage.get("latency_ms") or 0),
+        "transport_attempt_duration_ms": int(
+            usage.get("transport_attempt_duration_ms") or 0
+        ),
+        "transport_retry_sleep_duration_ms": int(
+            usage.get("transport_retry_sleep_duration_ms") or 0
+        ),
         "response_characters": int(usage.get("response_characters") or 0),
         "response_utf8_bytes": int(usage.get("response_utf8_bytes") or 0),
         "response_lines": int(usage.get("response_lines") or 0),

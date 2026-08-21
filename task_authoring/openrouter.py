@@ -6,6 +6,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
@@ -15,7 +16,14 @@ from .schemas import provider_compatible_schema
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        transport_attempt_log: tuple[dict[str, Any], ...] = (),
+    ):
+        super().__init__(message)
+        self.transport_attempt_log = transport_attempt_log
 
 
 class BudgetError(RuntimeError):
@@ -39,6 +47,7 @@ class ChatResult:
     retries: int
     billable: bool
     parse_mode: str = "direct-json"
+    transport_attempt_log: tuple[dict[str, Any], ...] = ()
 
 
 class StructuredResponseError(ProviderError):
@@ -50,7 +59,10 @@ class StructuredResponseError(ProviderError):
         audit_result: ChatResult,
         raw_content: str,
     ):
-        super().__init__(message)
+        super().__init__(
+            message,
+            transport_attempt_log=audit_result.transport_attempt_log,
+        )
         self.audit_result = audit_result
         self.raw_content = raw_content
 
@@ -212,7 +224,7 @@ class OpenRouterClient:
 
     def _request_json(
         self, method: str, path: str, payload: dict[str, Any] | None = None
-    ) -> tuple[dict[str, Any], int, int]:
+    ) -> tuple[dict[str, Any], int, int, tuple[dict[str, Any], ...]]:
         url = f"{self.api_base}/{path.lstrip('/')}"
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
@@ -228,28 +240,87 @@ class OpenRouterClient:
         )
         started = time.monotonic()
         last_error: Exception | None = None
+        attempt_log: list[dict[str, Any]] = []
         for attempt in range(self.max_retries + 1):
+            attempt_started = time.monotonic()
+            attempt_record: dict[str, Any] = {
+                "attempt": attempt + 1,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "method": method.upper(),
+                "path": path,
+            }
+            retryable = True
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                     decoded = response.read().decode("utf-8")
                 latency_ms = int((time.monotonic() - started) * 1000)
-                return json.loads(decoded), latency_ms, attempt
+                value = json.loads(decoded)
+                attempt_record.update(
+                    {
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                        "duration_ms": round(
+                            (time.monotonic() - attempt_started) * 1000
+                        ),
+                        "outcome": "completed",
+                        "http_status": getattr(response, "status", None),
+                        "retry_scheduled": False,
+                        "retry_delay_ms": 0,
+                    }
+                )
+                attempt_log.append(attempt_record)
+                return value, latency_ms, attempt, tuple(attempt_log)
             except urllib.error.HTTPError as exc:
                 error_body = exc.read().decode("utf-8", errors="replace")
                 last_error = ProviderError(f"OpenRouter HTTP {exc.code}: {error_body[:800]}")
                 if exc.code not in {408, 409, 429, 500, 502, 503, 504}:
-                    break
+                    retryable = False
+                attempt_record.update(
+                    {
+                        "outcome": "http_error",
+                        "http_status": exc.code,
+                        "error_type": type(last_error).__name__,
+                    }
+                )
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 last_error = exc
-            if attempt < self.max_retries:
-                time.sleep(min(2**attempt, 4))
+                attempt_record.update(
+                    {
+                        "outcome": (
+                            "response_parse_error"
+                            if isinstance(exc, json.JSONDecodeError)
+                            else "transport_error"
+                        ),
+                        "error_type": type(exc).__name__,
+                    }
+                )
+            retry_scheduled = attempt < self.max_retries and retryable
+            retry_delay = min(2**attempt, 4) if retry_scheduled else 0
+            attempt_record.update(
+                {
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "duration_ms": round(
+                        (time.monotonic() - attempt_started) * 1000
+                    ),
+                    "retry_scheduled": retry_scheduled,
+                    "retry_delay_ms": retry_delay * 1000,
+                }
+            )
+            attempt_log.append(attempt_record)
+            if retry_scheduled:
+                retry_sleep_started = time.monotonic()
+                time.sleep(retry_delay)
+                attempt_record["retry_sleep_duration_ms"] = round(
+                    (time.monotonic() - retry_sleep_started) * 1000
+                )
+            else:
+                break
         raise ProviderError(
-            f"OpenRouter request failed after {self.max_retries + 1} attempts: {last_error}"
+            f"OpenRouter request failed after {len(attempt_log)} attempts: {last_error}",
+            transport_attempt_log=tuple(attempt_log),
         ) from last_error
 
     def get_key_status(self) -> dict[str, Any]:
-        data, _, _ = self._request_json("GET", "/key")
-        return data
+        return self._request_json("GET", "/key")[0]
 
     def complete(
         self,
@@ -293,25 +364,33 @@ class OpenRouterClient:
             }
         if role.ignored_providers:
             payload["provider"]["ignore"] = list(role.ignored_providers)
-        response, latency_ms, retries = self._request_json(
-            "POST", "/chat/completions", payload
-        )
+        request_result = self._request_json("POST", "/chat/completions", payload)
+        response, latency_ms, retries = request_result[:3]
+        transport_attempt_log = request_result[3] if len(request_result) > 3 else ()
         if response.get("error"):
-            raise ProviderError(f"OpenRouter error response: {response['error']}")
+            raise ProviderError(
+                f"OpenRouter error response: {response['error']}",
+                transport_attempt_log=transport_attempt_log,
+            )
         choices = response.get("choices") or []
         if not choices:
-            raise ProviderError("OpenRouter response contained no choices")
+            raise ProviderError(
+                "OpenRouter response contained no choices",
+                transport_attempt_log=transport_attempt_log,
+            )
         choice = choices[0]
         raw_content = choice.get("message", {}).get("content")
         response_model = str(response.get("model", ""))
         if response_model != role.model:
             raise ProviderError(
-                f"Model substitution refused: requested {role.model}, got {response_model}"
+                f"Model substitution refused: requested {role.model}, got {response_model}",
+                transport_attempt_log=transport_attempt_log,
             )
         usage = response.get("usage") or {}
         if usage.get("cost") is None:
             raise ProviderError(
-                "OpenRouter omitted usage.cost; stopping because spend cannot be audited"
+                "OpenRouter omitted usage.cost; stopping because spend cannot be audited",
+                transport_attempt_log=transport_attempt_log,
             )
         details = usage.get("completion_tokens_details") or {}
         prompt_details = usage.get("prompt_tokens_details") or {}
@@ -335,6 +414,7 @@ class OpenRouterClient:
             latency_ms=latency_ms,
             retries=retries,
             billable=True,
+            transport_attempt_log=transport_attempt_log,
         )
         try:
             content, parse_mode = _parse_structured_object(raw_content)
