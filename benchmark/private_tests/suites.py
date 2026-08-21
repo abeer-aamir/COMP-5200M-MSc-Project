@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +35,7 @@ EXPECTED_REQUIREMENTS = {
     "pilot-001": {f"R{number:02d}" for number in range(1, 15)},
     "pilot-002": {f"R{number:02d}" for number in range(1, 15)},
     "pilot-003": {f"R{number:02d}" for number in range(1, 12)},
+    "pilot-004": {f"R{number:02d}" for number in range(1, 14)},
 }
 
 _FRESH_CLUSTER_NAMESPACES = {
@@ -67,6 +69,44 @@ _DEFAULT_NAMESPACE_EMPTY_KINDS = {
     "secrets",
     "statefulsets",
 }
+
+
+def _network_policy_rule_has_exact_ports(
+    rule: dict[str, Any], expected: set[tuple[str, str]]
+) -> bool:
+    """Compare the effective port allowance without prescribing peer syntax."""
+
+    ports = rule.get("ports", [])
+    if not isinstance(ports, list) or len(ports) != len(expected):
+        return False
+    actual: set[tuple[str, str]] = set()
+    for item in ports:
+        if (
+            not isinstance(item, dict)
+            or "port" not in item
+            or item.get("endPort") is not None
+        ):
+            return False
+        actual.add(
+            (item.get("protocol", "TCP"), int_or_string(item.get("port")))
+        )
+    return actual == expected
+
+
+def _has_bounded_retry_and_nonzero_failure(
+    command: str, *, maximum_attempts: int
+) -> bool:
+    """Recognize common finite BusyBox-shell retry forms without fixing one syntax."""
+
+    limits: list[int] = []
+    for pattern in (
+        r"\bseq\s+(?:1\s+)?([0-9]+)\b",
+        r"-(?:lt|ge)\s+([0-9]+)\b",
+    ):
+        limits.extend(int(value) for value in re.findall(pattern, command))
+    bounded = any(1 <= value <= maximum_attempts for value in limits)
+    nonzero_failure = bool(re.search(r"\bexit\s+[1-9][0-9]*\b", command))
+    return bounded and nonzero_failure
 
 
 def _main_container(workload: dict[str, Any]) -> dict[str, Any]:
@@ -1147,6 +1187,362 @@ def _task3_checks(
     ]
 
 
+def _task4_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def named_main(workload_name: str, container_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        workload = kube.get("deployment", workload_name)
+        containers = pod_spec(workload).get("containers", [])
+        require(len(containers) == 1, f"{workload_name} must have exactly one main container")
+        require(containers[0].get("name") == container_name, f"{workload_name} container must be named {container_name}")
+        return workload, containers[0]
+
+    def assert_configmap_mount(
+        deployment: dict[str, Any], container: dict[str, Any], name: str, path: str
+    ) -> None:
+        mount = find_mount(container, path)
+        require(mount is not None, f"{name} is not mounted at {path}")
+        require(mount.get("readOnly") is True, f"{path} mount must be read-only")
+        volume = find_volume(pod_spec(deployment), mount.get("name", ""))
+        require(volume is not None, f"volume {mount.get('name')!r} does not exist")
+        require(volume.get("configMap", {}).get("name") == name, f"{path} is not backed by {name}")
+
+    def assert_http_probes(container: dict[str, Any], path: str, port: int) -> None:
+        named_ports = {
+            item.get("name"): item.get("containerPort")
+            for item in container.get("ports", [])
+            if item.get("name")
+        }
+        probes: dict[str, dict[str, Any]] = {}
+        for name in ("startupProbe", "readinessProbe", "livenessProbe"):
+            probe = container.get(name, {})
+            http_get = probe.get("httpGet", {})
+            require(http_get.get("path") == path, f"{name} path must be {path}")
+            actual_port = named_ports.get(http_get.get("port"), http_get.get("port"))
+            require(int_or_string(actual_port) == str(port), f"{name} must target port {port}")
+            probes[name] = probe
+        require(_startup_probe_window_seconds(probes["startupProbe"]) >= 30, "startup probe allows less than 30 seconds")
+        for name in ("readinessProbe", "livenessProbe"):
+            require(probes[name].get("periodSeconds", 10) <= 10, f"{name} runs less often than every 10 seconds")
+
+    def policy(name: str) -> dict[str, Any]:
+        return kube.get("networkpolicy", name)
+
+    def selector_labels(item: dict[str, Any]) -> dict[str, str]:
+        return item.get("spec", {}).get("podSelector", {}).get("matchLabels", {})
+
+    def has_role_expression(item: dict[str, Any], values: set[str]) -> bool:
+        selector = item.get("spec", {}).get("podSelector", {})
+        expressions = selector.get("matchExpressions", [])
+        return (
+            not selector.get("matchLabels")
+            and len(expressions) == 1
+            and expressions[0].get("key") == "role"
+            and expressions[0].get("operator") == "In"
+            and set(expressions[0].get("values", [])) == values
+        )
+
+    def r02() -> str:
+        deployments = {item.get("metadata", {}).get("name") for item in kube.list("deployments")}
+        services = {item.get("metadata", {}).get("name") for item in kube.list("services")}
+        require(deployments == {"backend", "gateway"}, f"unexpected Deployments: {sorted(deployments)}")
+        require(services == {"backend-svc", "gateway-svc"}, f"unexpected Services: {sorted(services)}")
+        for name, init_count in (("backend", 0), ("gateway", 1)):
+            deployment = kube.get("deployment", name)
+            require(len(pod_spec(deployment).get("containers", [])) == 1, f"{name} must have one main container")
+            require(len(pod_spec(deployment).get("initContainers", [])) == init_count, f"{name} init-container count differs")
+        replica_sets = kube.list("replicasets")
+        owned_sets = {
+            item.get("metadata", {}).get("name")
+            for item in replica_sets
+            if any(owner.get("kind") == "Deployment" and owner.get("name") in deployments for owner in item.get("metadata", {}).get("ownerReferences", []))
+        }
+        require(len(owned_sets) == len(replica_sets), "a ReplicaSet is not owned by backend or gateway")
+        for pod in kube.list("pods"):
+            owners = pod.get("metadata", {}).get("ownerReferences", [])
+            require(any(owner.get("kind") == "ReplicaSet" and owner.get("name") in owned_sets for owner in owners), f"pod {pod.get('metadata', {}).get('name')} is not owned by an application Deployment")
+        forbidden = {
+            "StatefulSets": kube.list("statefulsets"),
+            "DaemonSets": kube.list("daemonsets"),
+            "ReplicationControllers": kube.list("replicationcontrollers"),
+            "persistent volume claims": kube.list("persistentvolumeclaims"),
+            "Jobs": kube.list("jobs"),
+            "CronJobs": kube.list("cronjobs"),
+        }
+        present = [label for label, items in forbidden.items() if items]
+        require(not present, f"forbidden workload/storage resources exist: {present}")
+        require(all(item.get("spec", {}).get("clusterIP") != "None" for item in kube.list("services")), "headless Services are forbidden")
+        return "exactly the backend and gateway Deployments and Services exist"
+
+    def r03() -> str:
+        config = kube.get("configmap", "backend-content")
+        require(config.get("data") == {"ready": "ready\n", "value": "42\n"}, f"backend-content data differs: {config.get('data')}")
+        deployment, container = named_main("backend", "backend")
+        assert_configmap_mount(deployment, container, "backend-content", "/srv")
+        return "exact backend content is mounted read-only at /srv"
+
+    def r04() -> str:
+        config = kube.get("configmap", "gateway-content")
+        require(config.get("data") == {"index.html": "Gateway online\n", "health": "ok\n"}, f"gateway-content data differs: {config.get('data')}")
+        deployment, container = named_main("gateway", "gateway")
+        assert_configmap_mount(deployment, container, "gateway-content", "/www")
+        secret = kube.get("secret", "gateway-secret")
+        secret_data = secret.get("data", {})
+        require(set(secret_data) == {"BACKEND_TOKEN"}, f"gateway-secret keys differ: {sorted(secret_data)}")
+        require(_decode_secret_value(secret_data.get("BACKEND_TOKEN", ""), "BACKEND_TOKEN") == "pilot-token", "BACKEND_TOKEN placeholder differs")
+        token_env = [item for item in container.get("env", []) or [] if item.get("name") == "BACKEND_TOKEN"]
+        require(len(token_env) == 1, "gateway main container must define BACKEND_TOKEN exactly once")
+        token_ref = token_env[0].get("valueFrom", {}).get("secretKeyRef", {})
+        require(token_ref.get("name") == "gateway-secret" and token_ref.get("key") == "BACKEND_TOKEN", "BACKEND_TOKEN does not reference gateway-secret/BACKEND_TOKEN")
+        require(not container.get("envFrom"), "gateway main container must not expose gateway-secret through envFrom")
+        init_containers = pod_spec(deployment).get("initContainers", [])
+        _assert_secret_not_in_environment({"containers": init_containers}, "gateway-secret")
+        _assert_no_secret_volume(pod_spec(deployment), "gateway-secret")
+        return "gateway content and environment-only Secret are wired exactly"
+
+    def r05() -> str:
+        deployment, container = named_main("backend", "backend")
+        require(deployment.get("spec", {}).get("replicas") == 1, "backend must have one replica")
+        require(pod_labels(deployment).get("app") == "backend", "backend app label is missing")
+        _assert_pod_label_and_service_account(deployment, "backend", "backend-sa")
+        require(container.get("image") == "busybox:1.36.1", "backend image differs")
+        require([item.get("containerPort") for item in container.get("ports", [])] == [8081], "backend must expose only container port 8081")
+        text = command_text(container)
+        for value in ("httpd", "-f", "8081", "/srv"):
+            require(value in text, f"backend command does not reference {value}")
+        assert_http_probes(container, "/ready", 8081)
+        service = kube.get("service", "backend-svc")
+        require(service.get("spec", {}).get("type", "ClusterIP") == "ClusterIP", "backend-svc is not ClusterIP")
+        require(service.get("spec", {}).get("selector", {}).get("app") == "backend", "backend-svc selector differs")
+        require(len(service.get("spec", {}).get("ports", [])) == 1, "backend-svc must expose exactly one port")
+        port = _service_port(service, 8081)
+        require(port.get("protocol", "TCP") == "TCP" and _resolved_target_port(port, deployment) == "8081", "backend-svc port mapping differs")
+        kube.rollout("deployment", "backend", timeout_seconds=120)
+        return "backend identity, probes, command, and Service mapping are correct"
+
+    def r06() -> str:
+        deployment, container = named_main("gateway", "gateway")
+        require(deployment.get("spec", {}).get("replicas") == 2, "gateway must have two replicas")
+        require(pod_labels(deployment).get("app") == "gateway", "gateway app label is missing")
+        _assert_pod_label_and_service_account(deployment, "gateway", "gateway-sa")
+        require(container.get("image") == "busybox:1.36.1", "gateway image differs")
+        require([item.get("containerPort") for item in container.get("ports", [])] == [8080], "gateway must expose only container port 8080")
+        text = command_text(container)
+        for value in ("httpd", "-f", "8080", "/www"):
+            require(value in text, f"gateway command does not reference {value}")
+        assert_http_probes(container, "/health", 8080)
+        strategy = deployment.get("spec", {}).get("strategy", {})
+        require(strategy.get("type", "RollingUpdate") == "RollingUpdate", "gateway must use RollingUpdate")
+        rolling = strategy.get("rollingUpdate", {})
+        require(int_or_string(rolling.get("maxUnavailable")) == "0", "gateway maxUnavailable must be 0")
+        require(int_or_string(rolling.get("maxSurge")) == "1", "gateway maxSurge must be 1")
+        service = kube.get("service", "gateway-svc")
+        require(service.get("spec", {}).get("type", "ClusterIP") == "ClusterIP", "gateway-svc is not ClusterIP")
+        require(service.get("spec", {}).get("selector", {}).get("app") == "gateway", "gateway-svc selector differs")
+        require(len(service.get("spec", {}).get("ports", [])) == 1, "gateway-svc must expose exactly one port")
+        port = _service_port(service, 80)
+        require(port.get("protocol", "TCP") == "TCP" and _resolved_target_port(port, deployment) == "8080", "gateway-svc port mapping differs")
+        kube.rollout("deployment", "gateway", timeout_seconds=120)
+        return "gateway identity, probes, rollout, command, and Service mapping are correct"
+
+    def r07() -> str:
+        deployment = kube.get("deployment", "gateway")
+        init_containers = pod_spec(deployment).get("initContainers", [])
+        require(len(init_containers) == 1, "gateway must have exactly one init container")
+        init = init_containers[0]
+        require(init.get("name") == "wait-backend", "init container must be wait-backend")
+        require(init.get("image") == "busybox:1.36.1", "wait-backend image differs")
+        text = command_text(init)
+        for value in ("http://backend-svc:8081/ready", "ready", "sleep"):
+            require(value in text, f"wait-backend command does not reference {value}")
+        lowered = text.lower()
+        require("|| true" not in lowered and "while true" not in lowered and "while :" not in lowered, "wait-backend suppresses failure or loops forever")
+        require(
+            _has_bounded_retry_and_nonzero_failure(
+                lowered, maximum_attempts=30
+            ),
+            "wait-backend does not expose a recognizable at-most-30-attempt bound and non-zero terminal failure",
+        )
+        gateway_pods = kube.list("pods", "app=gateway")
+        require(len(gateway_pods) == 2, f"expected two gateway pods, got {len(gateway_pods)}")
+        for pod in gateway_pods:
+            statuses = pod.get("status", {}).get("initContainerStatuses", [])
+            require(len(statuses) == 1, "gateway pod init status count differs")
+            terminated = statuses[0].get("state", {}).get("terminated", {})
+            require(terminated.get("exitCode") == 0, f"wait-backend did not terminate successfully: {terminated}")
+        return "bounded wait-backend dependency gate completed successfully"
+
+    def r08() -> str:
+        accounts = {item.get("metadata", {}).get("name") for item in kube.list("serviceaccounts")}
+        require({"backend-sa", "gateway-sa"} <= accounts, "required ServiceAccounts are missing")
+        for workload_name, account in (("backend", "backend-sa"), ("gateway", "gateway-sa")):
+            spec = pod_spec(kube.get("deployment", workload_name))
+            require(spec.get("serviceAccountName") == account, f"{workload_name} ServiceAccount differs")
+            require(spec.get("automountServiceAccountToken") is False, f"{workload_name} must disable token automount")
+        require(not kube.list("roles") and not kube.list("rolebindings"), "no Roles or RoleBindings are allowed")
+        return "separate ServiceAccounts are used without token mounting or namespaced RBAC"
+
+    def r09() -> str:
+        for workload_name in ("backend", "gateway"):
+            deployment = kube.get("deployment", workload_name)
+            assert_hardened(deployment, workload_name)
+            for container in all_containers(pod_spec(deployment)):
+                require(container.get("securityContext", {}).get("allowPrivilegeEscalation") is False, f"{workload_name} container permits privilege escalation")
+        return "all main and init containers use the required hardening"
+
+    def r10() -> str:
+        names = {item.get("metadata", {}).get("name") for item in kube.list("networkpolicies")}
+        expected = {"default-deny-apps", "allow-gateway-backend", "allow-gateway-egress", "allow-evaluator-ingress"}
+        require(names == expected, f"NetworkPolicy names differ: {sorted(names)}")
+        deny = policy("default-deny-apps")
+        require(has_role_expression(deny, {"backend", "gateway"}), "default-deny-apps does not select both roles")
+        require(set(deny.get("spec", {}).get("policyTypes", [])) == {"Ingress", "Egress"}, "default-deny-apps policyTypes differ")
+        require(deny.get("spec", {}).get("ingress", []) == [] and deny.get("spec", {}).get("egress", []) == [], "default-deny-apps is not a complete default deny")
+        return "exactly four policies exist and default-deny selects both applications"
+
+    def r11() -> str:
+        ingress = policy("allow-gateway-backend")
+        require(
+            selector_labels(ingress) == {"role": "backend"},
+            "allow-gateway-backend target differs",
+        )
+        ingress_rules = ingress.get("spec", {}).get("ingress", [])
+        require(
+            len(ingress_rules) == 1
+            and _network_policy_rule_has_exact_ports(
+                ingress_rules[0], {("TCP", "8081")}
+            ),
+            "allow-gateway-backend ports differ",
+        )
+        peers = ingress_rules[0].get("from", [])
+        require(
+            len(peers) == 1
+            and peers[0].get("podSelector", {}).get("matchLabels")
+            == {"role": "gateway"}
+            and set(peers[0]) == {"podSelector"},
+            "allow-gateway-backend source differs",
+        )
+
+        egress = policy("allow-gateway-egress")
+        require(
+            selector_labels(egress) == {"role": "gateway"},
+            "allow-gateway-egress target differs",
+        )
+        rules = egress.get("spec", {}).get("egress", [])
+        backend_rules = [
+            rule
+            for rule in rules
+            if _network_policy_rule_has_exact_ports(rule, {("TCP", "8081")})
+            and len(rule.get("to", [])) == 1
+            and rule.get("to", [])[0]
+            .get("podSelector", {})
+            .get("matchLabels")
+            == {"role": "backend"}
+            and set(rule.get("to", [])[0]) == {"podSelector"}
+        ]
+        dns_rules = [
+            rule
+            for rule in rules
+            if _network_policy_rule_has_exact_ports(
+                rule, {("UDP", "53"), ("TCP", "53")}
+            )
+        ]
+        require(
+            len(rules) == 2 and len(backend_rules) == 1,
+            "gateway backend egress rule differs",
+        )
+        backend_peers = backend_rules[0].get("to", [])
+        require(
+            len(backend_peers) == 1
+            and backend_peers[0].get("podSelector", {}).get("matchLabels")
+            == {"role": "backend"}
+            and set(backend_peers[0]) == {"podSelector"},
+            "gateway backend egress peer is broader than role=backend in this namespace",
+        )
+        require(len(dns_rules) == 1, "gateway DNS egress rule differs")
+
+        evaluator = policy("allow-evaluator-ingress")
+        require(
+            has_role_expression(evaluator, {"backend", "gateway"}),
+            "allow-evaluator-ingress targets differ",
+        )
+        evaluator_rules = evaluator.get("spec", {}).get("ingress", [])
+        require(
+            len(evaluator_rules) == 1
+            and _network_policy_rule_has_exact_ports(
+                evaluator_rules[0], {("TCP", "8080"), ("TCP", "8081")}
+            ),
+            "evaluator ingress ports differ",
+        )
+        evaluator_peers = evaluator_rules[0].get("from", [])
+        require(
+            len(evaluator_peers) == 1
+            and evaluator_peers[0].get("podSelector", {}).get("matchLabels")
+            == {"access": "probe"}
+            and set(evaluator_peers[0]) == {"podSelector"},
+            "evaluator ingress source differs",
+        )
+        return "gateway/backend, DNS, and evaluator allow rules are narrowly scoped"
+
+    def r12() -> str:
+        gateway_pods = kube.list("pods", "app=gateway")
+        backend_pods = kube.list("pods", "app=backend")
+        require(gateway_pods and backend_pods, "application pods are missing")
+        gateway_name = gateway_pods[0].get("metadata", {}).get("name", "")
+        backend_name = backend_pods[0].get("metadata", {}).get("name", "")
+        try:
+            kube.exec(gateway_name, "test \"$(wget -q -T 5 -O - http://backend-svc:8081/ready)\" = ready", "gateway")
+        except RequirementFailure as exc:
+            raise RequirementFailure(
+                "gateway could not resolve backend-svc and fetch its exact ready response"
+            ) from exc
+        allowed = kube.run_probe_pod(
+            "aipc-eval-authorized",
+            "test \"$(wget -q -T 5 -O - http://backend-svc:8081/value)\" = 42; test \"$(wget -q -T 5 -O - http://gateway-svc:80/)\" = \"Gateway online\"; test \"$(wget -q -T 5 -O - http://gateway-svc:80/health)\" = ok",
+            labels={"access": "probe"},
+        )
+        blocked_ingress = kube.run_probe_pod(
+            "aipc-eval-untrusted",
+            "wget -q -T 4 -O - http://backend-svc:8081/ready",
+            labels={"access": "untrusted"},
+            expect_success=False,
+        )
+        kube.exec(backend_name, "if wget -q -T 4 -O - http://gateway-svc:80/health; then exit 1; else exit 0; fi", "backend")
+        return f"gateway resolved and reached backend-svc; authorized {allowed}; untrusted {blocked_ingress}; backend egress blocked"
+
+    def r13() -> str:
+        pdb = kube.get("poddisruptionbudget", "gateway-pdb")
+        require(pdb.get("spec", {}).get("selector", {}).get("matchLabels", {}).get("role") == "gateway", "gateway-pdb selector differs")
+        require(int_or_string(pdb.get("spec", {}).get("minAvailable")) == "1", "gateway-pdb minAvailable differs")
+        quota = kube.get("resourcequota", "service-chain-quota")
+        hard = quota.get("status", {}).get("hard", quota.get("spec", {}).get("hard", {}))
+        require(hard.get("pods") == "6", f"pod quota must be 6, got {hard.get('pods')}")
+        backend_replicas = int(kube.get("deployment", "backend").get("spec", {}).get("replicas", 1))
+        gateway = kube.get("deployment", "gateway")
+        gateway_replicas = int(gateway.get("spec", {}).get("replicas", 1))
+        surge = int_or_string(gateway.get("spec", {}).get("strategy", {}).get("rollingUpdate", {}).get("maxSurge", 1))
+        require(surge.isdigit(), "gateway maxSurge must be an integer for quota-fit analysis")
+        peak = backend_replicas + gateway_replicas + int(surge) + 1
+        require(peak <= 6, f"rollout plus evaluator probe needs {peak} pods, exceeding quota 6")
+        return f"gateway PDB is minAvailable 1 and computed rollout-plus-probe peak is {peak}/6"
+
+    return [
+        ("R01", "isolated service-chain namespace", lambda: _check_namespace(kube, "service-chain", _require_candidate_path(candidate_path))),
+        ("R02", "exact two-service application topology", r02),
+        ("R03", "exact backend content and mount", r03),
+        ("R04", "exact gateway content and environment-only Secret", r04),
+        ("R05", "backend Deployment, probes, and Service", r05),
+        ("R06", "gateway Deployment, probes, rollout, and Service", r06),
+        ("R07", "bounded backend dependency gate", r07),
+        ("R08", "token-free ServiceAccounts and no RBAC", r08),
+        ("R09", "container security contexts", r09),
+        ("R10", "exact default-deny policy set", r10),
+        ("R11", "narrow application and evaluator allow rules", r11),
+        ("R12", "live service and network isolation behavior", r12),
+        ("R13", "gateway disruption budget and quota fit", r13),
+    ]
+
+
 def _require_candidate_path(candidate_path: Path | None) -> Path:
     if candidate_path is None:
         raise EvaluationInfrastructureError(
@@ -1164,6 +1560,8 @@ def run_suite(
         checks = _task2_checks(kube, candidate_path)
     elif task_id == "pilot-003":
         checks = _task3_checks(kube, candidate_path)
+    elif task_id == "pilot-004":
+        checks = _task4_checks(kube, candidate_path)
     else:
         raise EvaluationError(f"unknown task id {task_id!r}")
     actual_ids = {requirement_id for requirement_id, _, _ in checks}

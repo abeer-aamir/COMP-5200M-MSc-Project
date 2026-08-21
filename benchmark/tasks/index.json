@@ -20,6 +20,12 @@
       "namespace": "status-page",
       "description": "benchmark/tasks/pilot-003/description.txt",
       "post_execution_suite": "pilot-003"
+    },
+    {
+      "task_id": "pilot-004",
+      "namespace": "service-chain",
+      "description": "benchmark/tasks/pilot-004/description.txt",
+      "post_execution_suite": "pilot-004"
     }
   ]
 }

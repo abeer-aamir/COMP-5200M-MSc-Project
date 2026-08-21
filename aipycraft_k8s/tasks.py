@@ -18,6 +18,7 @@ CANONICAL_TASK_NAMESPACES = {
     "pilot-001": "order-system",
     "pilot-002": "pipeline-ns",
     "pilot-003": "status-page",
+    "pilot-004": "service-chain",
 }
 
 

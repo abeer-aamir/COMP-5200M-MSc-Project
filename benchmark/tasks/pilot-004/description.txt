@@ -1,0 +1,103 @@
+Please build a small two-service application in a namespace named
+`service-chain`. Keep every namespaced resource in that namespace, apart from
+the Namespace object itself. It will run on a single-node kind Kubernetes 1.35
+cluster without workload internet access. Use normal built-in Kubernetes
+resources and only the already-loaded `busybox:1.36.1` image.
+
+The application has a backend and a gateway. Create exactly two Deployments,
+named `backend` and `gateway`, and exactly two application Services, named
+`backend-svc` and `gateway-svc`. Do not add StatefulSets, DaemonSets, standalone
+Pods, Jobs, CronJobs, persistent volume claims, headless Services, sidecars, or
+additional application workloads and Services.
+
+Create a ConfigMap called `backend-content` with exactly these entries and keep
+the final newline in each value:
+
+```text
+ready=ready
+value=42
+```
+
+Mount it read-only at `/srv` in the backend so the files are available as
+`/srv/ready` and `/srv/value`. Run a Deployment named `backend` with exactly one
+replica, pod labels `app=backend` and `role=backend`, and ServiceAccount
+`backend-sa`. Its single container must be named `backend`, use
+`busybox:1.36.1`, expose port 8081, and run BusyBox httpd in the foreground on
+port 8081 with `/srv` as the document root. Give it startup, readiness, and
+liveness HTTP probes which all request `/ready` on port 8081. Allow at least 30
+seconds in the startup probe and run readiness and liveness at least once every
+10 seconds.
+
+Expose the backend through a ClusterIP Service named `backend-svc`, selecting
+`app=backend`, with TCP port 8081 targeting container port 8081. A request to
+`/ready` must return `ready`, and `/value` must return `42`.
+
+Create another ConfigMap named `gateway-content` with exactly these entries,
+again preserving each final newline:
+
+```text
+index.html=Gateway online
+health=ok
+```
+
+Mount it read-only at `/www` in the gateway's main container. Create a Secret
+named `gateway-secret` containing the placeholder
+`BACKEND_TOKEN=pilot-token`. Expose that key only to the gateway main container
+as an environment variable named `BACKEND_TOKEN`; do not expose it to the init
+container and do not mount the Secret as a file.
+
+Run a Deployment named `gateway` with exactly two replicas. Its pod template
+must have labels `app=gateway` and `role=gateway` and use ServiceAccount
+`gateway-sa`. Before the main container starts, run exactly one init container
+named `wait-backend` using `busybox:1.36.1`. It must query
+`http://backend-svc:8081/ready` until the exact body is `ready`, sleep between
+attempts, and stop after at most 30 attempts with a non-zero exit if the backend
+never becomes ready. Do not hide the final failure behind `|| true`, an
+unconditional success, or an infinite loop.
+
+The gateway's single main container must be named `gateway`, use
+`busybox:1.36.1`, expose port 8080, and run BusyBox httpd in the foreground on
+port 8080 with `/www` as its document root. Give it startup, readiness, and
+liveness HTTP probes which all request `/health` on port 8080. Allow at least 30
+seconds in the startup probe and run readiness and liveness at least once every
+10 seconds. Use a RollingUpdate strategy with `maxUnavailable: 0` and
+`maxSurge: 1`.
+
+Expose the gateway through a ClusterIP Service named `gateway-svc`, selecting
+`app=gateway`, with TCP port 80 targeting container port 8080. Requests to `/`
+must return `Gateway online`, and `/health` must return `ok`.
+
+Create `backend-sa` and `gateway-sa`. Neither workload needs Kubernetes API
+access, so disable automatic ServiceAccount-token mounting for both pod
+templates and do not create Roles, ClusterRoles, RoleBindings, or
+ClusterRoleBindings for them.
+
+Run the backend, gateway, and init containers as non-root user 1000 with a
+read-only root filesystem. Disallow privilege escalation and drop all Linux
+capabilities from every container.
+
+Add these four NetworkPolicies, with no other NetworkPolicies:
+
+- `default-deny-apps` must select both `role=backend` and `role=gateway` pods
+  and default-deny both ingress and egress.
+- `allow-gateway-backend` must allow TCP ingress to backend pods on container
+  port 8081 from gateway pods only.
+- `allow-gateway-egress` must allow gateway pods to reach backend pods on TCP
+  port 8081 and allow UDP and TCP egress on port 53 for cluster DNS. Do not
+  otherwise open gateway egress.
+- `allow-evaluator-ingress` must allow pods labelled `access=probe` to reach
+  backend port 8081 and gateway port 8080. Pods without that label must not gain
+  application ingress access from this policy.
+
+The resulting policy behavior matters: gateway pods must resolve cluster DNS
+and reach `backend-svc`, a pod labelled `access=probe` must reach both Services,
+an otherwise untrusted pod must not reach the backend, and backend pods must not
+be able to initiate a connection to the gateway.
+
+Add a PodDisruptionBudget named `gateway-pdb` selecting `role=gateway` with
+`minAvailable: 1`. Add a ResourceQuota named `service-chain-quota` which caps
+Pods in the namespace at 6. The normal three application pods, a one-pod gateway
+rolling-update surge, and one temporary evaluator pod must fit within the
+quota.
+
+Return one complete multi-document YAML configuration and no explanation.
