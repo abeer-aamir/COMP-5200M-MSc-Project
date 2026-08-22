@@ -56,6 +56,36 @@
       "namespace": "easy-diagnostics-ns",
       "description": "benchmark/tasks/easy-005/description.txt",
       "post_execution_suite": "easy-005"
+    },
+    {
+      "task_id": "medium-001",
+      "namespace": "medium-portal-ns",
+      "description": "benchmark/tasks/medium-001/description.txt",
+      "post_execution_suite": "medium-001"
+    },
+    {
+      "task_id": "medium-002",
+      "namespace": "medium-batch-ns",
+      "description": "benchmark/tasks/medium-002/description.txt",
+      "post_execution_suite": "medium-002"
+    },
+    {
+      "task_id": "medium-003",
+      "namespace": "medium-stateful-ns",
+      "description": "benchmark/tasks/medium-003/description.txt",
+      "post_execution_suite": "medium-003"
+    },
+    {
+      "task_id": "medium-004",
+      "namespace": "medium-check-ns",
+      "description": "benchmark/tasks/medium-004/description.txt",
+      "post_execution_suite": "medium-004"
+    },
+    {
+      "task_id": "medium-005",
+      "namespace": "medium-ledger-ns",
+      "description": "benchmark/tasks/medium-005/description.txt",
+      "post_execution_suite": "medium-005"
     }
   ]
 }

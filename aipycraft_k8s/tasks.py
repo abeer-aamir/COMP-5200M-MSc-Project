@@ -24,6 +24,11 @@ CANONICAL_TASK_NAMESPACES = {
     "easy-003": "easy-rbac-ns",
     "easy-004": "easy-restart-ns",
     "easy-005": "easy-diagnostics-ns",
+    "medium-001": "medium-portal-ns",
+    "medium-002": "medium-batch-ns",
+    "medium-003": "medium-stateful-ns",
+    "medium-004": "medium-check-ns",
+    "medium-005": "medium-ledger-ns",
 }
 
 

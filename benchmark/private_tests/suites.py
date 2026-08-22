@@ -14,6 +14,7 @@ from .core import (
     EvaluationError,
     EvaluationInfrastructureError,
     Kubectl,
+    KubectlError,
     RequirementFailure,
     ResultCollector,
     all_containers,
@@ -24,6 +25,7 @@ from .core import (
     find_mount,
     find_volume,
     int_or_string,
+    job_terminal_condition,
     pod_labels,
     pod_spec,
     require,
@@ -42,6 +44,11 @@ EXPECTED_REQUIREMENTS = {
     "easy-003": {f"R{number:02d}" for number in range(1, 7)},
     "easy-004": {f"R{number:02d}" for number in range(1, 7)},
     "easy-005": {f"R{number:02d}" for number in range(1, 7)},
+    "medium-001": {f"R{number:02d}" for number in range(1, 11)},
+    "medium-002": {f"R{number:02d}" for number in range(1, 11)},
+    "medium-003": {f"R{number:02d}" for number in range(1, 11)},
+    "medium-004": {f"R{number:02d}" for number in range(1, 10)},
+    "medium-005": {f"R{number:02d}" for number in range(1, 11)},
 }
 
 _FRESH_CLUSTER_NAMESPACES = {
@@ -178,6 +185,11 @@ def _decode_secret_value(encoded: Any, key: str) -> str:
         return base64.b64decode(encoded, validate=True).decode("utf-8")
     except (binascii.Error, TypeError, UnicodeDecodeError, ValueError) as exc:
         raise RequirementFailure(f"Secret key {key} is not valid base64 UTF-8") from exc
+
+
+def _assert_exact_configmap_data(configmap: dict[str, Any], expected: dict[str, str]) -> None:
+    require(configmap.get("data", {}) == expected, "ConfigMap data differs")
+    require(not configmap.get("binaryData"), "ConfigMap contains unexpected binaryData keys")
 
 
 def _container_exposes_secret_key(
@@ -1613,6 +1625,163 @@ def _assert_cronjob(
     require(_combined_command(containers[0]) == expected_command, "CronJob command differs")
 
 
+def _assert_http_readiness(
+    container: dict[str, Any],
+    *,
+    path: str,
+    port: int | str,
+    period: int,
+    failure: int | None = None,
+    initial_delay: int | None = None,
+) -> None:
+    probe = container.get("readinessProbe", {})
+    http_get = probe.get("httpGet", {})
+    require(http_get.get("path") == path, "readiness probe path differs")
+    require(http_get.get("port") == port, "readiness probe port differs")
+    require(probe.get("periodSeconds", 10) == period, "readiness periodSeconds differs")
+    if failure is not None:
+        require(probe.get("failureThreshold", 3) == failure, "readiness failureThreshold differs")
+    if initial_delay is not None:
+        require(probe.get("initialDelaySeconds", 0) == initial_delay, "readiness initialDelaySeconds differs")
+
+
+def _assert_medium_hardening(workload: dict[str, Any], label: str) -> None:
+    spec = pod_spec(workload)
+    pod_security = spec.get("securityContext", {})
+    expected_pod = {
+        "runAsNonRoot": True,
+        "runAsUser": 1000,
+        "runAsGroup": 1000,
+        "fsGroup": 1000,
+    }
+    for field, expected in expected_pod.items():
+        require(pod_security.get(field) == expected, f"{label}: pod securityContext {field} differs")
+    for container in all_containers(spec):
+        security = container.get("securityContext", {})
+        require(security.get("allowPrivilegeEscalation") is False, f"{label}: allowPrivilegeEscalation must be false")
+        require(security.get("readOnlyRootFilesystem") is True, f"{label}: readOnlyRootFilesystem must be true")
+        require(set(security.get("capabilities", {}).get("drop", [])) == {"ALL"}, f"{label}: capabilities.drop must be exactly ALL")
+
+
+def _assert_single_ingress_policy(
+    policy: dict[str, Any], *, app: str, access: str, port: int
+) -> None:
+    spec = policy.get("spec", {})
+    require(spec.get("podSelector", {}).get("matchLabels") == {"app": app}, "NetworkPolicy selector differs")
+    require(set(spec.get("policyTypes", ["Ingress"])) == {"Ingress"}, "policyTypes must contain only Ingress")
+    ingress = spec.get("ingress", [])
+    require(len(ingress) == 1, "NetworkPolicy must contain exactly one ingress rule")
+    require(
+        ingress[0].get("from", []) == [{"podSelector": {"matchLabels": {"access": access}}}],
+        f"ingress source must be the same-namespace access={access} selector",
+    )
+    require(
+        _network_policy_rule_has_exact_ports(ingress[0], {("TCP", str(port))}),
+        "NetworkPolicy port allowance differs",
+    )
+
+
+def _ready_pod(pod: dict[str, Any]) -> bool:
+    return any(
+        item.get("type") == "Ready" and item.get("status") == "True"
+        for item in pod.get("status", {}).get("conditions", [])
+    )
+
+
+def _ready_endpoint_uids(endpoints: dict[str, Any]) -> set[str]:
+    return {
+        address.get("targetRef", {}).get("uid", "")
+        for subset in endpoints.get("subsets", [])
+        for address in subset.get("addresses", [])
+        if address.get("targetRef", {}).get("uid")
+    }
+
+
+def _all_ready_pods_serve_base64(
+    kube: Kubectl,
+    label: str,
+    container: str,
+    expected_count: int,
+    expected_base64: str,
+) -> bool:
+    pods = [pod for pod in kube.list("pods", label) if _ready_pod(pod)]
+    if len(pods) != expected_count:
+        return False
+    for pod in pods:
+        name = pod.get("metadata", {}).get("name", "")
+        result = kube.run(
+            [
+                "exec",
+                "-n",
+                kube.namespace,
+                name,
+                "-c",
+                container,
+                "--",
+                "sh",
+                "-ec",
+                f'test "$(wget -qO- http://127.0.0.1:8080/ | base64 | tr -d \'\\n\')" = {expected_base64}',
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+    return True
+
+
+def _assert_exact_pdb(kube: Kubectl, name: str, app: str) -> str:
+    pdb = kube.get("poddisruptionbudget", name)
+    require(pdb.get("spec", {}).get("selector", {}).get("matchLabels") == {"app": app}, f"{name} selector differs")
+    require(int_or_string(pdb.get("spec", {}).get("minAvailable")) == "1", f"{name} minAvailable must be 1")
+    return f"{name} selects app={app} with minAvailable 1"
+
+
+def _raise_candidate_mutation_failure(
+    kube: Kubectl, exc: KubectlError, description: str
+) -> None:
+    detail = f"{exc.stdout}\n{exc.stderr}".lower()
+    candidate_markers = ("immutable", "forbidden", "denied", "invalid", "not found", "notfound")
+    if not any(marker in detail for marker in candidate_markers):
+        raise exc
+    ready = kube.run(["get", "--raw=/readyz"], check=False, timeout=min(kube.command_timeout, 10))
+    if ready.returncode == 0 and "ok" in ready.stdout.lower():
+        raise RequirementFailure(
+            f"the evaluator could not perform {description} because the candidate rejected it while the Kubernetes API remained healthy: {exc}"
+        ) from exc
+    raise exc
+
+
+def _run_cronjob_and_assert_log(
+    kube: Kubectl, cronjob: str, suffix: str, expected_log: str, timeout: int = 60
+) -> str:
+    name = f"aipc-eval-{suffix}"
+    kube.delete("job", name)
+    try:
+        try:
+            kube.run(["create", "job", name, f"--from=cronjob/{cronjob}", "-n", kube.namespace])
+        except KubectlError as exc:
+            kube._raise_evaluator_creation_failure(exc, f"probe Job {name}")
+        terminal: dict[str, Any] = {}
+        condition: str | None = None
+
+        def completed() -> bool:
+            nonlocal terminal, condition
+            terminal = kube.get("job", name)
+            condition = job_terminal_condition(terminal)
+            return condition is not None
+
+        kube.wait_until(completed, f"Job {name} to reach a terminal condition", timeout, 1)
+        require(condition == "Complete", f"{name} did not complete successfully: {terminal.get('status', {})}")
+        pods = kube.list("pods", f"job-name={name}")
+        require(len(pods) == 1, f"{name} must have exactly one pod, found {len(pods)}")
+        pod_name = pods[0].get("metadata", {}).get("name", "")
+        logs = kube.run(["logs", pod_name, "-n", kube.namespace]).stdout
+        require(logs == expected_log, f"{name} logs differ: {logs!r}")
+        return f"Job {name} completed and logged exactly {expected_log.rstrip()!r}"
+    finally:
+        kube.delete("job", name)
+
+
 def _easy1_checks(
     kube: Kubectl, candidate_path: Path | None = None
 ) -> list[tuple[str, str, Callable[[], str | None]]]:
@@ -2091,6 +2260,598 @@ def _easy5_checks(
     ]
 
 
+def _medium1_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def r02() -> str:
+        config = kube.get("configmap", "portal-content")
+        _assert_exact_configmap_data(config, {"index.html": "portal-version=v1\n"})
+        return "portal-content contains exactly the initial portal body"
+
+    def r03() -> str:
+        secret = kube.get("secret", "portal-token")
+        require(secret.get("type") == "Opaque", "portal-token must be Opaque")
+        require(set(secret.get("data", {})) == {"API_TOKEN"}, "portal-token must contain only API_TOKEN")
+        require(_decode_secret_value(secret.get("data", {}).get("API_TOKEN"), "API_TOKEN") == "medium-token", "API_TOKEN differs")
+        return "portal-token is the exact one-key Opaque Secret"
+
+    def r04() -> str:
+        deployment = kube.get("deployment", "portal-web")
+        require(deployment.get("spec", {}).get("replicas") == 2, "portal-web must have two replicas")
+        require(pod_labels(deployment).get("app") == "portal-web", "pod label app=portal-web is missing")
+        container = _single_named_container(deployment, "web")
+        require(container.get("image") == "busybox:1.36.1", "portal web image differs")
+        require(_combined_command(container) == ["sh", "-c", 'test "$API_TOKEN" = medium-token && httpd -f -p 8080 -h /www'], "portal web command differs")
+        token_env = [item for item in container.get("env", []) if item.get("name") == "API_TOKEN"]
+        require(len(token_env) == 1 and token_env[0].get("valueFrom", {}).get("secretKeyRef", {}) == {"name": "portal-token", "key": "API_TOKEN"}, "API_TOKEN is not sourced exactly once through portal-token/API_TOKEN secretKeyRef")
+        require(not any(item.get("secretRef", {}).get("name") == "portal-token" for item in container.get("envFrom", [])), "portal-token must not be exposed through envFrom")
+        mount = find_mount(container, "/www")
+        require(mount is not None and mount.get("readOnly") is True, "/www must be mounted read-only")
+        volume = find_volume(pod_spec(deployment), mount.get("name", ""))
+        require(volume is not None and volume.get("configMap", {}).get("name") == "portal-content", "/www is not backed by portal-content")
+        require(not volume.get("configMap", {}).get("items"), "portal-content must be mounted completely")
+        _assert_tcp_port(container, 8080, "http")
+        _assert_http_readiness(container, path="/", port="http", period=5, failure=3)
+        kube.rollout("deployment", "portal-web", timeout_seconds=60)
+        before = {pod.get("metadata", {}).get("uid") for pod in kube.list("pods", "app=portal-web")}
+        patch_v2 = json.dumps({"data": {"index.html": "portal-version=v2\n"}})
+        patch_v1 = json.dumps({"data": {"index.html": "portal-version=v1\n"}})
+        try:
+            kube.run(["patch", "configmap", "portal-content", "-n", kube.namespace, "--type=merge", "-p", patch_v2])
+        except KubectlError as exc:
+            _raise_candidate_mutation_failure(kube, exc, "the required portal ConfigMap update")
+        try:
+            kube.wait_until(
+                lambda: _all_ready_pods_serve_base64(kube, "app=portal-web", "web", 2, "cG9ydGFsLXZlcnNpb249djIK"),
+                "both Ready portal pods to serve portal-version=v2 without rollout",
+                120,
+                2,
+            )
+            after = {pod.get("metadata", {}).get("uid") for pod in kube.list("pods", "app=portal-web")}
+            require(after == before, "portal ConfigMap update triggered or coincided with a pod rollout")
+        finally:
+            kube.run(["patch", "configmap", "portal-content", "-n", kube.namespace, "--type=merge", "-p", patch_v1])
+            kube.wait_until(
+                lambda: _all_ready_pods_serve_base64(kube, "app=portal-web", "web", 2, "cG9ydGFsLXZlcnNpb249djEK"),
+                "both Ready portal pods to serve the restored v1 body",
+                120,
+                2,
+            )
+        return "portal-web wiring is exact and projected ConfigMap changes appeared and were restored without rollout"
+
+    def r05() -> str:
+        _assert_medium_hardening(kube.get("deployment", "portal-web"), "portal-web")
+        return "portal-web has every required pod and container hardening field"
+
+    def r06() -> str:
+        deployment = kube.get("deployment", "portal-web")
+        service = kube.get("service", "portal-svc")
+        spec = service.get("spec", {})
+        require(spec.get("type", "ClusterIP") == "ClusterIP", "portal-svc is not ClusterIP")
+        require(spec.get("selector") == {"app": "portal-web"}, "portal-svc selector differs")
+        port = _service_port(service, 80)
+        require(port.get("protocol", "TCP") == "TCP" and port.get("targetPort") == "http", "portal-svc must target named TCP port http")
+        require(_resolved_target_port(port, deployment) == "8080", "portal-svc targetPort does not resolve to 8080")
+        cluster_ip = spec.get("clusterIP")
+        require(cluster_ip not in {None, "", "None"}, "portal-svc has no ClusterIP")
+        _assert_exact_body_probe(kube, "aipc-eval-portal-initial", f"http://{cluster_ip}:80/", "portal-version=v1", 18, labels={"access": "portal"})
+        pods = [pod for pod in kube.list("pods", "app=portal-web") if _ready_pod(pod)]
+        require(len(pods) == 2, f"expected two Ready portal pods, found {len(pods)}")
+        victim = pods[0]
+        victim_name = victim.get("metadata", {}).get("name", "")
+        victim_uid = victim.get("metadata", {}).get("uid", "")
+        kube.run(["delete", "pod", victim_name, "-n", kube.namespace, "--wait=true"])
+        kube.wait_until(
+            lambda: victim_uid not in _ready_endpoint_uids(kube.get("endpoints", "portal-svc")),
+            "the deleted portal pod to leave the Ready endpoint set",
+            30,
+            1,
+        )
+        probe = kube.run_probe_pod(
+            "aipc-eval-portal-continuity",
+            f'i=0; while [ "$i" -lt 10 ]; do test "$(wget -q -T 5 -O - http://{cluster_ip}:80/)" = portal-version=v1; i=$((i + 1)); sleep 1; done',
+            labels={"access": "portal"},
+            timeout_seconds=30,
+        )
+        kube.wait_until(
+            lambda: any(
+                pod.get("metadata", {}).get("uid") not in {victim_uid, ""} and _ready_pod(pod)
+                for pod in kube.list("pods", "app=portal-web")
+            ),
+            "a distinct Ready portal replacement pod",
+            60,
+            1,
+        )
+        return f"portal-svc returned the exact body through ten replacement-time requests; {probe}"
+
+    def r07() -> str:
+        _assert_single_ingress_policy(kube.get("networkpolicy", "portal-ingress"), app="portal-web", access="portal", port=8080)
+        cluster_ip = kube.get("service", "portal-svc").get("spec", {}).get("clusterIP")
+        allowed = kube.run_probe_pod("aipc-eval-portal-allowed", f"wget -q -T 5 -O /dev/null http://{cluster_ip}:80/", labels={"access": "portal"})
+        denied = kube.run_probe_pod("aipc-eval-portal-denied", f"wget -q -T 4 -O /dev/null http://{cluster_ip}:80/", labels={"access": "other"}, expect_success=False)
+        return f"portal ingress is structurally narrow and works only for the allowed label; {allowed}; {denied}"
+
+    def r08() -> str:
+        return _assert_exact_pdb(kube, "portal-pdb", "portal-web")
+
+    def r09() -> str:
+        spec = kube.get("deployment", "portal-web").get("spec", {})
+        strategy = spec.get("strategy", {})
+        require(strategy.get("type", "RollingUpdate") == "RollingUpdate", "portal-web strategy must be RollingUpdate")
+        rolling = strategy.get("rollingUpdate", {})
+        require(int_or_string(rolling.get("maxUnavailable")) == "0", "maxUnavailable must be 0")
+        require(int_or_string(rolling.get("maxSurge")) == "1", "maxSurge must be 1")
+        require(spec.get("minReadySeconds") == 5, "minReadySeconds must be 5")
+        require(spec.get("progressDeadlineSeconds") == 90, "progressDeadlineSeconds must be 90")
+        require(spec.get("revisionHistoryLimit") == 2, "revisionHistoryLimit must be 2")
+        return "portal-web has the exact rollout controls"
+
+    def r10() -> str:
+        require(kube.get("secret", "portal-token").get("immutable") is True, "portal-token must be immutable")
+        return "portal-token is immutable"
+
+    return [
+        ("R01", "isolated medium portal namespace", lambda: _check_namespace(kube, "medium-portal-ns", _require_candidate_path(candidate_path))),
+        ("R02", "exact portal content", r02),
+        ("R03", "exact portal token", r03),
+        ("R04", "portal Deployment and live configuration projection", r04),
+        ("R05", "portal pod hardening", r05),
+        ("R06", "portal Service response and replacement continuity", r06),
+        ("R07", "portal ingress isolation", r07),
+        ("R08", "portal disruption budget", r08),
+        ("R09", "portal rollout controls", r09),
+        ("R10", "immutable portal token", r10),
+    ]
+
+
+def _medium2_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def r02() -> str:
+        _assert_exact_configmap_data(kube.get("configmap", "batch-input"), {"VALUE": "17", "FACTOR": "3"})
+        return "batch-input contains exactly VALUE=17 and FACTOR=3"
+
+    def r03() -> str:
+        secret = kube.get("secret", "batch-mode")
+        require(secret.get("type") == "Opaque", "batch-mode must be Opaque")
+        require(set(secret.get("data", {})) == {"OPERATION"}, "batch-mode must contain only OPERATION")
+        require(_decode_secret_value(secret.get("data", {}).get("OPERATION"), "OPERATION") == "multiply", "OPERATION differs")
+        return "batch-mode is the exact one-key Opaque Secret"
+
+    def r04() -> str:
+        account = kube.get("serviceaccount", "batch-runner")
+        require(account.get("automountServiceAccountToken") is True, "batch-runner automountServiceAccountToken must be true")
+        return "batch-runner exists with token automount explicitly enabled"
+
+    def r05() -> str:
+        role = kube.get("role", "batch-input-reader")
+        require(role.get("rules") == [{"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["batch-input"], "verbs": ["get"]}], "batch-input-reader rule differs")
+        return "batch-input-reader grants only get on ConfigMap batch-input"
+
+    def r06() -> str:
+        binding = kube.get("rolebinding", "batch-input-reader-binding")
+        require(binding.get("subjects") == [{"kind": "ServiceAccount", "name": "batch-runner", "namespace": "medium-batch-ns"}], "RoleBinding must bind only batch-runner")
+        role_ref = binding.get("roleRef", {})
+        require(role_ref == {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "batch-input-reader"}, "RoleBinding roleRef differs")
+        require(kube.auth_can_i("batch-runner", "get", "configmap/batch-input"), "batch-runner cannot initially get batch-input")
+        require(not kube.auth_can_i("batch-runner", "list", "configmaps"), "batch-runner can list ConfigMaps")
+        restore = {
+            "apiVersion": binding.get("apiVersion", "rbac.authorization.k8s.io/v1"),
+            "kind": "RoleBinding",
+            "metadata": {"name": "batch-input-reader-binding", "namespace": kube.namespace},
+            "roleRef": role_ref,
+            "subjects": binding.get("subjects"),
+        }
+        kube.run(["delete", "rolebinding", "batch-input-reader-binding", "-n", kube.namespace, "--wait=true"])
+        try:
+            kube.wait_until(lambda: not kube.auth_can_i("batch-runner", "get", "configmap/batch-input"), "batch-runner get authorization to become denied", 15, 1)
+        finally:
+            kube.run(["apply", "-f", "-"], input_text=json.dumps(restore))
+        kube.wait_until(lambda: kube.auth_can_i("batch-runner", "get", "configmap/batch-input"), "batch-runner get authorization to recover", 15, 1)
+        return "batch-runner authorization follows the required allow-deny-allow transition"
+
+    def r07() -> str:
+        hard = kube.get("resourcequota", "batch-limits").get("spec", {}).get("hard", {})
+        require(set(hard) == {"count/jobs.batch", "pods"}, "batch-limits has missing or additional hard limits")
+        require({key: int_or_string(value) for key, value in hard.items()} == {"count/jobs.batch": "3", "pods": "6"}, "batch-limits values differ")
+        return "batch-limits has exactly the requested Job and pod limits"
+
+    def r08() -> str:
+        job = kube.get("job", "multiply-job")
+        spec = job.get("spec", {})
+        pod = spec.get("template", {}).get("spec", {})
+        require(pod.get("serviceAccountName", "default") == "batch-runner", "multiply-job does not use batch-runner")
+        require(pod.get("restartPolicy") == "Never", "multiply-job restartPolicy must be Never")
+        containers = pod.get("containers", [])
+        require(len(containers) == 1 and containers[0].get("name") == "calculator", "multiply-job must have one calculator container")
+        container = containers[0]
+        require(container.get("image") == "busybox:1.36.1", "calculator image differs")
+        require(_combined_command(container) == ["sh", "-c", 'test "$OPERATION" = multiply && result=$((VALUE * FACTOR)) && echo result=$result && test "$result" -eq 51'], "calculator command differs")
+        env = {item.get("name"): item.get("valueFrom", {}) for item in container.get("env", []) if isinstance(item, dict)}
+        require(env.get("VALUE", {}).get("configMapKeyRef", {}) == {"name": "batch-input", "key": "VALUE"}, "VALUE source differs")
+        require(env.get("FACTOR", {}).get("configMapKeyRef", {}) == {"name": "batch-input", "key": "FACTOR"}, "FACTOR source differs")
+        require(env.get("OPERATION", {}).get("secretKeyRef", {}) == {"name": "batch-mode", "key": "OPERATION"}, "OPERATION source differs")
+        require(spec.get("backoffLimit") == 1, "backoffLimit must be 1")
+        require(spec.get("activeDeadlineSeconds") == 60, "activeDeadlineSeconds must be 60")
+        kube.wait_until(lambda: kube.get("job", "multiply-job").get("status", {}).get("succeeded", 0) == 1, "multiply-job to complete", 60, 1)
+        pods = kube.list("pods", "job-name=multiply-job")
+        require(len(pods) == 1, f"multiply-job must have exactly one pod, found {len(pods)}")
+        logs = kube.run(["logs", pods[0].get("metadata", {}).get("name", ""), "-n", kube.namespace]).stdout
+        require(logs == "result=51\n", f"multiply-job logs differ: {logs!r}")
+        return "multiply-job has exact input wiring, completes once, and logs result=51"
+
+    def r09() -> str:
+        spec = kube.get("job", "multiply-job").get("spec", {})
+        require(spec.get("completions") == 1, "completions must be 1")
+        require(spec.get("parallelism") == 1, "parallelism must be 1")
+        require(spec.get("completionMode") == "NonIndexed", "completionMode must be NonIndexed")
+        require(spec.get("ttlSecondsAfterFinished") == 600, "ttlSecondsAfterFinished must be 600")
+        return "multiply-job has the exact completion and lifecycle controls"
+
+    def r10() -> str:
+        require(kube.get("secret", "batch-mode").get("immutable") is True, "batch-mode must be immutable")
+        return "batch-mode is immutable"
+
+    return [
+        ("R01", "isolated medium batch namespace", lambda: _check_namespace(kube, "medium-batch-ns", _require_candidate_path(candidate_path))),
+        ("R02", "exact batch input", r02),
+        ("R03", "exact batch mode", r03),
+        ("R04", "batch service identity", r04),
+        ("R05", "single-object batch Role", r05),
+        ("R06", "RoleBinding authorization loss and recovery", r06),
+        ("R07", "batch resource quota", r07),
+        ("R08", "multiply Job completion and output", r08),
+        ("R09", "multiply Job lifecycle", r09),
+        ("R10", "immutable batch mode", r10),
+    ]
+
+
+def _medium3_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def r02() -> str:
+        _assert_exact_configmap_data(kube.get("configmap", "registry-prefix"), {"PREFIX": "registry"})
+        return "registry-prefix contains exactly PREFIX=registry"
+
+    def r03() -> str:
+        secret = kube.get("secret", "registry-suffix")
+        require(secret.get("type") == "Opaque", "registry-suffix must be Opaque")
+        require(set(secret.get("data", {})) == {"SUFFIX"}, "registry-suffix must contain only SUFFIX")
+        require(_decode_secret_value(secret.get("data", {}).get("SUFFIX"), "SUFFIX") == "stable", "SUFFIX differs")
+        return "registry-suffix is the exact one-key Opaque Secret"
+
+    def r04() -> str:
+        service = kube.get("service", "registry-headless")
+        spec = service.get("spec", {})
+        require(spec.get("clusterIP") == "None", "registry-headless is not headless")
+        require(spec.get("publishNotReadyAddresses", False) is False, "publishNotReadyAddresses must be false")
+        require(spec.get("selector") == {"app": "registry"}, "registry-headless selector differs")
+        port = _service_port(service, 8080)
+        require(port.get("protocol", "TCP") == "TCP" and port.get("targetPort") == "http", "registry-headless port mapping differs")
+        return "registry-headless has the exact headless selector and named-port mapping"
+
+    def r05() -> str:
+        stateful = kube.get("statefulset", "registry")
+        spec = stateful.get("spec", {})
+        require(spec.get("serviceName") == "registry-headless", "registry serviceName differs")
+        require(spec.get("replicas") == 2, "registry must have two replicas")
+        require(pod_labels(stateful).get("app") == "registry", "pod label app=registry is missing")
+        container = _single_named_container(stateful, "registry")
+        require(container.get("image") == "busybox:1.36.1", "registry image differs")
+        expected_command = 'if [ ! -f /data/index.html ]; then printf "%s-%s-%s\\n" "$PREFIX" "$HOSTNAME" "$SUFFIX" > /data/index.html; fi; httpd -f -p 8080 -h /data'
+        require(_combined_command(container) == ["sh", "-c", expected_command], "registry command differs")
+        env = {item.get("name"): item.get("valueFrom", {}) for item in container.get("env", []) if isinstance(item, dict)}
+        require(env.get("PREFIX", {}).get("configMapKeyRef", {}) == {"name": "registry-prefix", "key": "PREFIX"}, "PREFIX source differs")
+        require(env.get("SUFFIX", {}).get("secretKeyRef", {}) == {"name": "registry-suffix", "key": "SUFFIX"}, "SUFFIX source differs")
+        require(not any(item.get("secretRef", {}).get("name") == "registry-suffix" for item in container.get("envFrom", [])), "registry-suffix must not be exposed through envFrom")
+        _assert_tcp_port(container, 8080, "http")
+        _assert_http_readiness(container, path="/", port="http", period=5)
+        mount = find_mount(container, "/data")
+        require(mount is not None and mount.get("name") == "data", "data claim is not mounted at /data")
+        assert_claim(volume_claim_template(stateful, "data"), "64Mi")
+        kube.wait_until(lambda: kube.get("statefulset", "registry").get("status", {}).get("readyReplicas", 0) == 2, "registry to have two Ready replicas", 90, 1)
+        original = kube.get("pod", "registry-0")
+        original_uid = original.get("metadata", {}).get("uid", "")
+        kube.exec("registry-0", "printf oracle-marker > /data/oracle-marker", "registry")
+        kube.run(["delete", "pod", "registry-0", "-n", kube.namespace, "--wait=true"])
+        replacement: dict[str, Any] = {}
+
+        def recovered() -> bool:
+            nonlocal replacement
+            candidates = [
+                pod
+                for pod in kube.list("pods", "app=registry")
+                if pod.get("metadata", {}).get("name") == "registry-0"
+            ]
+            if not candidates:
+                return False
+            candidate = candidates[0]
+            if candidate.get("metadata", {}).get("uid") in {"", original_uid} or not _ready_pod(candidate):
+                return False
+            replacement = candidate
+            return True
+
+        kube.wait_until(recovered, "a distinct Ready registry-0 replacement", 90, 1)
+        kube.exec("registry-0", 'test "$(cat /data/oracle-marker)" = oracle-marker', "registry")
+        kube.wait_until(lambda: len(_ready_endpoint_uids(kube.get("endpoints", "registry-headless"))) == 2, "registry-headless to regain two Ready endpoints", 90, 1)
+        kube.exec("registry-0", "rm -f /data/oracle-marker", "registry")
+        return f"registry-0 retained its PVC marker after replacement {original_uid} -> {replacement.get('metadata', {}).get('uid')} and the headless Service regained two endpoints"
+
+    def r06() -> str:
+        _assert_medium_hardening(kube.get("statefulset", "registry"), "registry")
+        return "registry has every required pod and container hardening field"
+
+    def r07() -> str:
+        _assert_single_ingress_policy(kube.get("networkpolicy", "registry-ingress"), app="registry", access="registry", port=8080)
+        allowed = kube.run_probe_pod("aipc-eval-registry-allowed", "wget -q -T 5 -O /dev/null http://registry-headless:8080/", labels={"access": "registry"})
+        denied = kube.run_probe_pod("aipc-eval-registry-denied", "wget -q -T 4 -O /dev/null http://registry-headless:8080/", labels={"access": "other"}, expect_success=False)
+        return f"registry ingress is structurally narrow and live-isolated; {allowed}; {denied}"
+
+    def r08() -> str:
+        return _assert_exact_pdb(kube, "registry-pdb", "registry")
+
+    def r09() -> str:
+        retention = kube.get("statefulset", "registry").get("spec", {}).get("persistentVolumeClaimRetentionPolicy", {})
+        require(retention == {"whenDeleted": "Retain", "whenScaled": "Retain"}, "PVC retention policy differs")
+        return "registry retains PVCs when deleted and scaled"
+
+    def r10() -> str:
+        spec = kube.get("statefulset", "registry").get("spec", {})
+        require(spec.get("podManagementPolicy") == "OrderedReady", "podManagementPolicy must be OrderedReady")
+        update = spec.get("updateStrategy", {})
+        require(update.get("type", "RollingUpdate") == "RollingUpdate", "updateStrategy must be RollingUpdate")
+        require(update.get("rollingUpdate", {}).get("partition", 0) == 0, "RollingUpdate partition must be 0")
+        return "registry uses OrderedReady and RollingUpdate partition 0"
+
+    return [
+        ("R01", "isolated medium stateful namespace", lambda: _check_namespace(kube, "medium-stateful-ns", _require_candidate_path(candidate_path))),
+        ("R02", "exact registry prefix", r02),
+        ("R03", "exact registry suffix", r03),
+        ("R04", "registry headless Service", r04),
+        ("R05", "registry StatefulSet storage and recovery", r05),
+        ("R06", "registry pod hardening", r06),
+        ("R07", "registry ingress isolation", r07),
+        ("R08", "registry disruption budget", r08),
+        ("R09", "registry PVC retention", r09),
+        ("R10", "registry ordering and update strategy", r10),
+    ]
+
+
+def _medium4_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    expected_cron_command = 'i=0; until body=$(wget -qO- http://check-svc); do i=$((i + 1)); [ "$i" -ge 10 ] && exit 1; sleep 2; done; test "$body" = check-ready && echo check-ok'
+
+    def r02() -> str:
+        _assert_exact_configmap_data(kube.get("configmap", "check-content"), {"index.html": "check-ready\n"})
+        return "check-content contains exactly the required body"
+
+    def r03() -> str:
+        deployment = kube.get("deployment", "check-web")
+        require(deployment.get("spec", {}).get("replicas") == 2, "check-web must have two replicas")
+        require(pod_labels(deployment).get("app") == "check-web", "pod label app=check-web is missing")
+        container = _single_named_container(deployment, "web")
+        require(container.get("image") == "busybox:1.36.1", "check-web image differs")
+        require(_combined_command(container) in (["httpd", "-f", "-p", "8080", "-h", "/www"], ["sh", "-c", "httpd -f -p 8080 -h /www"]), "check-web command differs")
+        mount = find_mount(container, "/www")
+        require(mount is not None and mount.get("readOnly") is True, "/www must be mounted read-only")
+        volume = find_volume(pod_spec(deployment), mount.get("name", ""))
+        require(volume is not None and volume.get("configMap", {}).get("name") == "check-content", "/www is not backed by check-content")
+        require(not volume.get("configMap", {}).get("items"), "check-content must be mounted completely")
+        _assert_tcp_port(container, 8080, "http")
+        _assert_http_readiness(container, path="/", port="http", period=5, failure=3, initial_delay=2)
+        kube.rollout("deployment", "check-web", timeout_seconds=60)
+        return "check-web has exact content wiring, listener, probe, and two Ready replicas"
+
+    def r04() -> str:
+        service = kube.get("service", "check-svc")
+        spec = service.get("spec", {})
+        require(spec.get("type", "ClusterIP") == "ClusterIP", "check-svc is not ClusterIP")
+        require(spec.get("selector") == {"app": "check-web"}, "check-svc selector differs")
+        port = _service_port(service, 80)
+        require(port.get("protocol", "TCP") == "TCP" and port.get("targetPort") == "http", "check-svc port mapping differs")
+        require(_resolved_target_port(port, kube.get("deployment", "check-web")) == "8080", "check-svc targetPort does not resolve to 8080")
+        cluster_ip = spec.get("clusterIP")
+        require(cluster_ip not in {None, "", "None"}, "check-svc has no ClusterIP")
+        probe = _assert_exact_body_probe(kube, "aipc-eval-check-service", f"http://{cluster_ip}:80/", "check-ready", 12, labels={"access": "checker"})
+        return f"check-svc returns the exact body to a permitted client; {probe}"
+
+    def r05() -> str:
+        _assert_medium_hardening(kube.get("deployment", "check-web"), "check-web")
+        return "check-web has every required pod and container hardening field"
+
+    def r06() -> str:
+        _assert_single_ingress_policy(kube.get("networkpolicy", "check-ingress"), app="check-web", access="checker", port=8080)
+        cluster_ip = kube.get("service", "check-svc").get("spec", {}).get("clusterIP")
+        allowed = kube.run_probe_pod("aipc-eval-check-allowed", f"wget -q -T 5 -O /dev/null http://{cluster_ip}:80/", labels={"access": "checker"})
+        denied = kube.run_probe_pod("aipc-eval-check-denied", f"wget -q -T 4 -O /dev/null http://{cluster_ip}:80/", labels={"access": "other"}, expect_success=False)
+        return f"check ingress is structurally narrow and live-isolated; {allowed}; {denied}"
+
+    def r07() -> str:
+        cronjob = kube.get("cronjob", "scheduled-check")
+        spec = cronjob.get("spec", {})
+        require(spec.get("schedule") == "*/5 * * * *", "scheduled-check schedule differs")
+        require(spec.get("suspend") is True, "scheduled-check must be suspended")
+        require(spec.get("concurrencyPolicy") == "Forbid", "concurrencyPolicy must be Forbid")
+        require(spec.get("successfulJobsHistoryLimit") == 1, "successfulJobsHistoryLimit must be 1")
+        require(spec.get("failedJobsHistoryLimit") == 1, "failedJobsHistoryLimit must be 1")
+        pod = _cron_spec(cronjob)
+        require(cronjob.get("spec", {}).get("jobTemplate", {}).get("spec", {}).get("template", {}).get("metadata", {}).get("labels") == {"access": "checker"}, "CronJob pod label must be exactly access=checker")
+        require(pod.get("restartPolicy") == "Never", "CronJob restartPolicy must be Never")
+        containers = pod.get("containers", [])
+        require(len(containers) == 1 and containers[0].get("name") == "checker", "CronJob must have one checker container")
+        require(containers[0].get("image") == "busybox:1.36.1", "checker image differs")
+        require(_combined_command(containers[0]) == ["sh", "-c", expected_cron_command], "scheduled-check command differs")
+        return _run_cronjob_and_assert_log(kube, "scheduled-check", "scheduled-check", "check-ok\n", 60)
+
+    def r08() -> str:
+        return _assert_exact_pdb(kube, "check-pdb", "check-web")
+
+    def r09() -> str:
+        spec = kube.get("deployment", "check-web").get("spec", {})
+        strategy = spec.get("strategy", {})
+        require(strategy.get("type", "RollingUpdate") == "RollingUpdate", "check-web strategy must be RollingUpdate")
+        rolling = strategy.get("rollingUpdate", {})
+        require(int_or_string(rolling.get("maxUnavailable")) == "0", "maxUnavailable must be 0")
+        require(int_or_string(rolling.get("maxSurge")) == "1", "maxSurge must be 1")
+        require(spec.get("minReadySeconds") == 5, "minReadySeconds must be 5")
+        require(spec.get("progressDeadlineSeconds") == 90, "progressDeadlineSeconds must be 90")
+        require(spec.get("revisionHistoryLimit") == 2, "revisionHistoryLimit must be 2")
+        return "check-web has the exact rollout controls"
+
+    return [
+        ("R01", "isolated medium checker namespace", lambda: _check_namespace(kube, "medium-check-ns", _require_candidate_path(candidate_path))),
+        ("R02", "exact checker content", r02),
+        ("R03", "checker Deployment and readiness", r03),
+        ("R04", "exact checker Service response", r04),
+        ("R05", "checker pod hardening", r05),
+        ("R06", "checker ingress isolation", r06),
+        ("R07", "suspended executable checker CronJob", r07),
+        ("R08", "checker disruption budget", r08),
+        ("R09", "checker rollout controls", r09),
+    ]
+
+
+def _medium5_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    expected_cron_command = 'i=0; until body=$(wget -qO- http://ledger-svc); do i=$((i + 1)); [ "$i" -ge 10 ] && exit 1; sleep 2; done; test "$body" = ledger-version=v1 && echo ledger-check-ok'
+
+    def r02() -> str:
+        _assert_exact_configmap_data(kube.get("configmap", "ledger-seed"), {"index.html": "ledger-version=v1\n"})
+        return "ledger-seed contains exactly the initial ledger body"
+
+    def r03() -> str:
+        claim = kube.get("persistentvolumeclaim", "ledger-data")
+        spec = claim.get("spec", {})
+        require(set(spec.get("accessModes", [])) == {"ReadWriteOnce"}, "ledger-data must be ReadWriteOnce")
+        require(spec.get("volumeMode", "Filesystem") == "Filesystem", "ledger-data volumeMode must be Filesystem")
+        require(spec.get("resources", {}).get("requests", {}).get("storage") == "64Mi", "ledger-data storage request must be 64Mi")
+        return "ledger-data has the exact access mode, volume mode, and size"
+
+    def r04() -> str:
+        deployment = kube.get("deployment", "ledger-web")
+        require(deployment.get("spec", {}).get("replicas") == 1, "ledger-web must have one replica")
+        require(pod_labels(deployment).get("app") == "ledger-web", "pod label app=ledger-web is missing")
+        pod = pod_spec(deployment)
+        init = pod.get("initContainers", [])
+        main = pod.get("containers", [])
+        require(len(init) == 1 and init[0].get("name") == "seed", "ledger-web must have exactly one seed init container")
+        require(len(main) == 1 and main[0].get("name") == "web", "ledger-web must have exactly one web container")
+        require(init[0].get("image") == "busybox:1.36.1", "seed image differs")
+        require(_combined_command(init[0]) == ["sh", "-c", "if [ ! -f /data/index.html ]; then cp /seed/index.html /data/index.html; fi"], "seed command differs")
+        require(main[0].get("image") == "busybox:1.36.1", "web image differs")
+        require(_combined_command(main[0]) in (["httpd", "-f", "-p", "8080", "-h", "/data"], ["sh", "-c", "httpd -f -p 8080 -h /data"]), "ledger web command differs")
+        seed_mount = find_mount(init[0], "/seed")
+        init_data_mount = find_mount(init[0], "/data")
+        web_data_mount = find_mount(main[0], "/data")
+        require(seed_mount is not None and seed_mount.get("readOnly") is True, "/seed must be mounted read-only in seed")
+        require(init_data_mount is not None and web_data_mount is not None and init_data_mount.get("name") == web_data_mount.get("name"), "seed and web must share the /data volume")
+        seed_volume = find_volume(pod, seed_mount.get("name", ""))
+        data_volume = find_volume(pod, web_data_mount.get("name", ""))
+        require(seed_volume is not None and seed_volume.get("configMap", {}).get("name") == "ledger-seed", "/seed is not backed by ledger-seed")
+        require(data_volume is not None and data_volume.get("persistentVolumeClaim", {}).get("claimName") == "ledger-data", "/data is not backed by ledger-data")
+        _assert_tcp_port(main[0], 8080, "http")
+        _assert_http_readiness(main[0], path="/", port="http", period=5)
+        kube.rollout("deployment", "ledger-web", timeout_seconds=90)
+        pods = [pod for pod in kube.list("pods", "app=ledger-web") if _ready_pod(pod)]
+        require(len(pods) == 1, f"expected one Ready ledger pod, found {len(pods)}")
+        original_name = pods[0].get("metadata", {}).get("name", "")
+        original_uid = pods[0].get("metadata", {}).get("uid", "")
+        kube.exec(original_name, "printf 'ledger-version=v2\\n' > /data/index.html", "web")
+        kube.exec(original_name, 'test "$(base64 /data/index.html | tr -d \'\\n\')" = bGVkZ2VyLXZlcnNpb249djIK', "web")
+        kube.run(["delete", "pod", original_name, "-n", kube.namespace, "--wait=true"])
+        replacement: dict[str, Any] = {}
+
+        def recovered() -> bool:
+            nonlocal replacement
+            candidates = [pod for pod in kube.list("pods", "app=ledger-web") if _ready_pod(pod)]
+            for candidate in candidates:
+                if candidate.get("metadata", {}).get("uid") not in {"", original_uid}:
+                    replacement = candidate
+                    return True
+            return False
+
+        kube.wait_until(recovered, "a distinct Ready ledger replacement pod", 90, 1)
+        replacement_name = replacement.get("metadata", {}).get("name", "")
+        try:
+            kube.exec(replacement_name, 'test "$(wget -qO- http://127.0.0.1:8080/ | base64 | tr -d \'\\n\')" = bGVkZ2VyLXZlcnNpb249djIK', "web")
+        finally:
+            kube.exec(replacement_name, "printf 'ledger-version=v1\\n' > /data/index.html", "web")
+        kube.wait_until(lambda: _all_ready_pods_serve_base64(kube, "app=ledger-web", "web", 1, "bGVkZ2VyLXZlcnNpb249djEK"), "ledger service content to be restored to v1", 30, 1)
+        return f"ledger PVC content survived replacement {original_uid} -> {replacement.get('metadata', {}).get('uid')} and was restored for later independent checks"
+
+    def r05() -> str:
+        service = kube.get("service", "ledger-svc")
+        spec = service.get("spec", {})
+        require(spec.get("type", "ClusterIP") == "ClusterIP", "ledger-svc is not ClusterIP")
+        require(spec.get("selector") == {"app": "ledger-web"}, "ledger-svc selector differs")
+        port = _service_port(service, 80)
+        require(port.get("protocol", "TCP") == "TCP" and port.get("targetPort") == "http", "ledger-svc port mapping differs")
+        require(_resolved_target_port(port, kube.get("deployment", "ledger-web")) == "8080", "ledger-svc targetPort does not resolve to 8080")
+        cluster_ip = spec.get("clusterIP")
+        require(cluster_ip not in {None, "", "None"}, "ledger-svc has no ClusterIP")
+        probe = _assert_exact_body_probe(kube, "aipc-eval-ledger-service", f"http://{cluster_ip}:80/", "ledger-version=v1", 18, labels={"access": "ledger"})
+        return f"ledger-svc returns the initial exact body to an allowed client; {probe}"
+
+    def r06() -> str:
+        _assert_single_ingress_policy(kube.get("networkpolicy", "ledger-ingress"), app="ledger-web", access="ledger", port=8080)
+        cluster_ip = kube.get("service", "ledger-svc").get("spec", {}).get("clusterIP")
+        allowed = kube.run_probe_pod("aipc-eval-ledger-allowed", f"wget -q -T 5 -O /dev/null http://{cluster_ip}:80/", labels={"access": "ledger"})
+        denied = kube.run_probe_pod("aipc-eval-ledger-denied", f"wget -q -T 4 -O /dev/null http://{cluster_ip}:80/", labels={"access": "other"}, expect_success=False)
+        return f"ledger ingress is structurally narrow and live-isolated; {allowed}; {denied}"
+
+    def r07() -> str:
+        hard = kube.get("resourcequota", "ledger-quota").get("spec", {}).get("hard", {})
+        expected = {"requests.storage": "256Mi", "persistentvolumeclaims": "2", "pods": "6", "services": "2"}
+        require(set(hard) == set(expected), "ledger-quota has missing or additional hard limits")
+        require({key: int_or_string(value) for key, value in hard.items()} == expected, "ledger-quota values differ")
+        return "ledger-quota has exactly the requested storage and object limits"
+
+    def r08() -> str:
+        cronjob = kube.get("cronjob", "ledger-check")
+        spec = cronjob.get("spec", {})
+        require(spec.get("schedule") == "*/15 * * * *", "ledger-check schedule differs")
+        require(spec.get("suspend") is True, "ledger-check must be suspended")
+        require(spec.get("concurrencyPolicy") == "Forbid", "ledger-check concurrencyPolicy must be Forbid")
+        labels = spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("metadata", {}).get("labels")
+        require(labels == {"access": "ledger"}, "CronJob pod label must be exactly access=ledger")
+        pod = _cron_spec(cronjob)
+        require(pod.get("restartPolicy") == "Never", "ledger-check restartPolicy must be Never")
+        containers = pod.get("containers", [])
+        require(len(containers) == 1 and containers[0].get("name") == "checker", "ledger-check must have one checker container")
+        require(containers[0].get("image") == "busybox:1.36.1", "ledger checker image differs")
+        require(_combined_command(containers[0]) == ["sh", "-c", expected_cron_command], "ledger-check command differs")
+        return _run_cronjob_and_assert_log(kube, "ledger-check", "ledger-check", "ledger-check-ok\n", 60)
+
+    def r09() -> str:
+        require(kube.get("configmap", "ledger-seed").get("immutable") is True, "ledger-seed must be immutable")
+        return "ledger-seed is immutable"
+
+    def r10() -> str:
+        spec = kube.get("deployment", "ledger-web").get("spec", {})
+        require(spec.get("strategy", {}).get("type") == "Recreate", "ledger-web strategy must be Recreate")
+        require(spec.get("progressDeadlineSeconds") == 120, "progressDeadlineSeconds must be 120")
+        require(spec.get("revisionHistoryLimit") == 1, "revisionHistoryLimit must be 1")
+        return "ledger-web has the exact Recreate and history controls"
+
+    return [
+        ("R01", "isolated medium ledger namespace", lambda: _check_namespace(kube, "medium-ledger-ns", _require_candidate_path(candidate_path))),
+        ("R02", "exact ledger seed", r02),
+        ("R03", "ledger persistent claim", r03),
+        # The public R08 contract says its CronJob is exercised before the
+        # evaluator mutates storage, so initial-state checks deliberately run
+        # before the destructive R04 replacement check.
+        ("R05", "exact ledger Service response", r05),
+        ("R06", "ledger ingress isolation", r06),
+        ("R07", "ledger resource quota", r07),
+        ("R08", "suspended live ledger checker", r08),
+        ("R09", "immutable ledger seed", r09),
+        ("R10", "ledger deployment strategy", r10),
+        ("R04", "ledger Deployment and durable replacement", r04),
+    ]
+
+
 def _require_candidate_path(candidate_path: Path | None) -> Path:
     if candidate_path is None:
         raise EvaluationInfrastructureError(
@@ -2120,6 +2881,16 @@ def run_suite(
         checks = _easy4_checks(kube, candidate_path)
     elif task_id == "easy-005":
         checks = _easy5_checks(kube, candidate_path)
+    elif task_id == "medium-001":
+        checks = _medium1_checks(kube, candidate_path)
+    elif task_id == "medium-002":
+        checks = _medium2_checks(kube, candidate_path)
+    elif task_id == "medium-003":
+        checks = _medium3_checks(kube, candidate_path)
+    elif task_id == "medium-004":
+        checks = _medium4_checks(kube, candidate_path)
+    elif task_id == "medium-005":
+        checks = _medium5_checks(kube, candidate_path)
     else:
         raise EvaluationError(f"unknown task id {task_id!r}")
     actual_ids = {requirement_id for requirement_id, _, _ in checks}
