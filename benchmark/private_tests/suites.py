@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +37,11 @@ EXPECTED_REQUIREMENTS = {
     "pilot-002": {f"R{number:02d}" for number in range(1, 15)},
     "pilot-003": {f"R{number:02d}" for number in range(1, 12)},
     "pilot-004": {f"R{number:02d}" for number in range(1, 14)},
+    "easy-001": {f"R{number:02d}" for number in range(1, 7)},
+    "easy-002": {f"R{number:02d}" for number in range(1, 7)},
+    "easy-003": {f"R{number:02d}" for number in range(1, 7)},
+    "easy-004": {f"R{number:02d}" for number in range(1, 7)},
+    "easy-005": {f"R{number:02d}" for number in range(1, 7)},
 }
 
 _FRESH_CLUSTER_NAMESPACES = {
@@ -1543,6 +1549,548 @@ def _task4_checks(
     ]
 
 
+def _combined_command(container: dict[str, Any]) -> list[str]:
+    return [*container.get("command", []), *container.get("args", [])]
+
+
+def _single_named_container(workload: dict[str, Any], name: str) -> dict[str, Any]:
+    containers = pod_spec(workload).get("containers", [])
+    require(len(containers) == 1, "workload must contain exactly one main container")
+    require(containers[0].get("name") == name, f"container must be named {name}")
+    return containers[0]
+
+
+def _assert_tcp_port(container: dict[str, Any], port: int, name: str | None = None) -> None:
+    matches = [
+        item
+        for item in container.get("ports", [])
+        if item.get("containerPort") == port
+        and item.get("protocol", "TCP") == "TCP"
+        and (name is None or item.get("name") == name)
+    ]
+    require(len(matches) == 1, f"container must expose the required TCP port {port}")
+
+
+def _assert_tcp_readiness(
+    container: dict[str, Any], port: int | str, period: int, failure: int | None = None
+) -> None:
+    probe = container.get("readinessProbe", {})
+    require(probe.get("tcpSocket", {}).get("port") == port, "readiness probe targets the wrong TCP port")
+    require(probe.get("periodSeconds", 10) == period, "readiness periodSeconds differs")
+    if failure is not None:
+        require(probe.get("failureThreshold", 3) == failure, "readiness failureThreshold differs")
+
+
+def _assert_exact_body_probe(
+    kube: Kubectl,
+    name: str,
+    url: str,
+    expected: str,
+    byte_count: int,
+    *,
+    labels: dict[str, str] | None = None,
+) -> str:
+    command = (
+        f"wget -q -T 5 -O /tmp/body {url}; "
+        f"test \"$(wc -c </tmp/body | tr -d ' ')\" = {byte_count}; "
+        f"test \"$(cat /tmp/body)\" = {expected}"
+    )
+    return kube.run_probe_pod(name, command, labels=labels, timeout_seconds=35)
+
+
+def _assert_cronjob(
+    cronjob: dict[str, Any], schedule: str, expected_command: list[str]
+) -> None:
+    spec = cronjob.get("spec", {})
+    require(spec.get("schedule") == schedule, "CronJob schedule differs")
+    require(spec.get("suspend") is True, "CronJob must be suspended")
+    require(spec.get("concurrencyPolicy") == "Forbid", "CronJob concurrencyPolicy must be Forbid")
+    pod = _cron_spec(cronjob)
+    require(pod.get("restartPolicy") == "Never", "CronJob restartPolicy must be Never")
+    containers = pod.get("containers", [])
+    require(len(containers) == 1, "CronJob must have exactly one container")
+    require(containers[0].get("image") == "busybox:1.36.1", "CronJob image differs")
+    require(_combined_command(containers[0]) == expected_command, "CronJob command differs")
+
+
+def _easy1_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def r02() -> str:
+        deployment = kube.get("deployment", "status-web")
+        require(deployment.get("spec", {}).get("replicas") == 1, "status-web must have one replica")
+        require(pod_labels(deployment).get("app") == "status-web", "pod label app=status-web is missing")
+        container = _single_named_container(deployment, "web")
+        require(container.get("image") == "busybox:1.36.1", "web image differs")
+        expected = [
+            "sh",
+            "-c",
+            "mkdir -p /www && printf 'status=green\\n' > /www/index.html && httpd -f -p 8080 -h /www",
+        ]
+        require(_combined_command(container) == expected, "status-web command differs")
+        _assert_tcp_port(container, 8080, "http")
+        _assert_tcp_readiness(container, "http", 5, 3)
+        kube.rollout("deployment", "status-web", timeout_seconds=60)
+        return "status-web has the exact image, command, port, probe, label, and Ready replica"
+
+    def r03() -> str:
+        deployment = kube.get("deployment", "status-web")
+        spec = deployment.get("spec", {})
+        require(spec.get("strategy", {}).get("type") == "Recreate", "strategy must be Recreate")
+        require(spec.get("revisionHistoryLimit") == 1, "revisionHistoryLimit must be 1")
+        return "status-web uses Recreate with revisionHistoryLimit 1"
+
+    def r04() -> str:
+        service = kube.get("service", "status-svc")
+        spec = service.get("spec", {})
+        require(spec.get("type", "ClusterIP") == "ClusterIP", "status-svc is not ClusterIP")
+        require(spec.get("selector") == {"app": "status-web"}, "status-svc selector differs")
+        port = _service_port(service, 80)
+        require(port.get("protocol", "TCP") == "TCP", "status-svc port is not TCP")
+        require(_resolved_target_port(port, kube.get("deployment", "status-web")) == "8080", "targetPort does not resolve to 8080")
+        cluster_ip = spec.get("clusterIP")
+        require(cluster_ip not in {None, "", "None"}, "status-svc has no ClusterIP")
+        probe = _assert_exact_body_probe(
+            kube,
+            "aipc-eval-status-allowed",
+            f"http://{cluster_ip}:80/",
+            "status=green",
+            13,
+            labels={"access": "status"},
+        )
+        return f"status-svc returns the exact body to the approved client; {probe}"
+
+    def r05() -> str:
+        policy = kube.get("networkpolicy", "status-ingress")
+        spec = policy.get("spec", {})
+        require(spec.get("podSelector", {}).get("matchLabels") == {"app": "status-web"}, "policy selector differs")
+        require(set(spec.get("policyTypes", ["Ingress"])) == {"Ingress"}, "policyTypes must contain only Ingress")
+        ingress = spec.get("ingress", [])
+        require(len(ingress) == 1, "status-ingress must have exactly one ingress rule")
+        peers = ingress[0].get("from", [])
+        require(len(peers) == 1, "status-ingress must have exactly one ingress peer")
+        require(peers[0] == {"podSelector": {"matchLabels": {"access": "status"}}}, "ingress peer must be the same-namespace access=status selector")
+        require(_network_policy_rule_has_exact_ports(ingress[0], {("TCP", "8080")}), "ingress port allowance differs")
+        service = kube.get("service", "status-svc")
+        cluster_ip = service.get("spec", {}).get("clusterIP")
+        allowed = kube.run_probe_pod(
+            "aipc-eval-policy-allowed",
+            f"wget -q -T 5 -O /dev/null http://{cluster_ip}:80/",
+            labels={"access": "status"},
+            timeout_seconds=35,
+        )
+        denied = kube.run_probe_pod(
+            "aipc-eval-policy-denied",
+            f"wget -q -T 5 -O /dev/null http://{cluster_ip}:80/",
+            labels={"access": "other"},
+            expect_success=False,
+            timeout_seconds=35,
+        )
+        return f"approved ingress succeeds and unapproved ingress fails; {allowed}; {denied}"
+
+    def r06() -> str:
+        _assert_cronjob(
+            kube.get("cronjob", "diagnostics-report"),
+            "0 * * * *",
+            ["sh", "-c", "echo diagnostics-ready"],
+        )
+        return "diagnostics-report is the exact suspended hourly CronJob"
+
+    return [
+        ("R01", "isolated easy-status namespace", lambda: _check_namespace(kube, "easy-status-ns", _require_candidate_path(candidate_path))),
+        ("R02", "status Deployment and readiness", r02),
+        ("R03", "status Deployment strategy", r03),
+        ("R04", "exact status Service response", r04),
+        ("R05", "status ingress isolation", r05),
+        ("R06", "suspended diagnostics CronJob", r06),
+    ]
+
+
+def _easy2_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def r02() -> str:
+        config = kube.get("configmap", "calc-inputs")
+        require(config.get("data") == {"LEFT": "7", "RIGHT": "5"}, "calc-inputs data differs")
+        return "calc-inputs contains exactly LEFT=7 and RIGHT=5"
+
+    def r03() -> str:
+        secret = kube.get("secret", "calc-operation")
+        require(secret.get("type") == "Opaque", "calc-operation must be Opaque")
+        data = secret.get("data", {})
+        require(set(data) == {"OPERATION"}, "calc-operation must contain only OPERATION")
+        require(_decode_secret_value(data.get("OPERATION"), "OPERATION") == "add", "OPERATION differs")
+        return "calc-operation is the exact one-key Opaque Secret"
+
+    def r04() -> str:
+        job = kube.get("job", "sum-job")
+        spec = job.get("spec", {})
+        pod = spec.get("template", {}).get("spec", {})
+        require(pod.get("restartPolicy") == "Never", "sum-job restartPolicy must be Never")
+        containers = pod.get("containers", [])
+        require(len(containers) == 1, "sum-job must have exactly one container")
+        container = containers[0]
+        require(container.get("image") == "busybox:1.36.1", "sum-job image differs")
+        require(
+            _combined_command(container)
+            == [
+                "sh",
+                "-c",
+                'test "$OPERATION" = add && result=$((LEFT + RIGHT)) && echo result=$result && test "$result" -eq 12',
+            ],
+            "sum-job command differs",
+        )
+        require(_container_exposes_configmap_keys(container, "calc-inputs", {"LEFT", "RIGHT"}), "LEFT and RIGHT are not sourced from calc-inputs")
+        operation_env = [item for item in container.get("env", []) if item.get("name") == "OPERATION"]
+        require(len(operation_env) == 1, "sum-job must define OPERATION exactly once")
+        require(
+            operation_env[0].get("valueFrom", {}).get("secretKeyRef", {})
+            == {"name": "calc-operation", "key": "OPERATION"},
+            "OPERATION is not sourced through the required secretKeyRef",
+        )
+        require(
+            not any(item.get("secretRef", {}).get("name") == "calc-operation" for item in container.get("envFrom", [])),
+            "calc-operation must not be exposed through envFrom",
+        )
+        require(spec.get("backoffLimit") == 1, "backoffLimit must be 1")
+        require(spec.get("activeDeadlineSeconds") == 60, "activeDeadlineSeconds must be 60")
+        kube.wait_until(
+            lambda: kube.get("job", "sum-job").get("status", {}).get("succeeded", 0) == 1,
+            "sum-job to complete once",
+            60,
+            1,
+        )
+        pods = kube.list("pods", "job-name=sum-job")
+        require(len(pods) == 1, f"sum-job must have exactly one pod, found {len(pods)}")
+        pod_name = pods[0].get("metadata", {}).get("name", "")
+        logs = kube.run(["logs", pod_name, "-n", kube.namespace]).stdout
+        require(logs == "result=12\n", f"sum-job logs differ: {logs!r}")
+        return "sum-job uses the required projections, completes once, and logs exactly result=12"
+
+    def r05() -> str:
+        quota = kube.get("resourcequota", "batch-quota")
+        hard = quota.get("spec", {}).get("hard", {})
+        require(set(hard) == {"count/jobs.batch"}, "batch-quota contains missing or additional limits")
+        require(int_or_string(hard.get("count/jobs.batch")) == "2", "count/jobs.batch must be 2")
+        return "batch-quota limits batch/v1 Jobs to exactly two"
+
+    def r06() -> str:
+        spec = kube.get("job", "sum-job").get("spec", {})
+        require(spec.get("completions") == 1, "completions must be 1")
+        require(spec.get("parallelism") == 1, "parallelism must be 1")
+        require(spec.get("ttlSecondsAfterFinished") == 600, "ttlSecondsAfterFinished must be 600")
+        return "sum-job has the exact completion, parallelism, and TTL values"
+
+    return [
+        ("R01", "isolated easy-calc namespace", lambda: _check_namespace(kube, "easy-calc-ns", _require_candidate_path(candidate_path))),
+        ("R02", "exact calculation ConfigMap", r02),
+        ("R03", "exact operation Secret", r03),
+        ("R04", "calculation Job completion and output", r04),
+        ("R05", "batch Job quota", r05),
+        ("R06", "calculation Job lifecycle", r06),
+    ]
+
+
+def _easy3_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def r02() -> str:
+        config = kube.get("configmap", "audit-target")
+        require(config.get("data") == {"MODE": "read-only"}, "audit-target data differs")
+        return "audit-target contains exactly MODE=read-only"
+
+    def r03() -> str:
+        config = kube.get("configmap", "audit-target")
+        require(config.get("immutable") is True, "audit-target must be immutable")
+        return "audit-target is immutable"
+
+    def r04() -> str:
+        account = kube.get("serviceaccount", "audit-reader")
+        require(account.get("metadata", {}).get("name") == "audit-reader", "audit-reader is absent")
+        return "audit-reader ServiceAccount exists"
+
+    def r05() -> str:
+        role = kube.get("role", "audit-reader-role")
+        rules = role.get("rules", [])
+        require(len(rules) == 1, "audit-reader-role must contain exactly one rule")
+        rule = rules[0]
+        require(rule.get("apiGroups") == [""], "Role apiGroups must be exactly ['']")
+        require(rule.get("resources") == ["configmaps"], "Role resources must be exactly ['configmaps']")
+        require(rule.get("resourceNames") == ["audit-target"], "Role resourceNames must be exactly ['audit-target']")
+        require(rule.get("verbs") == ["get"], "Role verbs must be exactly ['get']")
+        return "audit-reader-role grants only get on ConfigMap audit-target"
+
+    def r06() -> str:
+        binding = kube.get("rolebinding", "audit-reader-binding")
+        subjects = binding.get("subjects", [])
+        require(
+            subjects
+            == [
+                {
+                    "kind": "ServiceAccount",
+                    "name": "audit-reader",
+                    "namespace": "easy-rbac-ns",
+                }
+            ],
+            "RoleBinding must contain only the audit-reader ServiceAccount subject",
+        )
+        role_ref = binding.get("roleRef", {})
+        require(
+            role_ref
+            == {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": "audit-reader-role",
+            },
+            "RoleBinding roleRef differs",
+        )
+        require(
+            kube.auth_can_i("audit-reader", "get", "configmap/audit-target"),
+            "audit-reader is not initially authorized",
+        )
+        restore = {
+            "apiVersion": binding.get("apiVersion", "rbac.authorization.k8s.io/v1"),
+            "kind": "RoleBinding",
+            "metadata": {
+                "name": "audit-reader-binding",
+                "namespace": "easy-rbac-ns",
+            },
+            "roleRef": role_ref,
+            "subjects": subjects,
+        }
+        kube.run(
+            [
+                "delete",
+                "rolebinding",
+                "audit-reader-binding",
+                "-n",
+                kube.namespace,
+                "--wait=true",
+            ]
+        )
+        try:
+            kube.wait_until(
+                lambda: not kube.auth_can_i("audit-reader", "get", "configmap/audit-target"),
+                "audit-reader authorization to become denied",
+                15,
+                1,
+            )
+        finally:
+            kube.run(
+                ["apply", "-f", "-"],
+                input_text=json.dumps(restore),
+            )
+        kube.wait_until(
+            lambda: kube.auth_can_i("audit-reader", "get", "configmap/audit-target"),
+            "audit-reader authorization to recover",
+            15,
+            1,
+        )
+        return "audit-reader authorization follows the required yes-no-yes transition"
+
+    return [
+        ("R01", "isolated easy-rbac namespace", lambda: _check_namespace(kube, "easy-rbac-ns", _require_candidate_path(candidate_path))),
+        ("R02", "exact RBAC target ConfigMap", r02),
+        ("R03", "immutable RBAC target", r03),
+        ("R04", "audit-reader ServiceAccount", r04),
+        ("R05", "single-object least-privilege Role", r05),
+        ("R06", "RoleBinding authorization loss and recovery", r06),
+    ]
+
+
+def _easy4_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def r02() -> str:
+        secret = kube.get("secret", "banner-secret")
+        require(secret.get("type") == "Opaque", "banner-secret must be Opaque")
+        data = secret.get("data", {})
+        require(set(data) == {"BANNER"}, "banner-secret must contain only BANNER")
+        require(_decode_secret_value(data.get("BANNER"), "BANNER") == "hello-restart", "BANNER differs")
+        return "banner-secret is the exact one-key Opaque Secret"
+
+    def r03() -> str:
+        require(kube.get("secret", "banner-secret").get("immutable") is True, "banner-secret must be immutable")
+        return "banner-secret is immutable"
+
+    def r04() -> str:
+        deployment = kube.get("deployment", "restart-web")
+        require(deployment.get("spec", {}).get("replicas") == 1, "restart-web must have one replica")
+        require(pod_labels(deployment).get("app") == "restart-web", "pod label app=restart-web is missing")
+        container = _single_named_container(deployment, "web")
+        require(container.get("image") == "busybox:1.36.1", "web image differs")
+        require(
+            _combined_command(container)
+            == [
+                "sh",
+                "-c",
+                "mkdir -p /work && printf 'ready\\n' > /work/index.html && httpd -f -p 8080 -h /work",
+            ],
+            "restart-web command differs",
+        )
+        banner_env = [item for item in container.get("env", []) if item.get("name") == "BANNER"]
+        require(len(banner_env) == 1, "restart-web must define BANNER exactly once")
+        require(
+            banner_env[0].get("valueFrom", {}).get("secretKeyRef", {})
+            == {"name": "banner-secret", "key": "BANNER"},
+            "BANNER is not sourced through the required secretKeyRef",
+        )
+        require(
+            not any(item.get("secretRef", {}).get("name") == "banner-secret" for item in container.get("envFrom", [])),
+            "banner-secret must not be exposed through envFrom",
+        )
+        _assert_tcp_port(container, 8080)
+        _assert_tcp_readiness(container, 8080, 5)
+        kube.rollout("deployment", "restart-web", timeout_seconds=60)
+        return "restart-web has the exact Secret projection, command, port, probe, and Ready replica"
+
+    def r05() -> str:
+        deployment = kube.get("deployment", "restart-web")
+        service = kube.get("service", "restart-svc")
+        spec = service.get("spec", {})
+        require(spec.get("type", "ClusterIP") == "ClusterIP", "restart-svc is not ClusterIP")
+        require(spec.get("selector") == {"app": "restart-web"}, "restart-svc selector differs")
+        port = _service_port(service, 8080)
+        require(port.get("protocol", "TCP") == "TCP", "restart-svc port is not TCP")
+        require(_resolved_target_port(port, deployment) == "8080", "restart-svc targetPort differs")
+        pods = kube.list("pods", "app=restart-web")
+        require(len(pods) == 1, f"expected one initial restart-web pod, found {len(pods)}")
+        original_name = pods[0].get("metadata", {}).get("name", "")
+        original_uid = pods[0].get("metadata", {}).get("uid", "")
+        require(bool(original_name and original_uid), "initial restart-web pod has no stable identity")
+        kube.run(["delete", "pod", original_name, "-n", kube.namespace, "--wait=true"])
+        replacement: dict[str, Any] = {}
+
+        def replacement_ready() -> bool:
+            nonlocal replacement
+            candidates = kube.list("pods", "app=restart-web")
+            for candidate in candidates:
+                uid = candidate.get("metadata", {}).get("uid")
+                ready = any(
+                    item.get("type") == "Ready" and item.get("status") == "True"
+                    for item in candidate.get("status", {}).get("conditions", [])
+                )
+                if uid and uid != original_uid and ready:
+                    replacement = candidate
+                    return True
+            return False
+
+        kube.wait_until(replacement_ready, "a distinct Ready restart-web replacement pod", 60, 1)
+        cluster_ip = spec.get("clusterIP")
+        require(cluster_ip not in {None, "", "None"}, "restart-svc has no ClusterIP")
+        probe = _assert_exact_body_probe(
+            kube,
+            "aipc-eval-restart-response",
+            f"http://{cluster_ip}:8080/",
+            "ready",
+            6,
+        )
+        uid = replacement.get("metadata", {}).get("uid")
+        return f"pod {original_uid} was replaced by {uid} and the exact Service response recovered; {probe}"
+
+    def r06() -> str:
+        quota = kube.get("resourcequota", "restart-quota")
+        hard = quota.get("spec", {}).get("hard", {})
+        require(set(hard) == {"pods", "services", "secrets"}, "restart-quota hard-limit keys differ")
+        expected = {"pods": "5", "services": "2", "secrets": "3"}
+        require({key: int_or_string(value) for key, value in hard.items()} == expected, "restart-quota values differ")
+        return "restart-quota has exactly the three requested hard limits"
+
+    return [
+        ("R01", "isolated easy-restart namespace", lambda: _check_namespace(kube, "easy-restart-ns", _require_candidate_path(candidate_path))),
+        ("R02", "exact banner Secret", r02),
+        ("R03", "immutable banner Secret", r03),
+        ("R04", "restart-web Deployment wiring", r04),
+        ("R05", "pod replacement and Service recovery", r05),
+        ("R06", "restart namespace quota", r06),
+    ]
+
+
+def _easy5_checks(
+    kube: Kubectl, candidate_path: Path | None = None
+) -> list[tuple[str, str, Callable[[], str | None]]]:
+    def r02() -> str:
+        config = kube.get("configmap", "diagnostics-content")
+        require(config.get("data") == {"index.html": "diagnostics-ready\n"}, "diagnostics-content data differs")
+        return "diagnostics-content contains the exact index.html body"
+
+    def r03() -> str:
+        deployment = kube.get("deployment", "diagnostics-web")
+        require(deployment.get("spec", {}).get("replicas") == 1, "diagnostics-web must have one replica")
+        require(pod_labels(deployment).get("app") == "diagnostics-web", "pod label app=diagnostics-web is missing")
+        container = _single_named_container(deployment, "web")
+        require(container.get("image") == "busybox:1.36.1", "web image differs")
+        require(_combined_command(container) == ["httpd", "-f", "-p", "8080", "-h", "/www"], "diagnostics-web command differs")
+        _assert_tcp_port(container, 8080, "http")
+        _assert_tcp_readiness(container, "http", 5)
+        spec = pod_spec(deployment)
+        mount = find_mount(container, "/www")
+        require(mount is not None, "diagnostics-content is not mounted at /www")
+        require(mount.get("readOnly") is True, "/www mount must be explicitly read-only")
+        volume = find_volume(spec, mount.get("name", ""))
+        require(volume is not None, "the /www volume does not exist")
+        require(volume.get("configMap", {}).get("name") == "diagnostics-content", "/www is not backed by diagnostics-content")
+        return "diagnostics-web has the exact ConfigMap mount, listener, port, and readiness probe"
+
+    def r04() -> str:
+        deployment = kube.get("deployment", "diagnostics-web")
+        spec = pod_spec(deployment)
+        pod_security = spec.get("securityContext", {})
+        require(pod_security.get("runAsNonRoot") is True, "runAsNonRoot must be true")
+        require(pod_security.get("runAsUser") == 1000, "runAsUser must be 1000")
+        container = _single_named_container(deployment, "web")
+        security = container.get("securityContext", {})
+        require(security.get("allowPrivilegeEscalation") is False, "allowPrivilegeEscalation must be false")
+        require(security.get("readOnlyRootFilesystem") is True, "readOnlyRootFilesystem must be true")
+        require(set(security.get("capabilities", {}).get("drop", [])) == {"ALL"}, "capabilities.drop must be exactly ALL")
+        return "diagnostics-web has every required pod and container hardening field"
+
+    def r05() -> str:
+        deployment = kube.get("deployment", "diagnostics-web")
+        service = kube.get("service", "diagnostics-svc")
+        spec = service.get("spec", {})
+        require(spec.get("type", "ClusterIP") == "ClusterIP", "diagnostics-svc is not ClusterIP")
+        require(spec.get("selector") == {"app": "diagnostics-web"}, "diagnostics-svc selector differs")
+        port = _service_port(service, 80)
+        require(port.get("protocol", "TCP") == "TCP", "diagnostics-svc port is not TCP")
+        require(_resolved_target_port(port, deployment) == "8080", "targetPort does not resolve to 8080")
+        kube.rollout("deployment", "diagnostics-web", timeout_seconds=60)
+        endpoints = kube.get("endpoints", "diagnostics-svc")
+        ready_addresses = [
+            address
+            for subset in endpoints.get("subsets", [])
+            for address in subset.get("addresses", [])
+        ]
+        require(bool(ready_addresses), "diagnostics-svc has no Ready endpoint")
+        cluster_ip = spec.get("clusterIP")
+        require(cluster_ip not in {None, "", "None"}, "diagnostics-svc has no ClusterIP")
+        probe = _assert_exact_body_probe(
+            kube,
+            "aipc-eval-diagnostics-response",
+            f"http://{cluster_ip}:80/",
+            "diagnostics-ready",
+            18,
+        )
+        return f"diagnostics-svc has a Ready endpoint and returns the exact body; {probe}"
+
+    def r06() -> str:
+        _assert_cronjob(
+            kube.get("cronjob", "diagnostics-check"),
+            "*/10 * * * *",
+            ["sh", "-c", "echo diagnostics-suspended"],
+        )
+        return "diagnostics-check is the exact suspended ten-minute CronJob"
+
+    return [
+        ("R01", "isolated easy-diagnostics namespace", lambda: _check_namespace(kube, "easy-diagnostics-ns", _require_candidate_path(candidate_path))),
+        ("R02", "exact diagnostics content", r02),
+        ("R03", "diagnostics Deployment wiring", r03),
+        ("R04", "diagnostics pod hardening", r04),
+        ("R05", "diagnostics endpoint and exact response", r05),
+        ("R06", "suspended diagnostics check", r06),
+    ]
+
+
 def _require_candidate_path(candidate_path: Path | None) -> Path:
     if candidate_path is None:
         raise EvaluationInfrastructureError(
@@ -1562,6 +2110,16 @@ def run_suite(
         checks = _task3_checks(kube, candidate_path)
     elif task_id == "pilot-004":
         checks = _task4_checks(kube, candidate_path)
+    elif task_id == "easy-001":
+        checks = _easy1_checks(kube, candidate_path)
+    elif task_id == "easy-002":
+        checks = _easy2_checks(kube, candidate_path)
+    elif task_id == "easy-003":
+        checks = _easy3_checks(kube, candidate_path)
+    elif task_id == "easy-004":
+        checks = _easy4_checks(kube, candidate_path)
+    elif task_id == "easy-005":
+        checks = _easy5_checks(kube, candidate_path)
     else:
         raise EvaluationError(f"unknown task id {task_id!r}")
     actual_ids = {requirement_id for requirement_id, _, _ in checks}

@@ -1,0 +1,8 @@
+A support team wants one service identity to have narrowly limited read access to a single immutable settings object.
+
+- Create a Namespace named `easy-rbac-ns`.
+- In namespace `easy-rbac-ns`, create a ConfigMap named `audit-target` containing exactly one key, `MODE`, with value `read-only`.
+- Set ConfigMap `audit-target` to `immutable: true`.
+- In namespace `easy-rbac-ns`, create a ServiceAccount named `audit-reader`.
+- In namespace `easy-rbac-ns`, create a Role named `audit-reader-role` containing exactly one rule: API group `""`, resource `configmaps`, resourceName `audit-target`, and verb `get`. It must grant no other resources, resource names, API groups, or verbs.
+- In namespace `easy-rbac-ns`, create a RoleBinding named `audit-reader-binding` that binds only ServiceAccount `audit-reader` to Role `audit-reader-role`. `kubectl auth can-i get configmap/audit-target --as=system:serviceaccount:easy-rbac-ns:audit-reader -n easy-rbac-ns` must return `yes`; after an evaluator temporarily deletes this RoleBinding it must return `no` within 15 seconds, and after the same RoleBinding is reapplied it must return `yes` again within 15 seconds.

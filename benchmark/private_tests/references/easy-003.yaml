@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: easy-rbac-ns
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: audit-target
+  namespace: easy-rbac-ns
+immutable: true
+data:
+  MODE: read-only
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: audit-reader
+  namespace: easy-rbac-ns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: audit-reader-role
+  namespace: easy-rbac-ns
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["audit-target"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: audit-reader-binding
+  namespace: easy-rbac-ns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: audit-reader-role
+subjects:
+  - kind: ServiceAccount
+    name: audit-reader
+    namespace: easy-rbac-ns

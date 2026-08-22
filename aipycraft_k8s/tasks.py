@@ -19,6 +19,11 @@ CANONICAL_TASK_NAMESPACES = {
     "pilot-002": "pipeline-ns",
     "pilot-003": "status-page",
     "pilot-004": "service-chain",
+    "easy-001": "easy-status-ns",
+    "easy-002": "easy-calc-ns",
+    "easy-003": "easy-rbac-ns",
+    "easy-004": "easy-restart-ns",
+    "easy-005": "easy-diagnostics-ns",
 }
 
 

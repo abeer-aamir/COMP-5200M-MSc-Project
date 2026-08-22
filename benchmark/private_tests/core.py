@@ -164,12 +164,14 @@ class Kubectl:
         *,
         check: bool = True,
         timeout: int | None = None,
+        input_text: str | None = None,
     ) -> CommandResult:
         command = [*self._base(), *args]
         result = self.runner.run(
             command,
             timeout=timeout or self.command_timeout,
             check=False,
+            input_text=input_text,
         )
         if self.journal_callback is not None:
             self.journal_callback(result)

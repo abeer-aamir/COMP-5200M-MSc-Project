@@ -1,0 +1,8 @@
+A reporting team wants a small one-shot calculation job whose inputs come from normal configuration and a protected operation setting.
+
+- Create a Namespace named `easy-calc-ns`.
+- In namespace `easy-calc-ns`, create a ConfigMap named `calc-inputs` containing exactly `LEFT=7` and `RIGHT=5`.
+- In namespace `easy-calc-ns`, create an Opaque Secret named `calc-operation` containing exactly one key, `OPERATION`, with value `add`.
+- In namespace `easy-calc-ns`, create a Job named `sum-job` with one pod using `busybox:1.36.1` and `restartPolicy: Never`. Set environment variables `LEFT` and `RIGHT` from the matching keys in `calc-inputs`, and set `OPERATION` from `calc-operation/OPERATION` using `secretKeyRef`. Run `sh -c "test \"$OPERATION\" = add && result=$((LEFT + RIGHT)) && echo result=$result && test \"$result\" -eq 12"`. Set `backoffLimit: 1` and `activeDeadlineSeconds: 60`; the Job must reach Complete within 60 seconds and its only pod must log exactly `result=12` followed by a newline.
+- In namespace `easy-calc-ns`, create a ResourceQuota named `batch-quota` whose hard limit `count/jobs.batch` is exactly `2`.
+- Configure `sum-job` with `completions: 1`, `parallelism: 1`, and `ttlSecondsAfterFinished: 600`.

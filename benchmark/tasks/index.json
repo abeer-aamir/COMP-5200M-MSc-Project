@@ -26,6 +26,36 @@
       "namespace": "service-chain",
       "description": "benchmark/tasks/pilot-004/description.txt",
       "post_execution_suite": "pilot-004"
+    },
+    {
+      "task_id": "easy-001",
+      "namespace": "easy-status-ns",
+      "description": "benchmark/tasks/easy-001/description.txt",
+      "post_execution_suite": "easy-001"
+    },
+    {
+      "task_id": "easy-002",
+      "namespace": "easy-calc-ns",
+      "description": "benchmark/tasks/easy-002/description.txt",
+      "post_execution_suite": "easy-002"
+    },
+    {
+      "task_id": "easy-003",
+      "namespace": "easy-rbac-ns",
+      "description": "benchmark/tasks/easy-003/description.txt",
+      "post_execution_suite": "easy-003"
+    },
+    {
+      "task_id": "easy-004",
+      "namespace": "easy-restart-ns",
+      "description": "benchmark/tasks/easy-004/description.txt",
+      "post_execution_suite": "easy-004"
+    },
+    {
+      "task_id": "easy-005",
+      "namespace": "easy-diagnostics-ns",
+      "description": "benchmark/tasks/easy-005/description.txt",
+      "post_execution_suite": "easy-005"
     }
   ]
 }
