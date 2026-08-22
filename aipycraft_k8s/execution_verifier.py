@@ -99,33 +99,65 @@ def _ready_pod(pods: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
-def _target_container_and_port(
+def _target_containers_and_port(
     pod: dict[str, Any], target_port: Any
-) -> tuple[str | None, int | None]:
+) -> tuple[list[str], int | None]:
+    """Resolve a Service target and order containers suitable for inspection.
+
+    All regular containers in a Pod share its network namespace.  Prefer the
+    container that declares the target, but retain the others as fallbacks so a
+    shell-less/distroless primary container does not make an otherwise
+    inspectable Pod look broken.
+    """
+
     containers = pod.get("spec", {}).get("containers", []) or []
+    names = [
+        str(container.get("name"))
+        for container in containers
+        if isinstance(container, dict) and container.get("name")
+    ]
     if isinstance(target_port, bool):
-        return None, None
+        return [], None
+    preferred: str | None = None
     if isinstance(target_port, int):
-        container_name = next(
+        preferred = next(
             (
                 str(container.get("name"))
                 for container in containers
+                if isinstance(container, dict)
                 if any(
                     port.get("containerPort") == target_port
                     for port in container.get("ports", []) or []
+                    if isinstance(port, dict)
                 )
             ),
-            str(containers[0].get("name")) if containers else None,
+            None,
         )
-        return container_name, target_port
-    if isinstance(target_port, str):
+        resolved = target_port
+    elif isinstance(target_port, str):
+        resolved = None
         for container in containers:
+            if not isinstance(container, dict):
+                continue
             for port in container.get("ports", []) or []:
+                if not isinstance(port, dict):
+                    continue
                 if port.get("name") == target_port:
                     value = port.get("containerPort")
                     if isinstance(value, int) and not isinstance(value, bool):
-                        return str(container.get("name")), value
-    return None, None
+                        preferred = str(container.get("name"))
+                        resolved = value
+                        break
+            if resolved is not None:
+                break
+    else:
+        return [], None
+    if resolved is None:
+        return [], None
+    ordered = ([preferred] if preferred else []) + [
+        name for name in names if name != preferred
+    ]
+    return ordered, resolved
 
 
 def _condition_true(value: dict[str, Any], *types: str) -> dict[str, Any] | None:
@@ -210,6 +242,35 @@ def _job_state(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "state": state,
         "condition": condition,
+        "status": status,
+    }
+
+
+def _standalone_pod_state(item: dict[str, Any]) -> dict[str, Any]:
+    status = item.get("status", {}) or {}
+    phase = status.get("phase")
+    ready = next(
+        (
+            condition.get("status")
+            for condition in status.get("conditions", []) or []
+            if isinstance(condition, dict) and condition.get("type") == "Ready"
+        ),
+        None,
+    )
+    if phase == "Succeeded" or (phase == "Running" and ready == "True"):
+        state = "ready"
+        reason = None
+    elif phase == "Failed":
+        state = "failed"
+        reason = status.get("reason") or "pod_entered_failed_phase"
+    else:
+        state = "pending"
+        reason = status.get("reason") or "waiting_for_ready_or_succeeded"
+    return {
+        "state": state,
+        "reason": reason,
+        "phase": phase,
+        "ready": ready,
         "status": status,
     }
 
@@ -659,12 +720,75 @@ def _failed_command_attribution(
 
 
 def _repair_feedback(report: dict[str, Any]) -> dict[str, Any]:
+    def compact_command(value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        compact = {
+            key: value.get(key)
+            for key in (
+                "argv",
+                "returncode",
+                "duration_ms",
+                "timeout_seconds",
+                "deadline_overrun",
+                "host_pause_suspected",
+            )
+            if value.get(key) is not None
+        }
+        for stream in ("stdout", "stderr"):
+            text = value.get(stream)
+            if isinstance(text, str) and text:
+                compact[stream] = text[:4096]
+                if len(text) > 4096:
+                    compact[f"{stream}_truncated"] = True
+        return compact
+
     def compact_finding(finding: dict[str, Any]) -> dict[str, Any]:
         compact = {
             key: finding.get(key)
-            for key in ("type", "resource", "reason", "state", "message")
+            for key in (
+                "type",
+                "resource",
+                "reason",
+                "state",
+                "message",
+                "job",
+                "probe_job",
+                "pod",
+                "container",
+                "target_port",
+                "phase",
+                "ready",
+                "ready_addresses",
+                "not_ready_addresses",
+                "selected_workloads",
+                "likely_downstream_of",
+                "observed",
+                "limit",
+                "counts",
+            )
             if finding.get(key) is not None
         }
+        if finding.get("diagnostic") is not None:
+            compact["diagnostic"] = compact_command(finding["diagnostic"])
+        attribution = finding.get("failure_attribution")
+        if isinstance(attribution, dict):
+            compact["failure_attribution"] = {
+                key: (
+                    compact_command(attribution.get(key))
+                    if key in {"failed_command", "api_readiness", "candidate_namespace"}
+                    else attribution.get(key)
+                )
+                for key in (
+                    "status",
+                    "basis",
+                    "namespace_phase",
+                    "failed_command",
+                    "api_readiness",
+                    "candidate_namespace",
+                )
+                if attribution.get(key) is not None
+            }
         diagnostics = finding.get("pod_diagnostics", {}) or {}
         representative_pods = []
         for pod in (diagnostics.get("pods", []) or [])[:2]:
@@ -741,6 +865,60 @@ def _repair_feedback(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _cleanup_probe_jobs(
+    env: AttemptEnvironment,
+    namespace: str,
+    probe_jobs: dict[str, dict[str, Any]],
+    report: dict[str, Any],
+    *,
+    command_timeout: int,
+) -> bool:
+    """Best-effort, fully audited cleanup for temporary CronJob probes."""
+
+    succeeded = True
+    already_recorded = {
+        item.get("resource")
+        for item in report.get("probe_cleanup", [])
+        if isinstance(item, dict)
+    }
+    for job_name in probe_jobs:
+        resource = f"job/{job_name}"
+        if resource in already_recorded:
+            continue
+        job_succeeded = True
+        try:
+            deleted = env.kubectl(
+                [
+                    "delete",
+                    "job",
+                    job_name,
+                    "-n",
+                    namespace,
+                    "--ignore-not-found=true",
+                    "--wait=false",
+                ],
+                check=False,
+                timeout=command_timeout,
+            )
+            cleanup = {"resource": resource, **_command_detail(deleted)}
+            if deleted.returncode != 0:
+                job_succeeded = False
+                succeeded = False
+        except Exception as exc:
+            job_succeeded = False
+            succeeded = False
+            cleanup = {
+                "resource": resource,
+                "exception": f"{type(exc).__name__}: {exc}",
+            }
+        report.setdefault("probe_cleanup", []).append(cleanup)
+        if not job_succeeded:
+            report.setdefault("warnings", []).append(
+                f"Could not request deletion of execution probe {resource}"
+            )
+    return succeeded
+
+
 def run_execution_gate(
     task: BenchmarkTask,
     env: AttemptEnvironment,
@@ -749,10 +927,10 @@ def run_execution_gate(
 ) -> dict[str, Any]:
     """Run bounded, task-agnostic operational checks after deployment.
 
-    Jobs and workloads share one deadline.  A terminal Job failure ends the
-    readiness wait immediately, after which the gate snapshots every unresolved
-    resource and captures logs/events before probe cleanup.  Hidden requirement
-    data is never available to this function.
+    Jobs, controller workloads, and standalone Pods share one deadline.  A
+    terminal failure ends the readiness wait immediately, after which the gate
+    snapshots every unresolved resource and captures logs/events before probe
+    cleanup.  Hidden requirement data is never available to this function.
     """
 
     gate_started = time.monotonic()
@@ -864,6 +1042,13 @@ def run_execution_gate(
         services = _resource_items(
             env, "services", task.namespace, timeout=diagnostic_timeout
         )
+        standalone_pods = [
+            item
+            for item in _resource_items(
+                env, "pods", task.namespace, timeout=diagnostic_timeout
+            )
+            if not item.get("metadata", {}).get("ownerReferences")
+        ]
         report["resource_counts"] = {
             "direct_jobs": len(direct_jobs),
             "cronjobs": len(cronjobs),
@@ -872,12 +1057,14 @@ def run_execution_gate(
                 for resource, items in workloads.items()
             },
             "services": len(services),
+            "standalone_pods": len(standalone_pods),
         }
         monitored_count = (
             len(direct_jobs)
             + len(cronjobs)
             + sum(len(items) for items in workloads.values())
             + len(services)
+            + len(standalone_pods)
         )
         # Prevent a generated fan-out from multiplying evaluator time or
         # diagnostic volume.  This cap is intentionally far above every task.
@@ -966,23 +1153,13 @@ def run_execution_gate(
         if report["status"] == "infrastructure_error":
             # A prior CronJob may already have produced a probe Job. Request
             # bounded, non-blocking cleanup before returning inconclusive.
-            for job_name in probe_jobs:
-                deleted = env.kubectl(
-                    [
-                        "delete",
-                        "job",
-                        job_name,
-                        "-n",
-                        task.namespace,
-                        "--ignore-not-found=true",
-                        "--wait=false",
-                    ],
-                    check=False,
-                    timeout=diagnostic_timeout,
-                )
-                report["probe_cleanup"].append(
-                    {"resource": f"job/{job_name}", **_command_detail(deleted)}
-                )
+            _cleanup_probe_jobs(
+                env,
+                task.namespace,
+                probe_jobs,
+                report,
+                command_timeout=diagnostic_timeout,
+            )
             report["duration_ms"] = round(
                 (time.monotonic() - gate_started) * 1000
             )
@@ -1029,12 +1206,30 @@ def run_execution_gate(
                     "check": check,
                 }
 
+        monitored_pods: dict[str, dict[str, Any]] = {}
+        for pod in standalone_pods:
+            name = _name(pod)
+            check = {
+                "type": "standalone_pod_execution",
+                "resource": f"pod/{name}",
+                "outcome": "pending",
+            }
+            report["checks"].append(check)
+            monitored_pods[name] = {
+                "name": name,
+                "resource": f"pod/{name}",
+                "last_object": pod,
+                "state": _standalone_pod_state(pod),
+                "history": [],
+                "check": check,
+            }
+
         poll_started = time.monotonic()
         deadline = poll_started + command_timeout
         definitive_failure = bool(report["failures"])
         timed_out = False
 
-        while monitored_jobs or monitored_workloads:
+        while monitored_jobs or monitored_workloads or monitored_pods:
             elapsed_ms = round((time.monotonic() - poll_started) * 1000)
             remaining = deadline - time.monotonic()
             poll_timeout = max(min(round(remaining) + 2, diagnostic_timeout), 5)
@@ -1060,6 +1255,16 @@ def run_execution_gate(
                     )
                 }
                 if monitored_jobs
+                else {}
+            )
+            current_pods = (
+                {
+                    _name(item): item
+                    for item in _resource_items(
+                        env, "pods", task.namespace, timeout=poll_timeout
+                    )
+                }
+                if monitored_pods
                 else {}
             )
 
@@ -1119,12 +1324,43 @@ def run_execution_gate(
                 if state.get("state") == "failed":
                     definitive_failure = True
 
+            for name, record in monitored_pods.items():
+                item = current_pods.get(name)
+                state = (
+                    {
+                        "state": "failed",
+                        "reason": "standalone_pod_disappeared_after_deployment",
+                        "phase": None,
+                        "ready": None,
+                    }
+                    if item is None
+                    else _standalone_pod_state(item)
+                )
+                if item is not None:
+                    record["last_object"] = item
+                if state.get("state") != record["state"].get("state"):
+                    record["history"].append(
+                        {
+                            "elapsed_ms": elapsed_ms,
+                            "state": state.get("state"),
+                            "reason": state.get("reason"),
+                            "phase": state.get("phase"),
+                            "ready": state.get("ready"),
+                        }
+                    )
+                record["state"] = state
+                if state.get("state") == "failed":
+                    definitive_failure = True
+
             all_resolved = all(
                 record["state"].get("state") in {"ready", "failed"}
                 for record in monitored_workloads.values()
             ) and all(
                 record["state"].get("state") in {"succeeded", "failed"}
                 for record in monitored_jobs.values()
+            ) and all(
+                record["state"].get("state") in {"ready", "failed"}
+                for record in monitored_pods.values()
             )
             if definitive_failure or all_resolved:
                 break
@@ -1242,37 +1478,58 @@ def run_execution_gate(
                     }
                 )
 
+        for record in monitored_pods.values():
+            state_name = record["state"].get("state")
+            record["check"]["outcome"] = state_name
+            record["check"]["state"] = record["state"]
+            record["check"]["history"] = record["history"]
+            if state_name == "ready":
+                continue
+            finding = {
+                "resource": record["resource"],
+                "state": record["state"],
+                "history": record["history"],
+                "phase": record["state"].get("phase"),
+                "ready": record["state"].get("ready"),
+                "pod_diagnostics": _pod_execution_diagnostics(
+                    env,
+                    task.namespace,
+                    [record["last_object"]],
+                    command_timeout=diagnostic_timeout,
+                ),
+            }
+            if state_name == "failed" or timed_out:
+                report["failures"].append(
+                    {
+                        "type": "standalone_pod_not_operational",
+                        **finding,
+                        "reason": (
+                            record["state"].get("reason")
+                            if state_name == "failed"
+                            else "shared_operational_deadline_reached"
+                        ),
+                    }
+                )
+            else:
+                report["correlated_observations"].append(
+                    {
+                        "type": "standalone_pod_pending_when_other_failure_became_definitive",
+                        **finding,
+                    }
+                )
+
         # Capture evidence above before deleting probe Jobs.  Non-blocking
         # deletion avoids adding another per-probe timeout to a disposable cluster.
-        for job_name in probe_jobs:
-            deleted = env.kubectl(
-                [
-                    "delete",
-                    "job",
-                    job_name,
-                    "-n",
-                    task.namespace,
-                    "--ignore-not-found=true",
-                    "--wait=false",
-                ],
-                check=False,
-                timeout=diagnostic_timeout,
-            )
-            cleanup = {
-                "resource": f"job/{job_name}",
-                **_command_detail(deleted),
-            }
-            report["probe_cleanup"].append(cleanup)
-            if deleted.returncode != 0:
-                report.setdefault("warnings", []).append(
-                    f"Could not request deletion of execution probe job/{job_name}"
-                )
-                if not report["failures"]:
-                    report["status"] = "infrastructure_error"
-                    report["error"] = (
-                        f"Could not remove execution-gate probe job {job_name}: "
-                        f"{deleted.stderr.strip() or deleted.stdout.strip()}"
-                    )
+        cleanup_succeeded = _cleanup_probe_jobs(
+            env,
+            task.namespace,
+            probe_jobs,
+            report,
+            command_timeout=diagnostic_timeout,
+        )
+        if not cleanup_succeeded and not report["failures"]:
+            report["status"] = "infrastructure_error"
+            report["error"] = "Could not remove one or more execution-gate probe Jobs"
 
         if report["status"] == "infrastructure_error":
             report["duration_ms"] = round((time.monotonic() - gate_started) * 1000)
@@ -1300,15 +1557,18 @@ def run_execution_gate(
             )
             related_workloads = []
             for record in monitored_workloads.values():
-                workload_selector = (
+                pod_template_labels = (
                     record["last_object"].get("spec", {})
-                    .get("selector", {})
-                    .get("matchLabels", {})
+                    .get("template", {})
+                    .get("metadata", {})
+                    .get("labels", {})
                 )
                 if (
-                    isinstance(workload_selector, dict)
-                    and workload_selector
-                    and all(selector.get(k) == v for k, v in workload_selector.items())
+                    isinstance(pod_template_labels, dict)
+                    and all(
+                        pod_template_labels.get(key) == value
+                        for key, value in selector.items()
+                    )
                 ):
                     related_workloads.append(record["resource"])
             check = {
@@ -1377,8 +1637,8 @@ def run_execution_gate(
                     )
                     continue
                 target = port_spec.get("targetPort", port_spec.get("port"))
-                container_name, target_number = _target_container_and_port(pod, target)
-                if container_name is None or target_number is None:
+                container_names, target_number = _target_containers_and_port(pod, target)
+                if not container_names or target_number is None:
                     report["failures"].append(
                         {
                             "type": "service_target_port_unresolved",
@@ -1388,39 +1648,61 @@ def run_execution_gate(
                         }
                     )
                     continue
-                connected = env.kubectl(
-                    [
-                        "exec",
-                        "-n",
-                        task.namespace,
-                        pod_name,
-                        "-c",
-                        container_name,
-                        "--",
-                        "sh",
-                        "-ec",
-                        (
-                            f"port=$(printf '%04X' {target_number}); "
-                            "awk -v p=\":$port\" "
-                            "'$2 ~ (p \"$\") && $4 == \"0A\" "
-                            "{found=1} END {exit !found}' "
-                            "/proc/net/tcp /proc/net/tcp6"
-                        ),
-                    ],
-                    check=False,
-                    timeout=diagnostic_timeout,
-                )
-                report["checks"].append(
-                    {
-                        "type": "service_target_port",
-                        "resource": f"service/{service_name}",
-                        "pod": pod_name,
-                        "container": container_name,
-                        "target_port": target_number,
-                        "command": _command_detail(connected),
-                    }
-                )
-                if connected.returncode != 0:
+                check = {
+                    "type": "service_target_port",
+                    "resource": f"service/{service_name}",
+                    "pod": pod_name,
+                    "target_port": target_number,
+                    "probe_attempts": [],
+                }
+                report["checks"].append(check)
+                inspected = False
+                for container_name in container_names:
+                    connected = env.kubectl(
+                        [
+                            "exec",
+                            "-n",
+                            task.namespace,
+                            pod_name,
+                            "-c",
+                            container_name,
+                            "--",
+                            "sh",
+                            "-c",
+                            (
+                                f"port=$(printf '%04X' {target_number}) || exit $?; "
+                                "files=/proc/net/tcp; "
+                                "[ ! -r /proc/net/tcp6 ] || files=\"$files /proc/net/tcp6\"; "
+                                "awk -v p=\":$port\" "
+                                "'$2 ~ (p \"$\") && $4 == \"0A\" "
+                                "{found=1} END {exit !found}' $files; rc=$?; "
+                                "if [ \"$rc\" -eq 0 ]; then "
+                                "printf '__AIPC_TARGET_LISTENING__\\n'; exit 0; fi; "
+                                "if [ \"$rc\" -eq 1 ]; then "
+                                "printf '__AIPC_TARGET_NOT_LISTENING__\\n'; exit 42; fi; "
+                                "exit \"$rc\""
+                            ),
+                        ],
+                        check=False,
+                        timeout=diagnostic_timeout,
+                    )
+                    detail = _command_detail(connected)
+                    attempt = {"container": container_name, "command": detail}
+                    check["probe_attempts"].append(attempt)
+                    combined_output = f"{connected.stdout}\n{connected.stderr}"
+                    if (
+                        connected.returncode == 0
+                        and "__AIPC_TARGET_LISTENING__" in combined_output
+                    ):
+                        check["container"] = container_name
+                        check["status"] = "listening"
+                        inspected = True
+                        break
+                    if connected.returncode == 0:
+                        attempt["inspection_error"] = (
+                            "socket probe exited successfully without its result marker"
+                        )
+                        continue
                     attribution = _failed_command_attribution(
                         env,
                         task.namespace,
@@ -1428,8 +1710,15 @@ def run_execution_gate(
                         command_timeout=diagnostic_timeout,
                         allow_remote_exit=True,
                     )
-                    report["checks"][-1]["failure_attribution"] = attribution
-                    if attribution["status"] == "candidate":
+                    attempt["failure_attribution"] = attribution
+                    check["failure_attribution"] = attribution
+                    if (
+                        "__AIPC_TARGET_NOT_LISTENING__" in combined_output
+                        and attribution["status"] == "candidate"
+                    ):
+                        check["container"] = container_name
+                        check["status"] = "not_listening"
+                        check["failure_attribution"] = attribution
                         report["failures"].append(
                             {
                                 "type": "service_target_not_listening",
@@ -1441,71 +1730,61 @@ def run_execution_gate(
                                 "failure_attribution": attribution,
                             }
                         )
-                        continue
-                    report["status"] = "infrastructure_error"
-                    report["error"] = (
-                        "Could not reliably inspect the listening target for "
-                        f"service/{service_name}: "
-                        f"{connected.stderr.strip() or connected.stdout.strip()}"
-                    )
-                    report["duration_ms"] = round(
-                        (time.monotonic() - gate_started) * 1000
-                    )
-                    return report
-
-        for pod in _resource_items(
-            env, "pods", task.namespace, timeout=diagnostic_timeout
-        ):
-            metadata = pod.get("metadata", {})
-            if metadata.get("ownerReferences"):
-                continue
-            pod_name = _name(pod)
-            phase = pod.get("status", {}).get("phase")
-            ready_condition = next(
-                (
-                    condition.get("status")
-                    for condition in pod.get("status", {}).get("conditions", []) or []
-                    if condition.get("type") == "Ready"
-                ),
-                None,
-            )
-            passed = phase == "Succeeded" or (
-                phase == "Running" and ready_condition == "True"
-            )
-            report["checks"].append(
-                {
-                    "type": "standalone_pod_execution",
-                    "resource": f"pod/{pod_name}",
-                    "phase": phase,
-                    "ready": ready_condition,
-                }
-            )
-            if not passed:
-                report["failures"].append(
-                    {
-                        "type": "standalone_pod_not_operational",
-                        "resource": f"pod/{pod_name}",
-                        "phase": phase,
-                        "ready": ready_condition,
-                        "pod_diagnostics": _pod_execution_diagnostics(
-                            env,
-                            task.namespace,
-                            [pod],
-                            command_timeout=diagnostic_timeout,
-                        ),
-                    }
+                        inspected = True
+                        break
+                if inspected:
+                    continue
+                check["status"] = "inspection_inconclusive"
+                report["status"] = "infrastructure_error"
+                report["error"] = (
+                    "Could not reliably inspect the listening target for "
+                    f"service/{service_name}; none of the selected Pod's "
+                    "containers supported the read-only socket probe"
                 )
+                report["duration_ms"] = round(
+                    (time.monotonic() - gate_started) * 1000
+                )
+                return report
     except Exception as exc:
         report["gate_exception"] = f"{type(exc).__name__}: {exc}"
-        confirmation = env.readyz()
+        _cleanup_probe_jobs(
+            env,
+            task.namespace,
+            probe_jobs,
+            report,
+            command_timeout=diagnostic_timeout,
+        )
+        try:
+            confirmation = env.readyz()
+        except Exception as confirmation_exc:
+            report["status"] = "infrastructure_error"
+            report["error"] = report["gate_exception"]
+            report["api_readiness_confirmation_error"] = (
+                f"{type(confirmation_exc).__name__}: {confirmation_exc}"
+            )
+            report["duration_ms"] = round(
+                (time.monotonic() - gate_started) * 1000
+            )
+            return report
         report["api_readiness_after_gate_exception"] = _command_detail(
             confirmation
         )
-        namespace_after = env.kubectl(
-            ["get", "namespace", task.namespace, "-o", "json"],
-            check=False,
-            timeout=diagnostic_timeout,
-        )
+        try:
+            namespace_after = env.kubectl(
+                ["get", "namespace", task.namespace, "-o", "json"],
+                check=False,
+                timeout=diagnostic_timeout,
+            )
+        except Exception as namespace_exc:
+            report["status"] = "infrastructure_error"
+            report["error"] = report["gate_exception"]
+            report["namespace_confirmation_error"] = (
+                f"{type(namespace_exc).__name__}: {namespace_exc}"
+            )
+            report["duration_ms"] = round(
+                (time.monotonic() - gate_started) * 1000
+            )
+            return report
         report["namespace_after_gate_exception"] = _command_detail(namespace_after)
         namespace_detail = (
             f"{namespace_after.stdout}\n{namespace_after.stderr}"
