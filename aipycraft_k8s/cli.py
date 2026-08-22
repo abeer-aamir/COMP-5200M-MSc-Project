@@ -178,7 +178,8 @@ def _plan(config: Any) -> dict[str, Any]:
         "generic_execution_gate": {
             "timing": "after apply and initial runtime observation",
             "wait_strategy": (
-                "failed-aware polling for Jobs and controllers under one shared "
+                "failed-aware polling for Jobs, controllers, and standalone "
+                "Pods under one shared "
                 "deadline; terminal failure stops the wait immediately"
             ),
             "checks": [
