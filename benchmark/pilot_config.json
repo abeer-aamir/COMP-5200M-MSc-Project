@@ -2,8 +2,9 @@
   "api_base": "https://openrouter.ai/api/v1",
   "budget_usd": null,
   "task_count": 2,
-  "max_task_count": 3,
+  "max_task_count": 15,
   "max_revision_rounds": 1,
+  "default_difficulty": "hard",
   "target_kubernetes_version": "1.35",
   "kind_node_image": "kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f",
   "reservation_safety_multiplier": 1.25,
@@ -39,13 +40,48 @@
       "prompt": "benchmark/prompts/critic.txt"
     }
   },
-  "hardness_gate": {
-    "minimum_score": 8,
-    "minimum_categories": 5,
-    "minimum_public_requirements": 12,
-    "minimum_resource_kinds": 6,
-    "minimum_runtime_behaviors": 3,
-    "minimum_dependency_edges": 5,
-    "minimum_safety_constraints": 3
+  "difficulty_contracts": {
+    "easy": {
+      "minimum_score": 1,
+      "maximum_score": 4,
+      "minimum_categories": 3,
+      "minimum_public_requirements": 6,
+      "maximum_public_requirements": 8,
+      "minimum_resource_kinds": 4,
+      "maximum_resource_kinds": 5,
+      "minimum_dependency_edges": 1,
+      "maximum_dependency_edges": 2,
+      "runtime_behaviors": 1,
+      "safety_constraints": 1,
+      "minimum_interacting_mechanisms": 1
+    },
+    "medium": {
+      "minimum_score": 5,
+      "maximum_score": 7,
+      "minimum_categories": 4,
+      "minimum_public_requirements": 9,
+      "maximum_public_requirements": 11,
+      "minimum_resource_kinds": 5,
+      "maximum_resource_kinds": 7,
+      "minimum_dependency_edges": 3,
+      "maximum_dependency_edges": 5,
+      "runtime_behaviors": 2,
+      "safety_constraints": 2,
+      "minimum_interacting_mechanisms": 2
+    },
+    "hard": {
+      "minimum_score": 8,
+      "maximum_score": 10,
+      "minimum_categories": 5,
+      "minimum_public_requirements": 12,
+      "maximum_public_requirements": 14,
+      "minimum_resource_kinds": 7,
+      "maximum_resource_kinds": 10,
+      "minimum_dependency_edges": 6,
+      "maximum_dependency_edges": null,
+      "runtime_behaviors": 3,
+      "safety_constraints": 3,
+      "minimum_interacting_mechanisms": 3
+    }
   }
 }

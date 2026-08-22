@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "benchmark" / "pilot_config.json"
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 REQUIRED_ROLES = ("spec_generator", "plaintext_writer", "critic")
+DIFFICULTY_LEVELS = ("easy", "medium", "hard")
 
 
 class ConfigError(ValueError):
@@ -33,6 +34,38 @@ class RoleConfig:
 
 
 @dataclass(frozen=True)
+class DifficultyContract:
+    level: str
+    minimum_score: int
+    maximum_score: int
+    minimum_categories: int
+    minimum_public_requirements: int
+    maximum_public_requirements: int
+    minimum_resource_kinds: int
+    maximum_resource_kinds: int
+    minimum_dependency_edges: int
+    maximum_dependency_edges: int | None
+    runtime_behaviors: int
+    safety_constraints: int
+    minimum_interacting_mechanisms: int
+
+    def prompt_view(self) -> dict[str, int | None | str]:
+        """Return structural controls without exposing the critic score gate."""
+        return {
+            "difficulty_level": self.level,
+            "minimum_public_requirements": self.minimum_public_requirements,
+            "maximum_public_requirements": self.maximum_public_requirements,
+            "minimum_resource_kinds": self.minimum_resource_kinds,
+            "maximum_resource_kinds": self.maximum_resource_kinds,
+            "minimum_dependency_edges": self.minimum_dependency_edges,
+            "maximum_dependency_edges": self.maximum_dependency_edges,
+            "runtime_behaviors": self.runtime_behaviors,
+            "safety_constraints": self.safety_constraints,
+            "minimum_interacting_mechanisms": self.minimum_interacting_mechanisms,
+        }
+
+
+@dataclass(frozen=True)
 class PilotConfig:
     path: Path
     api_base: str
@@ -44,7 +77,8 @@ class PilotConfig:
     kind_node_image: str
     reservation_safety_multiplier: Decimal
     roles: dict[str, RoleConfig]
-    hardness_gate: dict[str, int]
+    default_difficulty: str
+    difficulty_contracts: dict[str, DifficultyContract]
 
 
 def _decimal(value: Any, label: str) -> Decimal:
@@ -68,8 +102,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
 
     task_count = int(raw.get("task_count", 0))
     max_task_count = int(raw.get("max_task_count", 0))
-    if not 1 <= task_count <= max_task_count <= 3:
-        raise ConfigError("Require 1 <= task_count <= max_task_count <= 3")
+    if not 1 <= task_count <= max_task_count <= 15:
+        raise ConfigError("Require 1 <= task_count <= max_task_count <= 15")
 
     revision_rounds = int(raw.get("max_revision_rounds", -1))
     if revision_rounds not in (0, 1):
@@ -144,20 +178,83 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
             prompt_path=prompt_path,
         )
 
-    gate = raw.get("hardness_gate", {})
-    required_gate_fields = {
+    default_difficulty = str(raw.get("default_difficulty", ""))
+    if default_difficulty not in DIFFICULTY_LEVELS:
+        raise ConfigError("default_difficulty must be easy, medium, or hard")
+
+    raw_contracts = raw.get("difficulty_contracts", {})
+    if set(raw_contracts) != set(DIFFICULTY_LEVELS):
+        raise ConfigError("difficulty_contracts must define easy, medium, and hard")
+    required_contract_fields = {
         "minimum_score",
+        "maximum_score",
         "minimum_categories",
         "minimum_public_requirements",
+        "maximum_public_requirements",
         "minimum_resource_kinds",
-        "minimum_runtime_behaviors",
+        "maximum_resource_kinds",
         "minimum_dependency_edges",
-        "minimum_safety_constraints",
+        "maximum_dependency_edges",
+        "runtime_behaviors",
+        "safety_constraints",
+        "minimum_interacting_mechanisms",
     }
-    if set(gate) != required_gate_fields:
-        missing = required_gate_fields - set(gate)
-        extra = set(gate) - required_gate_fields
-        raise ConfigError(f"Invalid hardness_gate fields; missing={missing}, extra={extra}")
+    contracts: dict[str, DifficultyContract] = {}
+    for level in DIFFICULTY_LEVELS:
+        item = raw_contracts[level]
+        if set(item) != required_contract_fields:
+            missing = required_contract_fields - set(item)
+            extra = set(item) - required_contract_fields
+            raise ConfigError(
+                f"Invalid {level} difficulty contract; missing={missing}, extra={extra}"
+            )
+        maximum_edges = item["maximum_dependency_edges"]
+        contract = DifficultyContract(
+            level=level,
+            minimum_score=int(item["minimum_score"]),
+            maximum_score=int(item["maximum_score"]),
+            minimum_categories=int(item["minimum_categories"]),
+            minimum_public_requirements=int(item["minimum_public_requirements"]),
+            maximum_public_requirements=int(item["maximum_public_requirements"]),
+            minimum_resource_kinds=int(item["minimum_resource_kinds"]),
+            maximum_resource_kinds=int(item["maximum_resource_kinds"]),
+            minimum_dependency_edges=int(item["minimum_dependency_edges"]),
+            maximum_dependency_edges=(
+                None if maximum_edges is None else int(maximum_edges)
+            ),
+            runtime_behaviors=int(item["runtime_behaviors"]),
+            safety_constraints=int(item["safety_constraints"]),
+            minimum_interacting_mechanisms=int(
+                item["minimum_interacting_mechanisms"]
+            ),
+        )
+        numeric_values = [
+            contract.minimum_score,
+            contract.maximum_score,
+            contract.minimum_categories,
+            contract.minimum_public_requirements,
+            contract.maximum_public_requirements,
+            contract.minimum_resource_kinds,
+            contract.maximum_resource_kinds,
+            contract.minimum_dependency_edges,
+            contract.runtime_behaviors,
+            contract.safety_constraints,
+            contract.minimum_interacting_mechanisms,
+        ]
+        if any(value < 1 for value in numeric_values):
+            raise ConfigError(f"{level} difficulty contract values must be positive")
+        if not 1 <= contract.minimum_score <= contract.maximum_score <= 10:
+            raise ConfigError(f"{level} score range must be within 1..10")
+        if contract.minimum_public_requirements > contract.maximum_public_requirements:
+            raise ConfigError(f"{level} public requirement range is reversed")
+        if contract.minimum_resource_kinds > contract.maximum_resource_kinds:
+            raise ConfigError(f"{level} resource-kind range is reversed")
+        if (
+            contract.maximum_dependency_edges is not None
+            and contract.minimum_dependency_edges > contract.maximum_dependency_edges
+        ):
+            raise ConfigError(f"{level} dependency-edge range is reversed")
+        contracts[level] = contract
 
     multiplier = _decimal(
         raw.get("reservation_safety_multiplier"), "reservation_safety_multiplier"
@@ -176,7 +273,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
         kind_node_image=str(raw["kind_node_image"]),
         reservation_safety_multiplier=multiplier,
         roles=roles,
-        hardness_gate={key: int(value) for key, value in gate.items()},
+        default_difficulty=default_difficulty,
+        difficulty_contracts=contracts,
     )
 
 

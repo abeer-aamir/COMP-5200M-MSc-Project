@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any
 
-from .config import PilotConfig
+from .config import DIFFICULTY_LEVELS, PilotConfig
 
 
 CATEGORIES = (
@@ -42,12 +42,42 @@ ALLOWED_RESOURCE_KINDS = {
 }
 
 CHECK_NAMES = (
+    "difficulty_contract_satisfied",
     "no_easy_shortcut",
     "no_ambiguity",
     "no_contradiction",
     "no_private_leakage",
     "all_requirements_covered",
+    "verification_blueprints_complete",
+    "sufficient_diversity",
     "kubernetes_1_35_compatible",
+)
+
+DEPENDENCY_TOPOLOGY_CLASSES = (
+    "single_chain",
+    "fan_in",
+    "fan_out",
+    "multi_stage_chain",
+    "mixed_dag",
+)
+
+RUNTIME_BEHAVIOR_TYPES = (
+    "readiness_transition",
+    "probe_recovery",
+    "controller_replacement",
+    "job_completion",
+    "cron_scheduling",
+    "rollout_propagation",
+    "storage_handoff",
+    "service_endpoint_transition",
+    "policy_connectivity_transition",
+)
+
+SAFETY_CONSTRAINT_CATEGORIES = (
+    "pod_hardening",
+    "least_privilege_rbac",
+    "network_policy",
+    "resource_requests_limits",
 )
 
 
@@ -59,6 +89,7 @@ SPEC_SCHEMA: dict[str, Any] = {
         "additionalProperties": False,
         "required": [
             "task_id",
+            "difficulty_level",
             "title",
             "scenario",
             "target_kubernetes_version",
@@ -67,11 +98,18 @@ SPEC_SCHEMA: dict[str, Any] = {
             "resource_kinds",
             "runtime_behaviors",
             "safety_constraints",
+            "interacting_mechanisms",
+            "verification_blueprints",
+            "diversity_fingerprint",
             "hardness_rationale",
             "likely_failure_modes",
         ],
         "properties": {
-            "task_id": {"type": "string", "pattern": "^pilot-[0-9]{3}$"},
+            "task_id": {
+                "type": "string",
+                "pattern": "^(pilot|easy|medium|hard)-[0-9]{3}$",
+            },
+            "difficulty_level": {"type": "string", "enum": list(DIFFICULTY_LEVELS)},
             "title": {"type": "string"},
             "scenario": {"type": "string"},
             "target_kubernetes_version": {"type": "string", "const": "1.35"},
@@ -82,7 +120,7 @@ SPEC_SCHEMA: dict[str, Any] = {
             },
             "public_requirements": {
                 "type": "array",
-                "minItems": 12,
+                "minItems": 6,
                 "maxItems": 14,
                 "items": {
                     "type": "object",
@@ -116,15 +154,106 @@ SPEC_SCHEMA: dict[str, Any] = {
             },
             "runtime_behaviors": {
                 "type": "array",
-                "minItems": 3,
+                "minItems": 1,
                 "maxItems": 3,
                 "items": {"type": "string"},
             },
             "safety_constraints": {
                 "type": "array",
-                "minItems": 3,
+                "minItems": 1,
                 "maxItems": 3,
                 "items": {"type": "string"},
+            },
+            "interacting_mechanisms": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 6,
+                "uniqueItems": True,
+                "items": {"type": "string"},
+            },
+            "verification_blueprints": {
+                "type": "array",
+                "minItems": 6,
+                "maxItems": 14,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "requirement_id",
+                        "observable_state",
+                        "precondition",
+                        "assertion",
+                        "timeout_seconds",
+                        "candidate_failure_signals",
+                        "infrastructure_failure_signals",
+                    ],
+                    "properties": {
+                        "requirement_id": {
+                            "type": "string",
+                            "pattern": "^R[0-9]{2}$",
+                        },
+                        "observable_state": {"type": "string"},
+                        "precondition": {"type": "string"},
+                        "assertion": {"type": "string"},
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 300,
+                        },
+                        "candidate_failure_signals": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string"},
+                        },
+                        "infrastructure_failure_signals": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "diversity_fingerprint": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "resource_kind_set",
+                    "dependency_topology_class",
+                    "runtime_behavior_types",
+                    "safety_constraint_categories",
+                ],
+                "properties": {
+                    "resource_kind_set": {
+                        "type": "array",
+                        "uniqueItems": True,
+                        "items": {
+                            "type": "string",
+                            "enum": sorted(ALLOWED_RESOURCE_KINDS),
+                        },
+                    },
+                    "dependency_topology_class": {
+                        "type": "string",
+                        "enum": list(DEPENDENCY_TOPOLOGY_CLASSES),
+                    },
+                    "runtime_behavior_types": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": True,
+                        "items": {
+                            "type": "string",
+                            "enum": list(RUNTIME_BEHAVIOR_TYPES),
+                        },
+                    },
+                    "safety_constraint_categories": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": True,
+                        "items": {
+                            "type": "string",
+                            "enum": list(SAFETY_CONSTRAINT_CATEGORIES),
+                        },
+                    },
+                },
             },
             "hardness_rationale": {
                 "type": "array",
@@ -178,7 +307,9 @@ CRITIC_SCHEMA: dict[str, Any] = {
             "contradictions",
             "leakage_findings",
             "missing_requirement_ids",
+            "defects",
             "revision_instructions",
+            "revision_target",
         ],
         "properties": {
             "decision": {"type": "string", "enum": ["accept", "revise", "reject"]},
@@ -215,7 +346,55 @@ CRITIC_SCHEMA: dict[str, Any] = {
                 "uniqueItems": True,
                 "items": {"type": "string", "pattern": "^R[0-9]{2}$"},
             },
+            "defects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "requirement_id",
+                        "defect_type",
+                        "evidence",
+                        "affected_field",
+                        "minimum_revision_instruction",
+                        "revision_target",
+                    ],
+                    "properties": {
+                        "requirement_id": {
+                            "type": "string",
+                            "pattern": "^(R[0-9]{2})?$",
+                        },
+                        "defect_type": {
+                            "type": "string",
+                            "enum": [
+                                "contract_violation",
+                                "ambiguity",
+                                "infeasible",
+                                "non_deterministic_check",
+                                "unjustified_hidden_check",
+                                "leakage",
+                                "insufficient_diversity",
+                                "environment_violation",
+                                "public_rendering",
+                                "contradiction",
+                                "easy_shortcut",
+                            ],
+                        },
+                        "evidence": {"type": "string"},
+                        "affected_field": {"type": "string"},
+                        "minimum_revision_instruction": {"type": "string"},
+                        "revision_target": {
+                            "type": "string",
+                            "enum": ["spec_generator", "plaintext_writer"],
+                        },
+                    },
+                },
+            },
             "revision_instructions": {"type": "array", "items": {"type": "string"}},
+            "revision_target": {
+                "type": "string",
+                "enum": ["none", "spec_generator", "plaintext_writer"],
+            },
         },
     },
 }
@@ -386,7 +565,28 @@ def _require_mapping(value: Any, label: str, errors: list[str]) -> dict[str, Any
     return value
 
 
-def validate_spec(spec: Any, config: PilotConfig, task_id: str) -> list[str]:
+def _fingerprint_duplicate(
+    fingerprint: dict[str, Any], previous: list[dict[str, Any]]
+) -> str | None:
+    kinds = set(fingerprint.get("resource_kind_set", []))
+    topology = fingerprint.get("dependency_topology_class")
+    for entry in previous:
+        prior = entry.get("fingerprint", entry)
+        if (
+            kinds == set(prior.get("resource_kind_set", []))
+            and topology == prior.get("dependency_topology_class")
+        ):
+            return str(entry.get("task_id", "previous task"))
+    return None
+
+
+def validate_spec(
+    spec: Any,
+    config: PilotConfig,
+    task_id: str,
+    difficulty_level: str | None = None,
+    diversity_fingerprints: list[dict[str, Any]] | None = None,
+) -> list[str]:
     errors = validate_schema_instance(spec, SPEC_SCHEMA, "spec")
     if errors:
         return errors
@@ -402,16 +602,29 @@ def validate_spec(spec: Any, config: PilotConfig, task_id: str) -> list[str]:
     if item["target_kubernetes_version"] != config.target_kubernetes_version:
         errors.append("spec targets the wrong Kubernetes version")
 
-    gate = config.hardness_gate
+    requested_level = difficulty_level or str(item.get("difficulty_level", ""))
+    if requested_level not in config.difficulty_contracts:
+        errors.append("spec has an unknown difficulty level")
+        return errors
+    if item.get("difficulty_level") != requested_level:
+        errors.append(f"spec difficulty_level must be {requested_level}")
+    contract = config.difficulty_contracts[requested_level]
     categories = item.get("categories", [])
-    if not isinstance(categories, list) or len(set(categories)) < gate["minimum_categories"]:
+    if (
+        not isinstance(categories, list)
+        or len(set(categories)) < contract.minimum_categories
+    ):
         errors.append("spec has too few distinct hardness categories")
     if set(categories) - set(CATEGORIES):
         errors.append("spec contains an unknown category")
 
     requirements = item.get("public_requirements", [])
-    if not isinstance(requirements, list) or len(requirements) < gate["minimum_public_requirements"]:
-        errors.append("spec has too few public requirements")
+    if not isinstance(requirements, list) or not (
+        contract.minimum_public_requirements
+        <= len(requirements)
+        <= contract.maximum_public_requirements
+    ):
+        errors.append("spec public requirement count is outside its difficulty contract")
         return errors
 
     ids = [req.get("id") for req in requirements if isinstance(req, dict)]
@@ -433,10 +646,11 @@ def validate_spec(spec: Any, config: PilotConfig, task_id: str) -> list[str]:
         for dep in deps:
             if dep not in ids or dep == req.get("id"):
                 errors.append(f"{req.get('id')} has an invalid dependency {dep}")
-    if edges < gate["minimum_dependency_edges"]:
-        errors.append("requirement graph has too few dependency edges")
-    if not any(len(deps) >= 2 for deps in graph.values()):
-        errors.append("no requirement integrates at least two dependencies")
+    if edges < contract.minimum_dependency_edges or (
+        contract.maximum_dependency_edges is not None
+        and edges > contract.maximum_dependency_edges
+    ):
+        errors.append("requirement dependency count is outside its difficulty contract")
 
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -457,14 +671,46 @@ def validate_spec(spec: Any, config: PilotConfig, task_id: str) -> list[str]:
         errors.append("requirement dependency graph contains a cycle")
 
     kinds = item.get("resource_kinds", [])
-    if not isinstance(kinds, list) or len(set(kinds)) < gate["minimum_resource_kinds"]:
-        errors.append("spec requires too few distinct resource kinds")
+    if not isinstance(kinds, list) or not (
+        contract.minimum_resource_kinds
+        <= len(set(kinds))
+        <= contract.maximum_resource_kinds
+    ):
+        errors.append("spec resource-kind count is outside its difficulty contract")
     if set(kinds) - ALLOWED_RESOURCE_KINDS:
         errors.append("spec uses unsupported or cluster-scoped resource kinds")
-    if len(item.get("runtime_behaviors", [])) < gate["minimum_runtime_behaviors"]:
-        errors.append("spec has too few runtime behaviours")
-    if len(item.get("safety_constraints", [])) < gate["minimum_safety_constraints"]:
-        errors.append("spec has too few safety constraints")
+    if len(item.get("runtime_behaviors", [])) != contract.runtime_behaviors:
+        errors.append("spec runtime-behaviour count violates its difficulty contract")
+    if len(item.get("safety_constraints", [])) != contract.safety_constraints:
+        errors.append("spec safety-constraint count violates its difficulty contract")
+    if (
+        len(item.get("interacting_mechanisms", []))
+        < contract.minimum_interacting_mechanisms
+    ):
+        errors.append("spec has too few interacting mechanisms")
+
+    blueprints = item.get("verification_blueprints", [])
+    blueprint_ids = [
+        blueprint.get("requirement_id")
+        for blueprint in blueprints
+        if isinstance(blueprint, dict)
+    ]
+    if len(blueprint_ids) != len(ids) or sorted(blueprint_ids) != sorted(ids):
+        errors.append("verification blueprints must cover every requirement exactly once")
+
+    fingerprint = item.get("diversity_fingerprint", {})
+    if isinstance(fingerprint, dict):
+        if set(fingerprint.get("resource_kind_set", [])) != set(kinds):
+            errors.append("diversity fingerprint resource kinds do not match the spec")
+        if len(fingerprint.get("runtime_behavior_types", [])) != len(
+            item.get("runtime_behaviors", [])
+        ):
+            errors.append("diversity fingerprint runtime types do not match the spec")
+        duplicate = _fingerprint_duplicate(
+            fingerprint, diversity_fingerprints or []
+        )
+        if duplicate is not None:
+            errors.append(f"diversity fingerprint duplicates {duplicate}")
     if len(item.get("hardness_rationale", [])) < 4:
         errors.append("spec has insufficient private hardness rationale")
     if len(item.get("likely_failure_modes", [])) < 4:
@@ -532,6 +778,16 @@ def validate_critic(
     missing_ids = item.get("missing_requirement_ids", [])
     if not isinstance(missing_ids, list) or not set(missing_ids) <= required_ids:
         errors.append("critic missing_requirement_ids contains invalid IDs")
+    defects = item.get("defects", [])
+    if not isinstance(defects, list):
+        errors.append("critic defects must be a list")
+        defects = []
+    for defect in defects:
+        if not isinstance(defect, dict):
+            continue
+        requirement_id = defect.get("requirement_id")
+        if requirement_id and requirement_id not in required_ids:
+            errors.append("critic defect references an invalid requirement ID")
     checks = item.get("checks")
     if not isinstance(checks, dict) or set(checks) != set(CHECK_NAMES):
         errors.append("critic checks object is incomplete")
@@ -539,23 +795,57 @@ def validate_critic(
         errors.append("every critic check must be boolean")
     if item.get("decision") not in {"accept", "revise", "reject"}:
         errors.append("critic decision is invalid")
+    target = item.get("revision_target")
+    if item.get("decision") == "accept":
+        if target != "none":
+            errors.append("accepted critic output must use revision_target none")
+        if item.get("revision_instructions"):
+            errors.append("accepted critic output cannot contain revision instructions")
+        if defects:
+            errors.append("accepted critic output cannot contain defects")
+    elif target == "none":
+        errors.append("non-accepted critic output must identify a revision target")
+    elif not defects:
+        errors.append("non-accepted critic output must contain structured defects")
+    else:
+        defect_targets = {defect.get("revision_target") for defect in defects}
+        expected_target = (
+            "plaintext_writer"
+            if defect_targets == {"plaintext_writer"}
+            else "spec_generator"
+        )
+        if target != expected_target:
+            errors.append("critic revision_target disagrees with defect targets")
     return errors
 
 
 def acceptance_errors(
-    spec: dict[str, Any], writer: dict[str, Any], critic: dict[str, Any], config: PilotConfig
+    spec: dict[str, Any],
+    writer: dict[str, Any],
+    critic: dict[str, Any],
+    config: PilotConfig,
+    difficulty_level: str | None = None,
+    diversity_fingerprints: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    errors = validate_spec(spec, config, str(spec.get("task_id", "")))
+    level = difficulty_level or str(spec.get("difficulty_level", ""))
+    errors = validate_spec(
+        spec,
+        config,
+        str(spec.get("task_id", "")),
+        level,
+        diversity_fingerprints,
+    )
     errors.extend(validate_writer(writer, spec))
     errors.extend(validate_critic(critic, spec, config))
-    gate = config.hardness_gate
+    contract = config.difficulty_contracts.get(level)
     if critic.get("decision") != "accept":
         errors.append("critic did not accept the task")
-    if critic.get("hardness_score", 0) < gate["minimum_score"]:
-        errors.append("critic hardness score is below the threshold")
+    score = critic.get("hardness_score", 0)
+    if contract is None or not contract.minimum_score <= score <= contract.maximum_score:
+        errors.append("critic hardness score is outside the difficulty band")
     assignments = critic.get("category_assignments", [])
     category_count = len({x.get("category") for x in assignments if isinstance(x, dict)})
-    if category_count < gate["minimum_categories"]:
+    if contract is None or category_count < contract.minimum_categories:
         errors.append("critic confirmed too few categories")
     checks = critic.get("checks", {})
     for name in CHECK_NAMES:

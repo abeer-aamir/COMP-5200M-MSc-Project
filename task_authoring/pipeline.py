@@ -102,6 +102,7 @@ class TaskAuthoringPipeline:
         output_root: Path | str,
         budget_cap_usd: Decimal | None = None,
         key_budget_context: dict[str, Any] | None = None,
+        task_plan: list[tuple[str, str]] | None = None,
     ):
         self.config = config
         self.client = client
@@ -110,6 +111,20 @@ class TaskAuthoringPipeline:
             config.budget_usd if budget_cap_usd is None else budget_cap_usd
         )
         self.key_budget_context = key_budget_context
+        self.task_plan = task_plan or [
+            (f"pilot-{index:03d}", config.default_difficulty)
+            for index in range(1, config.task_count + 1)
+        ]
+        if not 1 <= len(self.task_plan) <= config.max_task_count:
+            raise ValueError(
+                f"task plan must contain from 1 to {config.max_task_count} tasks"
+            )
+        for task_id, difficulty in self.task_plan:
+            if difficulty not in config.difficulty_contracts:
+                raise ValueError(f"unknown difficulty in task plan: {difficulty}")
+            if not task_id:
+                raise ValueError("task plan contains an empty task ID")
+        self._diversity_fingerprints: list[dict[str, Any]] = []
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.run_dir = self.output_root / self.run_id
         self.public_dir = self.run_dir / "public"
@@ -339,15 +354,25 @@ class TaskAuthoringPipeline:
             "target_kubernetes_version": self.config.target_kubernetes_version,
             "kind_node_image": self.config.kind_node_image,
             "models": roles,
-            "hardness_gate": self.config.hardness_gate,
+            "default_difficulty": self.config.default_difficulty,
+            "difficulty_contracts": {
+                level: asdict(contract)
+                for level, contract in self.config.difficulty_contracts.items()
+            },
+            "task_plan": [
+                {"task_id": task_id, "difficulty_level": difficulty}
+                for task_id, difficulty in self.task_plan
+            ],
             "openrouter_key_budget_context": self.key_budget_context,
         }
 
-    def _generate_task(self, task_index: int, brief: str) -> dict[str, Any]:
+    def _generate_task(
+        self, task_id: str, difficulty_level: str, brief: str
+    ) -> dict[str, Any]:
         task_started = time.monotonic()
         task_started_at = datetime.now(timezone.utc).isoformat()
-        task_id = f"pilot-{task_index:03d}"
         task_dir = self.private_dir / task_id
+        contract = self.config.difficulty_contracts[difficulty_level]
         spec_revision_context: dict[str, Any] | None = None
         writer_revision_context: dict[str, Any] | None = None
         reusable_spec: dict[str, Any] | None = None
@@ -358,7 +383,10 @@ class TaskAuthoringPipeline:
             if reusable_spec is None:
                 spec_input = {
                     "task_id": task_id,
+                    "difficulty_level": difficulty_level,
+                    "difficulty_contract": contract.prompt_view(),
                     "authoring_brief": brief,
+                    "diversity_fingerprints": self._diversity_fingerprints,
                     "target_kubernetes_version": self.config.target_kubernetes_version,
                     "kind_node_image": self.config.kind_node_image,
                     "round": round_number,
@@ -372,7 +400,13 @@ class TaskAuthoringPipeline:
                 spec = reusable_spec
                 reusable_spec = None
             _write_json(round_dir / "spec.json", spec)
-            spec_errors = validate_spec(spec, self.config, task_id)
+            spec_errors = validate_spec(
+                spec,
+                self.config,
+                task_id,
+                difficulty_level,
+                self._diversity_fingerprints,
+            )
             if spec_errors:
                 last_errors = spec_errors
                 _write_json(round_dir / "deterministic_errors.json", spec_errors)
@@ -393,6 +427,7 @@ class TaskAuthoringPipeline:
                 "scenario": spec["scenario"],
                 "target_kubernetes_version": spec["target_kubernetes_version"],
                 "public_requirements": spec["public_requirements"],
+                "resource_kinds": spec["resource_kinds"],
             }
             writer_input = {
                 "public_specification": public_projection,
@@ -422,14 +457,23 @@ class TaskAuthoringPipeline:
             critic_input = {
                 "private_specification": spec,
                 "proposed_public_task_text": writer["task_text"],
-                "hardness_gate": self.config.hardness_gate,
+                "difficulty_level": difficulty_level,
+                "difficulty_contract": contract.prompt_view(),
+                "diversity_fingerprints": self._diversity_fingerprints,
                 "round": round_number,
             }
             critic_result = self._call_role("critic", task_id, round_number, critic_input)
             critic = critic_result.content
             _write_json(round_dir / "critic.json", critic)
             critic_shape_errors = validate_critic(critic, spec, self.config)
-            gate_errors = acceptance_errors(spec, writer, critic, self.config)
+            gate_errors = acceptance_errors(
+                spec,
+                writer,
+                critic,
+                self.config,
+                difficulty_level,
+                self._diversity_fingerprints,
+            )
             last_errors = sorted(set(critic_shape_errors + gate_errors))
             _write_json(round_dir / "acceptance_errors.json", last_errors)
             if not last_errors:
@@ -439,8 +483,19 @@ class TaskAuthoringPipeline:
                 _write_json(task_dir / "final_spec.json", spec)
                 _write_json(task_dir / "final_writer.json", writer)
                 _write_json(task_dir / "final_critic.json", critic)
+                fingerprint_entry = {
+                    "task_id": task_id,
+                    "difficulty_level": difficulty_level,
+                    "fingerprint": spec["diversity_fingerprint"],
+                }
+                self._diversity_fingerprints.append(fingerprint_entry)
+                _write_json(
+                    self.private_dir / "diversity_fingerprints.json",
+                    self._diversity_fingerprints,
+                )
                 return {
                     "task_id": task_id,
+                    "difficulty_level": difficulty_level,
                     "status": "accepted",
                     "started_at": task_started_at,
                     "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -454,20 +509,34 @@ class TaskAuthoringPipeline:
                     "duration_ms": round((time.monotonic() - task_started) * 1000),
                 }
 
-            spec_revision_context = {
-                "instruction": "Edit the previous specification in place.",
-                "preserve_public_requirement_count": len(
-                    spec.get("public_requirements", [])
-                ),
-                "previous_spec": spec,
-                "critic_revision_instructions": critic.get(
-                    "revision_instructions", []
-                ),
-            }
-            writer_revision_context = None
+            if critic.get("revision_target") == "plaintext_writer":
+                reusable_spec = spec
+                spec_revision_context = None
+                writer_revision_context = {
+                    "previous_public_text": writer.get("task_text"),
+                    "critic_revision_instructions": critic.get(
+                        "revision_instructions", []
+                    ),
+                    "instruction": (
+                        "Revise the public text only; preserve every specification detail."
+                    ),
+                }
+            else:
+                spec_revision_context = {
+                    "instruction": "Edit the previous specification in place.",
+                    "preserve_public_requirement_count": len(
+                        spec.get("public_requirements", [])
+                    ),
+                    "previous_spec": spec,
+                    "critic_revision_instructions": critic.get(
+                        "revision_instructions", []
+                    ),
+                }
+                writer_revision_context = None
 
         return {
             "task_id": task_id,
+            "difficulty_level": difficulty_level,
             "status": "rejected",
             "started_at": task_started_at,
             "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -503,8 +572,10 @@ class TaskAuthoringPipeline:
         fatal_error: dict[str, str] | None = None
         task_generation_started = time.monotonic()
         try:
-            for task_index in range(1, self.config.task_count + 1):
-                task_results.append(self._generate_task(task_index, brief))
+            for task_id, difficulty_level in self.task_plan:
+                task_results.append(
+                    self._generate_task(task_id, difficulty_level, brief)
+                )
         except Exception as exc:
             status = "failed"
             fatal_error = {"type": type(exc).__name__, "message": str(exc)}
@@ -533,7 +604,11 @@ class TaskAuthoringPipeline:
             },
             "openrouter_key_budget_context": self.key_budget_context,
             "accepted_tasks": sum(x.get("status") == "accepted" for x in task_results),
-            "requested_tasks": self.config.task_count,
+            "requested_tasks": len(self.task_plan),
+            "requested_by_difficulty": {
+                level: sum(difficulty == level for _, difficulty in self.task_plan)
+                for level in self.config.difficulty_contracts
+            },
             "tasks": task_results,
             "fatal_error": fatal_error,
         }
