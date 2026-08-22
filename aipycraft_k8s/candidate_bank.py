@@ -31,8 +31,9 @@ def _hash_file(path: Path) -> str:
 
 def initial_user_prompt(task: BenchmarkTask) -> str:
     return (
-        "TASK DESCRIPTION (this is the complete public specification):\n\n"
+        "<public_task>\n"
         f"{task.description.rstrip()}\n"
+        "</public_task>\n"
     )
 
 

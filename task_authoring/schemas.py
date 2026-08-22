@@ -7,21 +7,6 @@ from typing import Any
 from .config import DIFFICULTY_LEVELS, PilotConfig
 
 
-CATEGORIES = (
-    "multi_resource_dependencies",
-    "configuration_wiring",
-    "service_networking",
-    "readiness_and_health",
-    "rbac",
-    "pod_security",
-    "network_policy",
-    "stateful_storage",
-    "jobs_and_batch",
-    "scheduling",
-    "runtime_behavior",
-    "availability_and_disruption",
-)
-
 ALLOWED_RESOURCE_KINDS = {
     "ConfigMap",
     "Secret",
@@ -40,18 +25,6 @@ ALLOWED_RESOURCE_KINDS = {
     "ResourceQuota",
     "LimitRange",
 }
-
-CHECK_NAMES = (
-    "difficulty_contract_satisfied",
-    "no_easy_shortcut",
-    "no_ambiguity",
-    "no_contradiction",
-    "no_private_leakage",
-    "all_requirements_covered",
-    "verification_blueprints_complete",
-    "sufficient_diversity",
-    "kubernetes_1_35_compatible",
-)
 
 DEPENDENCY_TOPOLOGY_CLASSES = (
     "single_chain",
@@ -75,9 +48,28 @@ RUNTIME_BEHAVIOR_TYPES = (
 
 SAFETY_CONSTRAINT_CATEGORIES = (
     "pod_hardening",
-    "least_privilege_rbac",
+    "rbac_least_privilege",
     "network_policy",
-    "resource_requests_limits",
+    "resource_enforcement",
+)
+
+CRITIC_DEFECT_TYPES = (
+    "contract_violation",
+    "ambiguity",
+    "infeasible",
+    "non_deterministic_check",
+    "unjustified_hidden_check",
+    "leakage",
+    "insufficient_diversity",
+    "environment_violation",
+    "traceability_gap",
+    "core_redesign_required",
+)
+
+CRITIC_DEFECT_LOCATIONS = (
+    "private_specification",
+    "verification_blueprint",
+    "public_task_text",
 )
 
 
@@ -90,15 +82,12 @@ SPEC_SCHEMA: dict[str, Any] = {
         "required": [
             "task_id",
             "difficulty_level",
-            "title",
             "scenario",
-            "target_kubernetes_version",
-            "categories",
-            "public_requirements",
+            "requirements",
+            "dependency_edges",
             "resource_kinds",
-            "runtime_behaviors",
+            "runtime_behaviours",
             "safety_constraints",
-            "interacting_mechanisms",
             "verification_blueprints",
             "diversity_fingerprint",
             "hardness_rationale",
@@ -110,40 +99,32 @@ SPEC_SCHEMA: dict[str, Any] = {
                 "pattern": "^(pilot|easy|medium|hard)-[0-9]{3}$",
             },
             "difficulty_level": {"type": "string", "enum": list(DIFFICULTY_LEVELS)},
-            "title": {"type": "string"},
             "scenario": {"type": "string"},
-            "target_kubernetes_version": {"type": "string", "const": "1.35"},
-            "categories": {
-                "type": "array",
-                "uniqueItems": True,
-                "items": {"type": "string", "enum": list(CATEGORIES)},
-            },
-            "public_requirements": {
+            "requirements": {
                 "type": "array",
                 "minItems": 6,
                 "maxItems": 14,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["id", "text", "depends_on", "verification"],
+                    "required": ["id", "text"],
                     "properties": {
                         "id": {"type": "string", "pattern": "^R[0-9]{2}$"},
                         "text": {"type": "string"},
-                        "depends_on": {
-                            "type": "array",
-                            "uniqueItems": True,
-                            "items": {"type": "string", "pattern": "^R[0-9]{2}$"},
-                        },
-                        "verification": {
-                            "type": "string",
-                            "enum": [
-                                "manifest",
-                                "runtime",
-                                "security",
-                                "connectivity",
-                                "lifecycle",
-                            ],
-                        },
+                    },
+                },
+            },
+            "dependency_edges": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["from", "to", "reason"],
+                    "properties": {
+                        "from": {"type": "string", "pattern": "^R[0-9]{2}$"},
+                        "to": {"type": "string", "pattern": "^R[0-9]{2}$"},
+                        "reason": {"type": "string"},
                     },
                 },
             },
@@ -152,24 +133,47 @@ SPEC_SCHEMA: dict[str, Any] = {
                 "uniqueItems": True,
                 "items": {"type": "string", "enum": sorted(ALLOWED_RESOURCE_KINDS)},
             },
-            "runtime_behaviors": {
+            "runtime_behaviours": {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 3,
-                "items": {"type": "string"},
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["description", "related_requirement_ids"],
+                    "properties": {
+                        "description": {"type": "string"},
+                        "related_requirement_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "pattern": "^R[0-9]{2}$"},
+                        },
+                    },
+                },
             },
             "safety_constraints": {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 3,
-                "items": {"type": "string"},
-            },
-            "interacting_mechanisms": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 6,
-                "uniqueItems": True,
-                "items": {"type": "string"},
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["category", "description", "related_requirement_ids"],
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "enum": list(SAFETY_CONSTRAINT_CATEGORIES),
+                        },
+                        "description": {"type": "string"},
+                        "related_requirement_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "pattern": "^R[0-9]{2}$"},
+                        },
+                    },
+                },
             },
             "verification_blueprints": {
                 "type": "array",
@@ -219,7 +223,7 @@ SPEC_SCHEMA: dict[str, Any] = {
                 "required": [
                     "resource_kind_set",
                     "dependency_topology_class",
-                    "runtime_behavior_types",
+                    "runtime_behaviour_types",
                     "safety_constraint_categories",
                 ],
                 "properties": {
@@ -235,7 +239,7 @@ SPEC_SCHEMA: dict[str, Any] = {
                         "type": "string",
                         "enum": list(DEPENDENCY_TOPOLOGY_CLASSES),
                     },
-                    "runtime_behavior_types": {
+                    "runtime_behaviour_types": {
                         "type": "array",
                         "minItems": 1,
                         "uniqueItems": True,
@@ -255,16 +259,10 @@ SPEC_SCHEMA: dict[str, Any] = {
                     },
                 },
             },
-            "hardness_rationale": {
-                "type": "array",
-                "minItems": 4,
-                "maxItems": 4,
-                "items": {"type": "string"},
-            },
+            "hardness_rationale": {"type": "string"},
             "likely_failure_modes": {
                 "type": "array",
-                "minItems": 4,
-                "maxItems": 4,
+                "minItems": 1,
                 "items": {"type": "string"},
             },
         },
@@ -292,61 +290,29 @@ WRITER_SCHEMA: dict[str, Any] = {
 
 
 CRITIC_SCHEMA: dict[str, Any] = {
-    "name": "kubernetes_hardness_review",
+    "name": "kubernetes_authoring_review",
     "strict": True,
     "schema": {
         "type": "object",
         "additionalProperties": False,
         "required": [
-            "decision",
-            "hardness_score",
-            "category_assignments",
-            "checks",
-            "easy_shortcuts",
-            "ambiguities",
-            "contradictions",
-            "leakage_findings",
-            "missing_requirement_ids",
-            "defects",
-            "revision_instructions",
-            "revision_target",
+            "verdict",
+            "hardness_assessment",
+            "hardness_justification",
+            "findings",
         ],
         "properties": {
-            "decision": {"type": "string", "enum": ["accept", "revise", "reject"]},
-            "hardness_score": {"type": "integer", "minimum": 1, "maximum": 10},
-            "category_assignments": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["category", "evidence_requirement_ids"],
-                    "properties": {
-                        "category": {"type": "string", "enum": list(CATEGORIES)},
-                        "evidence_requirement_ids": {
-                            "type": "array",
-                            "minItems": 1,
-                            "uniqueItems": True,
-                            "items": {"type": "string", "pattern": "^R[0-9]{2}$"},
-                        },
-                    },
-                },
+            "verdict": {"type": "string", "enum": ["accept", "revise", "reject"]},
+            "hardness_assessment": {
+                "type": "string",
+                "enum": [
+                    "matches_contract",
+                    "easier_than_contract",
+                    "harder_than_contract",
+                ],
             },
-            "checks": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": list(CHECK_NAMES),
-                "properties": {name: {"type": "boolean"} for name in CHECK_NAMES},
-            },
-            "easy_shortcuts": {"type": "array", "items": {"type": "string"}},
-            "ambiguities": {"type": "array", "items": {"type": "string"}},
-            "contradictions": {"type": "array", "items": {"type": "string"}},
-            "leakage_findings": {"type": "array", "items": {"type": "string"}},
-            "missing_requirement_ids": {
-                "type": "array",
-                "uniqueItems": True,
-                "items": {"type": "string", "pattern": "^R[0-9]{2}$"},
-            },
-            "defects": {
+            "hardness_justification": {"type": "string"},
+            "findings": {
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -354,10 +320,9 @@ CRITIC_SCHEMA: dict[str, Any] = {
                     "required": [
                         "requirement_id",
                         "defect_type",
+                        "defect_location",
                         "evidence",
-                        "affected_field",
                         "minimum_revision_instruction",
-                        "revision_target",
                     ],
                     "properties": {
                         "requirement_id": {
@@ -366,34 +331,16 @@ CRITIC_SCHEMA: dict[str, Any] = {
                         },
                         "defect_type": {
                             "type": "string",
-                            "enum": [
-                                "contract_violation",
-                                "ambiguity",
-                                "infeasible",
-                                "non_deterministic_check",
-                                "unjustified_hidden_check",
-                                "leakage",
-                                "insufficient_diversity",
-                                "environment_violation",
-                                "public_rendering",
-                                "contradiction",
-                                "easy_shortcut",
-                            ],
+                            "enum": list(CRITIC_DEFECT_TYPES),
+                        },
+                        "defect_location": {
+                            "type": "string",
+                            "enum": list(CRITIC_DEFECT_LOCATIONS),
                         },
                         "evidence": {"type": "string"},
-                        "affected_field": {"type": "string"},
                         "minimum_revision_instruction": {"type": "string"},
-                        "revision_target": {
-                            "type": "string",
-                            "enum": ["spec_generator", "plaintext_writer"],
-                        },
                     },
                 },
-            },
-            "revision_instructions": {"type": "array", "items": {"type": "string"}},
-            "revision_target": {
-                "type": "string",
-                "enum": ["none", "spec_generator", "plaintext_writer"],
             },
         },
     },
@@ -599,8 +546,6 @@ def validate_spec(
         return errors
     if item["task_id"] != task_id:
         errors.append(f"spec task_id must be {task_id}")
-    if item["target_kubernetes_version"] != config.target_kubernetes_version:
-        errors.append("spec targets the wrong Kubernetes version")
 
     requested_level = difficulty_level or str(item.get("difficulty_level", ""))
     if requested_level not in config.difficulty_contracts:
@@ -609,16 +554,10 @@ def validate_spec(
     if item.get("difficulty_level") != requested_level:
         errors.append(f"spec difficulty_level must be {requested_level}")
     contract = config.difficulty_contracts[requested_level]
-    categories = item.get("categories", [])
-    if (
-        not isinstance(categories, list)
-        or len(set(categories)) < contract.minimum_categories
-    ):
-        errors.append("spec has too few distinct hardness categories")
-    if set(categories) - set(CATEGORIES):
-        errors.append("spec contains an unknown category")
+    if not str(item.get("scenario", "")).strip():
+        errors.append("spec scenario must be non-empty")
 
-    requirements = item.get("public_requirements", [])
+    requirements = item.get("requirements", [])
     if not isinstance(requirements, list) or not (
         contract.minimum_public_requirements
         <= len(requirements)
@@ -633,19 +572,42 @@ def validate_spec(
         return errors
     if any(not isinstance(req_id, str) or not re.fullmatch(r"R[0-9]{2}", req_id) for req_id in ids):
         errors.append("requirement IDs must use R00 format")
+    expected_ids = [f"R{index:02d}" for index in range(1, len(requirements) + 1)]
+    if ids != expected_ids:
+        errors.append("requirement IDs must be sequential and in source order")
+    if any(not str(req.get("text", "")).strip() for req in requirements):
+        errors.append("every requirement text must be non-empty")
+    namespace_requirements = [
+        req
+        for req in requirements
+        if isinstance(req, dict)
+        and re.search(r"\bNamespace\b", str(req.get("text", "")))
+    ]
+    if len(namespace_requirements) != 1:
+        errors.append("spec must contain exactly one explicit Namespace requirement")
 
-    edges = 0
-    graph: dict[str, list[str]] = {}
-    for req in requirements:
-        deps = req.get("depends_on", [])
-        if not isinstance(deps, list):
-            errors.append(f"{req.get('id')} depends_on must be a list")
-            deps = []
-        graph[str(req.get("id"))] = [str(dep) for dep in deps]
-        edges += len(deps)
-        for dep in deps:
-            if dep not in ids or dep == req.get("id"):
-                errors.append(f"{req.get('id')} has an invalid dependency {dep}")
+    dependency_edges = item.get("dependency_edges", [])
+    edges = len(dependency_edges) if isinstance(dependency_edges, list) else 0
+    graph: dict[str, list[str]] = {str(req_id): [] for req_id in ids}
+    edge_pairs: set[tuple[str, str]] = set()
+    for edge in dependency_edges if isinstance(dependency_edges, list) else []:
+        if not isinstance(edge, dict):
+            continue
+        prerequisite = edge.get("from")
+        dependent = edge.get("to")
+        if prerequisite not in ids or dependent not in ids or prerequisite == dependent:
+            errors.append(
+                f"dependency edge {prerequisite!r}->{dependent!r} is invalid"
+            )
+            continue
+        if not str(edge.get("reason", "")).strip():
+            errors.append(f"dependency edge {prerequisite}->{dependent} needs a reason")
+        pair = (str(prerequisite), str(dependent))
+        if pair in edge_pairs:
+            errors.append(f"dependency edge {prerequisite}->{dependent} is duplicated")
+            continue
+        edge_pairs.add(pair)
+        graph[str(prerequisite)].append(str(dependent))
     if edges < contract.minimum_dependency_edges or (
         contract.maximum_dependency_edges is not None
         and edges > contract.maximum_dependency_edges
@@ -661,7 +623,7 @@ def validate_spec(
         if node in visited:
             return False
         visiting.add(node)
-        if any(visit(dep) for dep in graph.get(node, [])):
+        if any(visit(dependent) for dependent in graph.get(node, [])):
             return True
         visiting.remove(node)
         visited.add(node)
@@ -679,15 +641,20 @@ def validate_spec(
         errors.append("spec resource-kind count is outside its difficulty contract")
     if set(kinds) - ALLOWED_RESOURCE_KINDS:
         errors.append("spec uses unsupported or cluster-scoped resource kinds")
-    if len(item.get("runtime_behaviors", [])) != contract.runtime_behaviors:
+    if len(item.get("runtime_behaviours", [])) != contract.runtime_behaviours:
         errors.append("spec runtime-behaviour count violates its difficulty contract")
     if len(item.get("safety_constraints", [])) != contract.safety_constraints:
         errors.append("spec safety-constraint count violates its difficulty contract")
-    if (
-        len(item.get("interacting_mechanisms", []))
-        < contract.minimum_interacting_mechanisms
-    ):
-        errors.append("spec has too few interacting mechanisms")
+
+    for field in ("runtime_behaviours", "safety_constraints"):
+        for entry in item.get(field, []):
+            if not isinstance(entry, dict):
+                continue
+            related = entry.get("related_requirement_ids", [])
+            if not related or not set(related) <= set(ids):
+                errors.append(f"{field} contains invalid related requirement IDs")
+            if not str(entry.get("description", "")).strip():
+                errors.append(f"{field} contains an empty description")
 
     blueprints = item.get("verification_blueprints", [])
     blueprint_ids = [
@@ -697,24 +664,41 @@ def validate_spec(
     ]
     if len(blueprint_ids) != len(ids) or sorted(blueprint_ids) != sorted(ids):
         errors.append("verification blueprints must cover every requirement exactly once")
+    for blueprint in blueprints:
+        if not isinstance(blueprint, dict):
+            continue
+        for field in ("observable_state", "assertion"):
+            if not str(blueprint.get(field, "")).strip():
+                errors.append(f"verification blueprint {field} must be non-empty")
+        for field in ("candidate_failure_signals", "infrastructure_failure_signals"):
+            if any(not str(signal).strip() for signal in blueprint.get(field, [])):
+                errors.append(f"verification blueprint {field} cannot contain empty signals")
 
     fingerprint = item.get("diversity_fingerprint", {})
     if isinstance(fingerprint, dict):
-        if set(fingerprint.get("resource_kind_set", [])) != set(kinds):
+        fingerprint_kinds = fingerprint.get("resource_kind_set", [])
+        if set(fingerprint_kinds) != set(kinds):
             errors.append("diversity fingerprint resource kinds do not match the spec")
-        if len(fingerprint.get("runtime_behavior_types", [])) != len(
-            item.get("runtime_behaviors", [])
-        ):
-            errors.append("diversity fingerprint runtime types do not match the spec")
+        if fingerprint_kinds != sorted(set(fingerprint_kinds)):
+            errors.append("diversity fingerprint resource kinds must be canonical and sorted")
+        actual_safety_categories = {
+            constraint.get("category")
+            for constraint in item.get("safety_constraints", [])
+            if isinstance(constraint, dict)
+        }
+        if set(fingerprint.get("safety_constraint_categories", [])) != actual_safety_categories:
+            errors.append("diversity fingerprint safety categories do not match the spec")
         duplicate = _fingerprint_duplicate(
             fingerprint, diversity_fingerprints or []
         )
         if duplicate is not None:
             errors.append(f"diversity fingerprint duplicates {duplicate}")
-    if len(item.get("hardness_rationale", [])) < 4:
-        errors.append("spec has insufficient private hardness rationale")
-    if len(item.get("likely_failure_modes", [])) < 4:
-        errors.append("spec has insufficient likely failure modes")
+    if not str(item.get("hardness_rationale", "")).strip():
+        errors.append("spec has no private hardness rationale")
+    if not item.get("likely_failure_modes") or any(
+        not str(mode).strip() for mode in item.get("likely_failure_modes", [])
+    ):
+        errors.append("spec has no likely failure modes")
     return errors
 
 
@@ -725,9 +709,9 @@ def validate_writer(writer: Any, spec: dict[str, Any]) -> list[str]:
     item = _require_mapping(writer, "writer output", errors)
     text = item.get("task_text")
     coverage = item.get("covered_requirement_ids")
-    expected = {req["id"] for req in spec.get("public_requirements", [])}
-    if not isinstance(coverage, list) or set(coverage) != expected or len(coverage) != len(expected):
-        errors.append("writer coverage must contain every requirement ID exactly once")
+    expected = [req["id"] for req in spec.get("requirements", [])]
+    if coverage != expected:
+        errors.append("writer coverage must contain every requirement ID exactly once and in order")
     if isinstance(text, str):
         lowered = text.lower()
         forbidden = (
@@ -743,6 +727,9 @@ def validate_writer(writer: Any, spec: dict[str, Any]) -> list[str]:
             errors.append("public task text leaks private authoring language")
         if re.search(r"\bR[0-9]{2}\b", text):
             errors.append("public task text leaks private requirement IDs")
+        bullets = [line for line in text.splitlines() if line.startswith("- ")]
+        if len(bullets) != len(expected):
+            errors.append("public task text must contain exactly one bullet per requirement")
     return errors
 
 
@@ -753,69 +740,52 @@ def validate_critic(
     if errors:
         return errors
     item = _require_mapping(critic, "critic output", errors)
-    required_ids = {req["id"] for req in spec.get("public_requirements", [])}
-    score = item.get("hardness_score")
-    if not isinstance(score, int) or not 1 <= score <= 10:
-        errors.append("critic hardness_score must be an integer from 1 to 10")
-    assignments = item.get("category_assignments", [])
-    if not isinstance(assignments, list):
-        errors.append("critic category_assignments must be a list")
-        assignments = []
-    assigned_categories: list[str] = []
-    for assignment in assignments:
-        if not isinstance(assignment, dict):
-            errors.append("critic category assignment must be an object")
+    required_ids = {req["id"] for req in spec.get("requirements", [])}
+    if not str(item.get("hardness_justification", "")).strip():
+        errors.append("critic hardness justification must be non-empty")
+    findings = item.get("findings", [])
+    if not isinstance(findings, list):
+        errors.append("critic findings must be a list")
+        findings = []
+    for finding in findings:
+        if not isinstance(finding, dict):
             continue
-        category = assignment.get("category")
-        evidence = assignment.get("evidence_requirement_ids", [])
-        assigned_categories.append(str(category))
-        if category not in CATEGORIES:
-            errors.append(f"critic assigned unknown category {category}")
-        if not evidence or not set(evidence) <= required_ids:
-            errors.append(f"critic category {category} has invalid evidence")
-    if len(set(assigned_categories)) != len(assigned_categories):
-        errors.append("critic categories must be unique")
-    missing_ids = item.get("missing_requirement_ids", [])
-    if not isinstance(missing_ids, list) or not set(missing_ids) <= required_ids:
-        errors.append("critic missing_requirement_ids contains invalid IDs")
-    defects = item.get("defects", [])
-    if not isinstance(defects, list):
-        errors.append("critic defects must be a list")
-        defects = []
-    for defect in defects:
-        if not isinstance(defect, dict):
-            continue
-        requirement_id = defect.get("requirement_id")
+        requirement_id = finding.get("requirement_id")
         if requirement_id and requirement_id not in required_ids:
-            errors.append("critic defect references an invalid requirement ID")
-    checks = item.get("checks")
-    if not isinstance(checks, dict) or set(checks) != set(CHECK_NAMES):
-        errors.append("critic checks object is incomplete")
-    elif any(not isinstance(value, bool) for value in checks.values()):
-        errors.append("every critic check must be boolean")
-    if item.get("decision") not in {"accept", "revise", "reject"}:
-        errors.append("critic decision is invalid")
-    target = item.get("revision_target")
-    if item.get("decision") == "accept":
-        if target != "none":
-            errors.append("accepted critic output must use revision_target none")
-        if item.get("revision_instructions"):
-            errors.append("accepted critic output cannot contain revision instructions")
-        if defects:
-            errors.append("accepted critic output cannot contain defects")
-    elif target == "none":
-        errors.append("non-accepted critic output must identify a revision target")
-    elif not defects:
-        errors.append("non-accepted critic output must contain structured defects")
-    else:
-        defect_targets = {defect.get("revision_target") for defect in defects}
-        expected_target = (
-            "plaintext_writer"
-            if defect_targets == {"plaintext_writer"}
-            else "spec_generator"
-        )
-        if target != expected_target:
-            errors.append("critic revision_target disagrees with defect targets")
+            errors.append("critic finding references an invalid requirement ID")
+        if not str(finding.get("evidence", "")).strip():
+            errors.append("critic finding evidence must be non-empty")
+        defect_type = finding.get("defect_type")
+        instruction = finding.get("minimum_revision_instruction")
+        if not str(instruction).strip() and not (
+            defect_type == "core_redesign_required" and item.get("verdict") == "reject"
+        ):
+            errors.append("critic finding is missing a minimum revision instruction")
+        if defect_type == "core_redesign_required" and item.get("verdict") != "reject":
+            errors.append("core_redesign_required is valid only with a reject verdict")
+
+    verdict = item.get("verdict")
+    assessment = item.get("hardness_assessment")
+    if verdict == "accept":
+        if findings:
+            errors.append("accepted critic output cannot contain findings")
+        if assessment != "matches_contract":
+            errors.append("accepted critic output must match its difficulty contract")
+    elif verdict in {"revise", "reject"}:
+        if not findings:
+            errors.append("non-accepted critic output must contain findings")
+        if verdict == "reject" and not any(
+            finding.get("defect_type") == "core_redesign_required"
+            for finding in findings
+            if isinstance(finding, dict)
+        ):
+            errors.append("reject verdict must identify a core redesign requirement")
+    if assessment != "matches_contract" and not any(
+        finding.get("defect_type") == "contract_violation"
+        for finding in findings
+        if isinstance(finding, dict)
+    ):
+        errors.append("hardness mismatch must have a contract_violation finding")
     return errors
 
 
@@ -837,27 +807,10 @@ def acceptance_errors(
     )
     errors.extend(validate_writer(writer, spec))
     errors.extend(validate_critic(critic, spec, config))
-    contract = config.difficulty_contracts.get(level)
-    if critic.get("decision") != "accept":
+    if critic.get("verdict") != "accept":
         errors.append("critic did not accept the task")
-    score = critic.get("hardness_score", 0)
-    if contract is None or not contract.minimum_score <= score <= contract.maximum_score:
-        errors.append("critic hardness score is outside the difficulty band")
-    assignments = critic.get("category_assignments", [])
-    category_count = len({x.get("category") for x in assignments if isinstance(x, dict)})
-    if contract is None or category_count < contract.minimum_categories:
-        errors.append("critic confirmed too few categories")
-    checks = critic.get("checks", {})
-    for name in CHECK_NAMES:
-        if checks.get(name) is not True:
-            errors.append(f"critic check failed: {name}")
-    for field in (
-        "easy_shortcuts",
-        "ambiguities",
-        "contradictions",
-        "leakage_findings",
-        "missing_requirement_ids",
-    ):
-        if critic.get(field):
-            errors.append(f"critic reported {field}")
+    if critic.get("hardness_assessment") != "matches_contract":
+        errors.append("critic hardness assessment does not match the difficulty contract")
+    if critic.get("findings"):
+        errors.append("critic reported material findings")
     return sorted(set(errors))

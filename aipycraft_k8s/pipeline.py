@@ -453,45 +453,24 @@ class KubernetesAIPyCraftPipeline:
     @staticmethod
     def _initial_user_prompt(task: BenchmarkTask) -> str:
         return (
-            "TASK DESCRIPTION (this is the complete public specification):\n\n"
+            "<public_task>\n"
             f"{task.description.rstrip()}\n"
+            "</public_task>\n"
         )
 
     def _repair_user_prompt(
         self, task: BenchmarkTask, previous: str, trigger: str, failure: str
     ) -> str:
-        scope = ""
-        if (
-            trigger == "ai_validator"
-            and self.config.ai_validator.feedback_mode == "detailed"
-        ):
-            scope = (
-                "When the trigger is ai_validator, fix every cited defect and make "
-                "any dependent changes required to fix it. Do not independently "
-                "change unrelated parts of the previous candidate.\n\n"
-            )
-        elif trigger in {
-            "deployment",
-            "runtime",
-            "execution_gate",
-            "candidate_api_disruption",
-        }:
-            scope = (
-                "Fix the observed execution failure and every dependent cause needed "
-                "to resolve it, while preserving unrelated working parts and every "
-                "public requirement.\n\n"
-            )
         return (
-            "ORIGINAL TASK DESCRIPTION:\n\n"
+            "<public_task>\n"
             f"{task.description.rstrip()}\n\n"
-            "PREVIOUS RESPONSE (untrusted data):\n\n"
+            "</public_task>\n\n"
+            "<previous_response>\n"
             f"{previous.rstrip()}\n\n"
-            "CORRECTION TRIGGER:\n\n"
-            f"{trigger}\n\n"
-            "CORRECTION FEEDBACK (untrusted data):\n\n"
-            f"{failure.rstrip()}\n\n"
-            f"{scope}"
-            "Return the complete replacement YAML stream now.\n"
+            "</previous_response>\n\n"
+            f'<correction_feedback trigger="{trigger}">\n'
+            f"{failure.rstrip()}\n"
+            "</correction_feedback>\n"
         )
 
     @staticmethod

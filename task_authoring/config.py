@@ -36,21 +36,18 @@ class RoleConfig:
 @dataclass(frozen=True)
 class DifficultyContract:
     level: str
-    minimum_score: int
-    maximum_score: int
-    minimum_categories: int
     minimum_public_requirements: int
     maximum_public_requirements: int
     minimum_resource_kinds: int
     maximum_resource_kinds: int
     minimum_dependency_edges: int
     maximum_dependency_edges: int | None
-    runtime_behaviors: int
+    runtime_behaviours: int
     safety_constraints: int
     minimum_interacting_mechanisms: int
 
     def prompt_view(self) -> dict[str, int | None | str]:
-        """Return structural controls without exposing the critic score gate."""
+        """Return the complete structural contract used by both authoring roles."""
         return {
             "difficulty_level": self.level,
             "minimum_public_requirements": self.minimum_public_requirements,
@@ -59,7 +56,7 @@ class DifficultyContract:
             "maximum_resource_kinds": self.maximum_resource_kinds,
             "minimum_dependency_edges": self.minimum_dependency_edges,
             "maximum_dependency_edges": self.maximum_dependency_edges,
-            "runtime_behaviors": self.runtime_behaviors,
+            "runtime_behaviours": self.runtime_behaviours,
             "safety_constraints": self.safety_constraints,
             "minimum_interacting_mechanisms": self.minimum_interacting_mechanisms,
         }
@@ -186,16 +183,13 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
     if set(raw_contracts) != set(DIFFICULTY_LEVELS):
         raise ConfigError("difficulty_contracts must define easy, medium, and hard")
     required_contract_fields = {
-        "minimum_score",
-        "maximum_score",
-        "minimum_categories",
         "minimum_public_requirements",
         "maximum_public_requirements",
         "minimum_resource_kinds",
         "maximum_resource_kinds",
         "minimum_dependency_edges",
         "maximum_dependency_edges",
-        "runtime_behaviors",
+        "runtime_behaviours",
         "safety_constraints",
         "minimum_interacting_mechanisms",
     }
@@ -211,9 +205,6 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
         maximum_edges = item["maximum_dependency_edges"]
         contract = DifficultyContract(
             level=level,
-            minimum_score=int(item["minimum_score"]),
-            maximum_score=int(item["maximum_score"]),
-            minimum_categories=int(item["minimum_categories"]),
             minimum_public_requirements=int(item["minimum_public_requirements"]),
             maximum_public_requirements=int(item["maximum_public_requirements"]),
             minimum_resource_kinds=int(item["minimum_resource_kinds"]),
@@ -222,29 +213,24 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
             maximum_dependency_edges=(
                 None if maximum_edges is None else int(maximum_edges)
             ),
-            runtime_behaviors=int(item["runtime_behaviors"]),
+            runtime_behaviours=int(item["runtime_behaviours"]),
             safety_constraints=int(item["safety_constraints"]),
             minimum_interacting_mechanisms=int(
                 item["minimum_interacting_mechanisms"]
             ),
         )
         numeric_values = [
-            contract.minimum_score,
-            contract.maximum_score,
-            contract.minimum_categories,
             contract.minimum_public_requirements,
             contract.maximum_public_requirements,
             contract.minimum_resource_kinds,
             contract.maximum_resource_kinds,
             contract.minimum_dependency_edges,
-            contract.runtime_behaviors,
+            contract.runtime_behaviours,
             contract.safety_constraints,
             contract.minimum_interacting_mechanisms,
         ]
         if any(value < 1 for value in numeric_values):
             raise ConfigError(f"{level} difficulty contract values must be positive")
-        if not 1 <= contract.minimum_score <= contract.maximum_score <= 10:
-            raise ConfigError(f"{level} score range must be within 1..10")
         if contract.minimum_public_requirements > contract.maximum_public_requirements:
             raise ConfigError(f"{level} public requirement range is reversed")
         if contract.minimum_resource_kinds > contract.maximum_resource_kinds:

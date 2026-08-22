@@ -375,6 +375,7 @@ class TaskAuthoringPipeline:
         contract = self.config.difficulty_contracts[difficulty_level]
         spec_revision_context: dict[str, Any] | None = None
         writer_revision_context: dict[str, Any] | None = None
+        critic_revision_context: list[dict[str, Any]] | None = None
         reusable_spec: dict[str, Any] | None = None
         last_errors: list[str] = []
 
@@ -387,10 +388,16 @@ class TaskAuthoringPipeline:
                     "difficulty_contract": contract.prompt_view(),
                     "authoring_brief": brief,
                     "diversity_fingerprints": self._diversity_fingerprints,
-                    "target_kubernetes_version": self.config.target_kubernetes_version,
-                    "kind_node_image": self.config.kind_node_image,
-                    "round": round_number,
-                    "revision_context": spec_revision_context,
+                    "previous_specification": (
+                        spec_revision_context.get("previous_specification", {})
+                        if spec_revision_context
+                        else {}
+                    ),
+                    "revision_feedback": (
+                        spec_revision_context.get("revision_feedback", [])
+                        if spec_revision_context
+                        else []
+                    ),
                 }
                 spec_result = self._call_role(
                     "spec_generator", task_id, round_number, spec_input
@@ -411,27 +418,34 @@ class TaskAuthoringPipeline:
                 last_errors = spec_errors
                 _write_json(round_dir / "deterministic_errors.json", spec_errors)
                 spec_revision_context = {
-                    "instruction": "Edit the previous specification in place.",
-                    "preserve_public_requirement_count": len(
-                        spec.get("public_requirements", [])
-                    ),
-                    "previous_spec": spec,
-                    "deterministic_errors": spec_errors,
+                    "previous_specification": spec,
+                    "revision_feedback": [
+                        {
+                            "source": "deterministic_schema_gate",
+                            "problem": error,
+                            "minimum_revision_instruction": (
+                                "Correct this schema or structural-contract defect and all "
+                                "dependent fields while preserving unaffected content."
+                            ),
+                        }
+                        for error in spec_errors
+                    ],
                 }
                 writer_revision_context = None
+                critic_revision_context = None
                 continue
 
             public_projection = {
-                "task_id": task_id,
-                "title": spec["title"],
                 "scenario": spec["scenario"],
-                "target_kubernetes_version": spec["target_kubernetes_version"],
-                "public_requirements": spec["public_requirements"],
-                "resource_kinds": spec["resource_kinds"],
+                "requirements": spec["requirements"],
             }
             writer_input = {
-                "public_specification": public_projection,
-                "round": round_number,
+                "specification": public_projection,
+                "previous_public_task": (
+                    writer_revision_context.get("previous_public_task", "")
+                    if writer_revision_context
+                    else ""
+                ),
                 "revision_context": writer_revision_context,
             }
             writer_result = self._call_role(
@@ -446,21 +460,39 @@ class TaskAuthoringPipeline:
                 reusable_spec = spec
                 spec_revision_context = None
                 writer_revision_context = {
-                    "previous_public_text": writer.get("task_text"),
-                    "deterministic_errors": writer_errors,
+                    "previous_public_task": writer.get("task_text", ""),
+                    "findings": [
+                        {
+                            "defect_location": "public_task_text",
+                            "evidence": error,
+                            "minimum_revision_instruction": (
+                                "Correct only the public rendering while preserving the "
+                                "specification exactly."
+                            ),
+                        }
+                        for error in writer_errors
+                    ],
                     "instruction": (
                         "Revise the public text only; preserve every specification detail."
                     ),
                 }
+                critic_revision_context = None
                 continue
 
             critic_input = {
-                "private_specification": spec,
-                "proposed_public_task_text": writer["task_text"],
                 "difficulty_level": difficulty_level,
                 "difficulty_contract": contract.prompt_view(),
-                "diversity_fingerprints": self._diversity_fingerprints,
-                "round": round_number,
+                "private_specification": {
+                    key: value
+                    for key, value in spec.items()
+                    if key != "verification_blueprints"
+                },
+                "verification_blueprints": spec["verification_blueprints"],
+                "public_task_text": writer["task_text"],
+                "diversity_fingerprints_of_accepted_tasks": (
+                    self._diversity_fingerprints
+                ),
+                "revision_context": critic_revision_context or [],
             }
             critic_result = self._call_role("critic", task_id, round_number, critic_input)
             critic = critic_result.content
@@ -501,36 +533,36 @@ class TaskAuthoringPipeline:
                     "finished_at": datetime.now(timezone.utc).isoformat(),
                     "round": round_number,
                     "public_path": str(public_path),
-                    "hardness_score": critic["hardness_score"],
-                    "categories": [
-                        assignment["category"]
-                        for assignment in critic["category_assignments"]
-                    ],
+                    "hardness_assessment": critic["hardness_assessment"],
+                    "critic_findings": len(critic["findings"]),
                     "duration_ms": round((time.monotonic() - task_started) * 1000),
                 }
 
-            if critic.get("revision_target") == "plaintext_writer":
+            findings = [
+                finding
+                for finding in critic.get("findings", [])
+                if isinstance(finding, dict)
+            ]
+            critic_revision_context = findings
+            if critic.get("verdict") == "reject":
+                break
+            if findings and all(
+                finding.get("defect_location") == "public_task_text"
+                for finding in findings
+            ):
                 reusable_spec = spec
                 spec_revision_context = None
                 writer_revision_context = {
-                    "previous_public_text": writer.get("task_text"),
-                    "critic_revision_instructions": critic.get(
-                        "revision_instructions", []
-                    ),
+                    "previous_public_task": writer.get("task_text", ""),
+                    "findings": findings,
                     "instruction": (
                         "Revise the public text only; preserve every specification detail."
                     ),
                 }
             else:
                 spec_revision_context = {
-                    "instruction": "Edit the previous specification in place.",
-                    "preserve_public_requirement_count": len(
-                        spec.get("public_requirements", [])
-                    ),
-                    "previous_spec": spec,
-                    "critic_revision_instructions": critic.get(
-                        "revision_instructions", []
-                    ),
+                    "previous_specification": spec,
+                    "revision_feedback": findings,
                 }
                 writer_revision_context = None
 
@@ -540,7 +572,7 @@ class TaskAuthoringPipeline:
             "status": "rejected",
             "started_at": task_started_at,
             "finished_at": datetime.now(timezone.utc).isoformat(),
-            "round": self.config.max_revision_rounds,
+            "round": round_number,
             "errors": last_errors,
             "duration_ms": round((time.monotonic() - task_started) * 1000),
         }

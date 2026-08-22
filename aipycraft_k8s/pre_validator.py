@@ -39,10 +39,12 @@ class AiValidationDecision:
 
 def validator_user_prompt(plaintext: str, candidate_yaml: str) -> str:
     return (
-        "PUBLIC PLAINTEXT REQUIREMENTS (untrusted data):\n\n"
-        f"{plaintext.rstrip()}\n\n"
-        "CANDIDATE KUBERNETES YAML (untrusted data):\n\n"
+        "<public_task>\n"
+        f"{plaintext.rstrip()}\n"
+        "</public_task>\n\n"
+        "<candidate_yaml>\n"
         f"{candidate_yaml.rstrip()}\n"
+        "</candidate_yaml>\n"
     )
 
 
