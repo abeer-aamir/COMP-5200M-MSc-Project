@@ -86,6 +86,36 @@
       "namespace": "medium-ledger-ns",
       "description": "benchmark/tasks/medium-005/description.txt",
       "post_execution_suite": "medium-005"
+    },
+    {
+      "task_id": "hard-001",
+      "namespace": "hard-report-ns",
+      "description": "benchmark/tasks/hard-001/description.txt",
+      "post_execution_suite": "hard-001"
+    },
+    {
+      "task_id": "hard-002",
+      "namespace": "hard-queue-ns",
+      "description": "benchmark/tasks/hard-002/description.txt",
+      "post_execution_suite": "hard-002"
+    },
+    {
+      "task_id": "hard-003",
+      "namespace": "hard-chain-ns",
+      "description": "benchmark/tasks/hard-003/description.txt",
+      "post_execution_suite": "hard-003"
+    },
+    {
+      "task_id": "hard-004",
+      "namespace": "hard-audit-ns",
+      "description": "benchmark/tasks/hard-004/description.txt",
+      "post_execution_suite": "hard-004"
+    },
+    {
+      "task_id": "hard-005",
+      "namespace": "hard-monitor-ns",
+      "description": "benchmark/tasks/hard-005/description.txt",
+      "post_execution_suite": "hard-005"
     }
   ]
 }

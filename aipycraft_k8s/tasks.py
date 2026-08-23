@@ -29,6 +29,11 @@ CANONICAL_TASK_NAMESPACES = {
     "medium-003": "medium-stateful-ns",
     "medium-004": "medium-check-ns",
     "medium-005": "medium-ledger-ns",
+    "hard-001": "hard-report-ns",
+    "hard-002": "hard-queue-ns",
+    "hard-003": "hard-chain-ns",
+    "hard-004": "hard-audit-ns",
+    "hard-005": "hard-monitor-ns",
 }
 
 
