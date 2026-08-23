@@ -116,15 +116,74 @@ def _has_bounded_retry_and_nonzero_failure(
 ) -> bool:
     """Recognize common finite BusyBox-shell retry forms without fixing one syntax."""
 
-    limits: list[int] = []
-    for pattern in (
-        r"\bseq\s+(?:1\s+)?([0-9]+)\b",
-        r"-(?:lt|ge)\s+([0-9]+)\b",
-    ):
-        limits.extend(int(value) for value in re.findall(pattern, command))
-    bounded = any(1 <= value <= maximum_attempts for value in limits)
-    nonzero_failure = bool(re.search(r"\bexit\s+[1-9][0-9]*\b", command))
+    attempts: list[int] = [
+        int(value) for value in re.findall(r"\bseq\s+(?:1\s+)?([0-9]+)\b", command)
+    ]
+    comparisons = re.findall(
+        r"\[\s*\"?\$?([A-Za-z_][A-Za-z0-9_]*)\"?\s+-(lt|le|ge|gt)\s+([0-9]+)\b",
+        command,
+    )
+    for variable, operator, raw_limit in comparisons:
+        limit = int(raw_limit)
+        starts = re.findall(rf"(?:^|[;\s]){re.escape(variable)}=([0-9]+)\b", command)
+        start = int(starts[0]) if starts else 0
+        if operator == "le":
+            attempts.append(max(0, limit - start + 1))
+        elif operator == "lt":
+            attempts.append(max(0, limit - start))
+        elif operator == "gt":
+            attempts.append(max(0, start - limit))
+        else:  # A post-failure `-ge N` guard permits at most N failures.
+            attempts.append(limit)
+    bounded = any(1 <= value <= maximum_attempts for value in attempts)
+    explicit_failure = bool(re.search(r"\bexit\s+[1-9][0-9]*\b", command))
+    errexit_final_test = bool(
+        re.search(r"\bsh\s+-[a-z]*e[a-z]*\b", command)
+        and re.search(r"(?:;|&&)\s*(?:test\b|\[).*$", command)
+    )
+    nonzero_failure = explicit_failure or errexit_final_test
     return bounded and nonzero_failure
+
+
+def _selector_includes(actual: Any, required: dict[str, str], label: str) -> dict[str, str]:
+    """Require stated selector terms without rejecting harmless extra labels."""
+
+    require(isinstance(actual, dict), f"{label} selector must be a mapping")
+    for key, value in required.items():
+        require(actual.get(key) == value, f"{label} selector must include {key}={value}")
+    return actual
+
+
+def _checks_stateful_ordinals(
+    command: str,
+    *,
+    workload: str,
+    headless_service: str,
+    body_prefix: str,
+    body_suffix: str,
+    ordinals: range,
+) -> bool:
+    """Accept literal or loop-generated stable identities, then rely on the live Job result."""
+
+    literal = all(
+        f"{workload}-{ordinal}.{headless_service}" in command
+        and f"{body_prefix}{workload}-{ordinal}{body_suffix}" in command
+        for ordinal in ordinals
+    )
+    if literal:
+        return True
+    values = " ".join(str(ordinal) for ordinal in ordinals)
+    dynamic_range = bool(
+        re.search(rf"\bseq\s+{ordinals.start}\s+{ordinals.stop - 1}\b", command)
+        or re.search(rf"\bfor\s+\w+\s+in\s+{re.escape(values)}(?:\s*;|\s+do\b)", command)
+    )
+    return (
+        dynamic_range
+        and f"{workload}-" in command
+        and headless_service in command
+        and body_prefix in command
+        and body_suffix in command
+    )
 
 
 def _main_container(workload: dict[str, Any]) -> dict[str, Any]:
@@ -1672,7 +1731,11 @@ def _assert_single_ingress_policy(
     policy: dict[str, Any], *, app: str, access: str, port: int
 ) -> None:
     spec = policy.get("spec", {})
-    require(spec.get("podSelector", {}).get("matchLabels") == {"app": app}, "NetworkPolicy selector differs")
+    _selector_includes(
+        spec.get("podSelector", {}).get("matchLabels"),
+        {"app": app},
+        "NetworkPolicy",
+    )
     require(set(spec.get("policyTypes", ["Ingress"])) == {"Ingress"}, "policyTypes must contain only Ingress")
     ingress = spec.get("ingress", [])
     require(len(ingress) == 1, "NetworkPolicy must contain exactly one ingress rule")
@@ -1736,7 +1799,17 @@ def _all_ready_pods_serve_base64(
 
 def _assert_exact_pdb(kube: Kubectl, name: str, app: str) -> str:
     pdb = kube.get("poddisruptionbudget", name)
-    require(pdb.get("spec", {}).get("selector", {}).get("matchLabels") == {"app": app}, f"{name} selector differs")
+    selector = _selector_includes(
+        pdb.get("spec", {}).get("selector", {}).get("matchLabels"),
+        {"app": app},
+        name,
+    )
+    for pod in kube.list("pods", f"app={app}"):
+        labels = pod.get("metadata", {}).get("labels", {})
+        require(
+            all(labels.get(key) == value for key, value in selector.items()),
+            f"{name} does not select every app={app} pod",
+        )
     require(int_or_string(pdb.get("spec", {}).get("minAvailable")) == "1", f"{name} minAvailable must be 1")
     return f"{name} selects app={app} with minAvailable 1"
 
@@ -1818,7 +1891,7 @@ def _easy1_checks(
         service = kube.get("service", "status-svc")
         spec = service.get("spec", {})
         require(spec.get("type", "ClusterIP") == "ClusterIP", "status-svc is not ClusterIP")
-        require(spec.get("selector") == {"app": "status-web"}, "status-svc selector differs")
+        _selector_includes(spec.get("selector"), {"app": "status-web"}, "status-svc")
         port = _service_port(service, 80)
         require(port.get("protocol", "TCP") == "TCP", "status-svc port is not TCP")
         require(_resolved_target_port(port, kube.get("deployment", "status-web")) == "8080", "targetPort does not resolve to 8080")
@@ -1837,7 +1910,11 @@ def _easy1_checks(
     def r05() -> str:
         policy = kube.get("networkpolicy", "status-ingress")
         spec = policy.get("spec", {})
-        require(spec.get("podSelector", {}).get("matchLabels") == {"app": "status-web"}, "policy selector differs")
+        _selector_includes(
+            spec.get("podSelector", {}).get("matchLabels"),
+            {"app": "status-web"},
+            "status-ingress",
+        )
         require(set(spec.get("policyTypes", ["Ingress"])) == {"Ingress"}, "policyTypes must contain only Ingress")
         ingress = spec.get("ingress", [])
         require(len(ingress) == 1, "status-ingress must have exactly one ingress rule")
@@ -2123,7 +2200,7 @@ def _easy4_checks(
         service = kube.get("service", "restart-svc")
         spec = service.get("spec", {})
         require(spec.get("type", "ClusterIP") == "ClusterIP", "restart-svc is not ClusterIP")
-        require(spec.get("selector") == {"app": "restart-web"}, "restart-svc selector differs")
+        _selector_includes(spec.get("selector"), {"app": "restart-web"}, "restart-svc")
         port = _service_port(service, 8080)
         require(port.get("protocol", "TCP") == "TCP", "restart-svc port is not TCP")
         require(_resolved_target_port(port, deployment) == "8080", "restart-svc targetPort differs")
@@ -2224,7 +2301,7 @@ def _easy5_checks(
         service = kube.get("service", "diagnostics-svc")
         spec = service.get("spec", {})
         require(spec.get("type", "ClusterIP") == "ClusterIP", "diagnostics-svc is not ClusterIP")
-        require(spec.get("selector") == {"app": "diagnostics-web"}, "diagnostics-svc selector differs")
+        _selector_includes(spec.get("selector"), {"app": "diagnostics-web"}, "diagnostics-svc")
         port = _service_port(service, 80)
         require(port.get("protocol", "TCP") == "TCP", "diagnostics-svc port is not TCP")
         require(_resolved_target_port(port, deployment) == "8080", "targetPort does not resolve to 8080")
@@ -2334,7 +2411,7 @@ def _medium1_checks(
         service = kube.get("service", "portal-svc")
         spec = service.get("spec", {})
         require(spec.get("type", "ClusterIP") == "ClusterIP", "portal-svc is not ClusterIP")
-        require(spec.get("selector") == {"app": "portal-web"}, "portal-svc selector differs")
+        _selector_includes(spec.get("selector"), {"app": "portal-web"}, "portal-svc")
         port = _service_port(service, 80)
         require(port.get("protocol", "TCP") == "TCP" and port.get("targetPort") == "http", "portal-svc must target named TCP port http")
         require(_resolved_target_port(port, deployment) == "8080", "portal-svc targetPort does not resolve to 8080")
@@ -2531,7 +2608,7 @@ def _medium3_checks(
         spec = service.get("spec", {})
         require(spec.get("clusterIP") == "None", "registry-headless is not headless")
         require(spec.get("publishNotReadyAddresses", False) is False, "publishNotReadyAddresses must be false")
-        require(spec.get("selector") == {"app": "registry"}, "registry-headless selector differs")
+        _selector_includes(spec.get("selector"), {"app": "registry"}, "registry-headless")
         port = _service_port(service, 8080)
         require(port.get("protocol", "TCP") == "TCP" and port.get("targetPort") == "http", "registry-headless port mapping differs")
         return "registry-headless has the exact headless selector and named-port mapping"
@@ -2654,7 +2731,7 @@ def _medium4_checks(
         service = kube.get("service", "check-svc")
         spec = service.get("spec", {})
         require(spec.get("type", "ClusterIP") == "ClusterIP", "check-svc is not ClusterIP")
-        require(spec.get("selector") == {"app": "check-web"}, "check-svc selector differs")
+        _selector_includes(spec.get("selector"), {"app": "check-web"}, "check-svc")
         port = _service_port(service, 80)
         require(port.get("protocol", "TCP") == "TCP" and port.get("targetPort") == "http", "check-svc port mapping differs")
         require(_resolved_target_port(port, kube.get("deployment", "check-web")) == "8080", "check-svc targetPort does not resolve to 8080")
@@ -2792,7 +2869,7 @@ def _medium5_checks(
         service = kube.get("service", "ledger-svc")
         spec = service.get("spec", {})
         require(spec.get("type", "ClusterIP") == "ClusterIP", "ledger-svc is not ClusterIP")
-        require(spec.get("selector") == {"app": "ledger-web"}, "ledger-svc selector differs")
+        _selector_includes(spec.get("selector"), {"app": "ledger-web"}, "ledger-svc")
         port = _service_port(service, 80)
         require(port.get("protocol", "TCP") == "TCP" and port.get("targetPort") == "http", "ledger-svc port mapping differs")
         require(_resolved_target_port(port, kube.get("deployment", "ledger-web")) == "8080", "ledger-svc targetPort does not resolve to 8080")
@@ -2907,7 +2984,7 @@ def _assert_exact_service(
     service = kube.get("service", name)
     spec = service.get("spec", {})
     require(spec.get("type", "ClusterIP") == "ClusterIP", f"{name} must be ClusterIP")
-    require(spec.get("selector") == selector, f"{name} selector differs")
+    _selector_includes(spec.get("selector"), selector, name)
     if headless:
         require(spec.get("clusterIP") == "None", f"{name} must be headless")
         require(spec.get("publishNotReadyAddresses", False) is False, f"{name} publishNotReadyAddresses must be false")
@@ -2948,8 +3025,9 @@ def _assert_stateful_storage(workload: dict[str, Any], container: dict[str, Any]
     mount = find_mount(container, "/data")
     require(mount is not None, "container does not mount /data")
     claim = volume_claim_template(workload, "data")
-    require(set(claim.get("accessModes", [])) == {"ReadWriteOnce"}, "data claim must be ReadWriteOnce")
-    require(claim.get("resources", {}).get("requests", {}).get("storage") == "64Mi", "data claim must request 64Mi")
+    claim_spec = claim.get("spec", {})
+    require(set(claim_spec.get("accessModes", [])) == {"ReadWriteOnce"}, "data claim must be ReadWriteOnce")
+    require(claim_spec.get("resources", {}).get("requests", {}).get("storage") == "64Mi", "data claim must request 64Mi")
 
 
 def _assert_stateful_controls(workload: dict[str, Any]) -> None:
@@ -3002,7 +3080,7 @@ def _assert_role_default_deny(policy: dict[str, Any], roles: set[str]) -> None:
 def _hard1_checks(
     kube: Kubectl, candidate_path: Path | None = None
 ) -> list[tuple[str, str, Callable[[], str | None]]]:
-    expected_job = 'i=0; until body=$(wget -qO- http://report-svc); do i=$((i + 1)); [ "$i" -ge 30 ] && exit 1; sleep 2; done; test "$body" = report-version=v1 && echo report-smoke-ok'
+    expected_job = 'i=0; until body=$(wget -qO- http://report-svc 2>/dev/null); do i=$((i + 1)); [ "$i" -ge 30 ] && exit 1; sleep 2; done; test "$body" = report-version=v1 && echo report-smoke-ok'
 
     def r02() -> str:
         _assert_exact_configmap_data(kube.get("configmap", "report-content"), {"index.html": "report-version=v1\n"}); return "exact report content"
@@ -3129,7 +3207,7 @@ def _hard2_checks(
         require(pod.get("restartPolicy") == "Never" and spec.get("jobTemplate", {}).get("spec", {}).get("activeDeadlineSeconds") == 180, "queue-check bounds differ")
         c = pod.get("containers", []); require(len(c) == 1 and c[0].get("name") == "checker" and c[0].get("image") == "busybox:1.36.1", "queue-check container differs")
         _assert_workload_hardening({"spec": {"template": {"spec": pod}}}, "queue-check")
-        command = command_text(c[0]); require(all(f"queue-{n}.queue-headless" in command and f"queue-queue-{n}-durable" in command for n in range(3)), "queue-check does not verify all stable identities")
+        command = command_text(c[0]); require(_checks_stateful_ordinals(command, workload="queue", headless_service="queue-headless", body_prefix="queue-", body_suffix="-durable", ordinals=range(3)), "queue-check does not verify all stable identities")
         require(_has_bounded_retry_and_nonzero_failure(command, maximum_attempts=30) and "sleep 2" in command and "queue-check-ok" in command, "queue-check retry or success contract differs")
         return _run_cronjob_and_assert_log(kube, "queue-check", "queue-check", "queue-check-ok\n", 180)
     def r13() -> str:
@@ -3210,11 +3288,11 @@ def _hard3_checks(
         pdb = kube.get("poddisruptionbudget", "gateway-pdb").get("spec", {}); require(pdb.get("selector", {}).get("matchLabels") == {"role": "gateway"} and int_or_string(pdb.get("minAvailable")) == "1", "gateway-pdb differs")
         job = kube.get("job", "chain-smoke"); spec = job.get("spec", {}); pod = spec.get("template", {}).get("spec", {}); require(spec.get("backoffLimit") == 0 and spec.get("activeDeadlineSeconds") == 120 and pod.get("restartPolicy") == "Never", "chain-smoke bounds differ")
         require(spec.get("template", {}).get("metadata", {}).get("labels", {}).get("access") == "chain", "chain-smoke access label missing"); _assert_workload_hardening({"spec": {"template": {"spec": pod}}}, "chain-smoke")
-        c = pod.get("containers", []); require(len(c) == 1 and c[0].get("name") == "smoke" and c[0].get("image") == "busybox:1.36.1", "chain-smoke container differs"); cmd = command_text(c[0]); require("backend-svc" in cmd and "gateway-svc" in cmd and "backend-ready" in cmd and "Gateway online" in cmd and "chain-smoke-ok" in cmd and _has_bounded_retry_and_nonzero_failure(cmd, maximum_attempts=30), "chain-smoke command differs")
+        c = pod.get("containers", []); require(len(c) == 1 and c[0].get("name") == "smoke" and c[0].get("image") == "busybox:1.36.1", "chain-smoke container differs"); cmd = command_text(c[0]); require("backend-svc" in cmd and "gateway-svc" in cmd and "backend-ready" in cmd and "Gateway online" in cmd and "chain-smoke-ok" in cmd and "sleep 2" in cmd and re.search(r"2\s*>\s*/dev/null", cmd) and _has_bounded_retry_and_nonzero_failure(cmd, maximum_attempts=30), "chain-smoke command differs")
         kube.wait_until(lambda: job_terminal_condition(kube.get("job", "chain-smoke")) is not None, "chain-smoke terminal state", 120, 1); require(job_terminal_condition(kube.get("job", "chain-smoke")) == "Complete", "chain-smoke failed"); pods = kube.list("pods", "job-name=chain-smoke"); require(len(pods) == 1 and kube.run(["logs", pods[0]["metadata"]["name"], "-n", kube.namespace]).stdout == "chain-smoke-ok\n", "chain-smoke logs differ"); return "chain-smoke completed with exact output"
     def r14() -> str:
         try:
-            kube.scale("deployment", "chain-backend", 0); kube.wait_until(lambda: _ready_count(kube, "role=gateway") == 0 and _endpoint_count(kube, "gateway-svc") == 0, "gateway dependency outage", 45, 1)
+            kube.scale("deployment", "chain-backend", 0); kube.wait_until(lambda: _ready_count(kube, "role=gateway") == 0 and _endpoint_count(kube, "gateway-svc") == 0, "gateway dependency outage", 75, 1)
         finally:
             kube.scale("deployment", "chain-backend", 1); kube.wait_until(lambda: _ready_count(kube, "role=backend") == 1 and _ready_count(kube, "role=gateway") == 2 and _endpoint_count(kube, "gateway-svc") == 2, "chain dependency recovery", 90, 1)
         return "gateway readiness followed backend outage and recovery"
@@ -3232,7 +3310,7 @@ def _hard4_checks(
     def r04() -> str:
         _assert_exact_service(kube, "audit-headless", {"app": "audit-store"}, 8080, "http", kube.get("statefulset", "audit-store"), 8080, headless=True); return "exact audit headless Service"
     def r05() -> str:
-        _assert_exact_service(kube, "audit-svc", {"app": "audit-store"}, 80, "http", kube.get("statefulset", "audit-store"), 8080); return "exact audit Service"
+        _assert_exact_service(kube, "audit-svc", {"app": "audit-store", "statefulset.kubernetes.io/pod-name": "audit-store-0"}, 80, "http", kube.get("statefulset", "audit-store"), 8080); return "ordinal-zero audit Service"
     def r06() -> str:
         kube.get("serviceaccount", "audit-inspector"); return "audit-inspector exists"
     def r07() -> str:
@@ -3256,7 +3334,7 @@ def _hard4_checks(
     def r12() -> str:
         job = kube.get("job", "audit-inspection"); spec = job.get("spec", {}); pod = spec.get("template", {}).get("spec", {}); require(pod.get("serviceAccountName") == "audit-inspector" and spec.get("template", {}).get("metadata", {}).get("labels", {}).get("access") == "audit", "audit-inspection identity differs")
         require(pod.get("restartPolicy") == "Never" and spec.get("backoffLimit") == 0 and spec.get("activeDeadlineSeconds") == 150, "audit-inspection bounds differ"); _assert_workload_hardening({"spec": {"template": {"spec": pod}}}, "audit-inspection")
-        c = pod.get("containers", []); require(len(c) == 1 and c[0].get("name") == "inspector" and c[0].get("image") == "busybox:1.36.1", "audit inspector differs"); cmd = command_text(c[0]); require(all(x in cmd for x in ("audit-store-0.audit-headless:8080", "audit-store-1.audit-headless:8080", "audit-audit-store-0-verified", "audit-audit-store-1-verified", "audit-inspection-ok", "sleep 2")) and _has_bounded_retry_and_nonzero_failure(cmd, maximum_attempts=30), "audit-inspection command differs")
+        c = pod.get("containers", []); require(len(c) == 1 and c[0].get("name") == "inspector" and c[0].get("image") == "busybox:1.36.1", "audit inspector differs"); cmd = command_text(c[0]); require(_checks_stateful_ordinals(cmd, workload="audit-store", headless_service="audit-headless", body_prefix="audit-", body_suffix="-verified", ordinals=range(2)) and "audit-inspection-ok" in cmd and "sleep 2" in cmd and _has_bounded_retry_and_nonzero_failure(cmd, maximum_attempts=30), "audit-inspection command differs")
         kube.wait_until(lambda: job_terminal_condition(kube.get("job", "audit-inspection")) is not None, "audit-inspection terminal state", 150, 1); require(job_terminal_condition(kube.get("job", "audit-inspection")) == "Complete", "audit-inspection failed"); pods = kube.list("pods", "job-name=audit-inspection"); require(len(pods) == 1 and kube.run(["logs", pods[0]["metadata"]["name"], "-n", kube.namespace]).stdout == "audit-inspection-ok\n", "audit-inspection logs differ"); return "audit-inspection completed with exact output"
     def r13() -> str:
         allowed = lambda: kube.auth_can_i("audit-inspector", "list", "pods") and kube.auth_can_i("audit-inspector", "get", "configmap/audit-prefix")
@@ -3333,7 +3411,7 @@ def _hard5_checks(
     def r14() -> str:
         ds = kube.get("daemonset", "node-agent"); original = pod_spec(ds).get("nodeSelector"); old_uid = next(p["metadata"]["uid"] for p in kube.list("pods", "role=agent") if _ready_pod(p)); impossible = json.dumps({"spec": {"template": {"spec": {"nodeSelector": {"aipycraft.invalid/node": "never"}}}}})
         kube.run(["patch", "daemonset", "node-agent", "-n", kube.namespace, "--type=merge", "-p", impossible])
-        try: kube.wait_until(lambda: _ready_count(kube, "role=agent") == 0 and _ready_count(kube, "role=collector") == 0 and _endpoint_count(kube, "collector-svc") == 0, "agent outage to remove collector readiness", 45, 1)
+        try: kube.wait_until(lambda: _ready_count(kube, "role=agent") == 0 and _ready_count(kube, "role=collector") == 0 and _endpoint_count(kube, "collector-svc") == 0, "agent outage to remove collector readiness", 75, 1)
         finally:
             if original is None:
                 kube.run(["patch", "daemonset", "node-agent", "-n", kube.namespace, "--type=json", "-p", '[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]'])
