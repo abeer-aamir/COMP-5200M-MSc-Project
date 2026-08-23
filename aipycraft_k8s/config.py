@@ -51,6 +51,7 @@ class AiValidatorConfig:
     enabled: bool
     feedback_mode: str
     shadow_mode: bool
+    api: ApiConfig
 
 
 @dataclass(frozen=True)
@@ -439,11 +440,19 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         integer=True,
     )
 
-    ai_validator = _exact_keys(
-        raw["ai_validator"],
-        {"enabled", "feedback_mode", "shadow_mode"},
-        "ai_validator",
-    )
+    if not isinstance(raw["ai_validator"], dict):
+        raise ConfigError("ai_validator must be an object")
+    ai_validator = raw["ai_validator"]
+    validator_base_keys = {"enabled", "feedback_mode", "shadow_mode"}
+    validator_keys = frozenset(ai_validator)
+    if validator_keys not in {
+        frozenset(validator_base_keys),
+        frozenset(validator_base_keys | {"api_override"}),
+    }:
+        raise ConfigError(
+            "Invalid ai_validator fields; expected enabled, feedback_mode, "
+            "shadow_mode, and optional api_override"
+        )
     if not isinstance(ai_validator["enabled"], bool):
         raise ConfigError("ai_validator.enabled must be true or false")
     if not isinstance(ai_validator["shadow_mode"], bool):
@@ -454,6 +463,67 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     if feedback_mode not in {"detailed", "verdict_only"}:
         raise ConfigError(
             "ai_validator.feedback_mode must be detailed or verdict_only"
+        )
+
+    main_api = ApiConfig(
+        base_url=base_url,
+        model=model,
+        provider_only=normalized_providers,
+        allow_fallbacks=False,
+        temperature=temperature,
+        reasoning_effort=normalized_reasoning_effort,
+        transport_retries=int(retries),
+        input_usd_per_million=input_price,
+        output_usd_per_million=output_price,
+    )
+    validator_api = main_api
+    if "api_override" in ai_validator:
+        override = _exact_keys(
+            ai_validator["api_override"],
+            {
+                "model",
+                "reasoning_effort",
+                "input_usd_per_million",
+                "output_usd_per_million",
+            },
+            "ai_validator.api_override",
+        )
+        validator_model = str(override["model"]).strip()
+        if not re.fullmatch(
+            r"[A-Za-z0-9._:-]+/[A-Za-z0-9._:-]+", validator_model
+        ):
+            raise ConfigError(
+                "ai_validator.api_override.model must be an explicit provider/model slug"
+            )
+        validator_reasoning = override["reasoning_effort"]
+        if validator_reasoning is not None and (
+            not isinstance(validator_reasoning, str)
+            or not validator_reasoning.strip()
+        ):
+            raise ConfigError(
+                "ai_validator.api_override.reasoning_effort must be null or a "
+                "non-empty string"
+            )
+        validator_api = ApiConfig(
+            base_url=main_api.base_url,
+            model=validator_model,
+            provider_only=main_api.provider_only,
+            allow_fallbacks=main_api.allow_fallbacks,
+            temperature=main_api.temperature,
+            reasoning_effort=(
+                validator_reasoning.strip().lower()
+                if isinstance(validator_reasoning, str)
+                else None
+            ),
+            transport_retries=main_api.transport_retries,
+            input_usd_per_million=_decimal(
+                override["input_usd_per_million"],
+                "ai_validator input token price",
+            ),
+            output_usd_per_million=_decimal(
+                override["output_usd_per_million"],
+                "ai_validator output token price",
+            ),
         )
 
     environment = _exact_keys(
@@ -477,17 +547,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
 
     return AppConfig(
         path=config_path,
-        api=ApiConfig(
-            base_url=base_url,
-            model=model,
-            provider_only=normalized_providers,
-            allow_fallbacks=False,
-            temperature=temperature,
-            reasoning_effort=normalized_reasoning_effort,
-            transport_retries=int(retries),
-            input_usd_per_million=input_price,
-            output_usd_per_million=output_price,
-        ),
+        api=main_api,
         pipeline=PipelineSettings(
             max_regenerations=FROZEN_MAX_REGENERATIONS,
             candidate_api_loss_confirmation_replays=(
@@ -505,6 +565,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             enabled=ai_validator["enabled"],
             feedback_mode=str(feedback_mode),
             shadow_mode=ai_validator["shadow_mode"],
+            api=validator_api,
         ),
         environment=EnvironmentConfig(
             lock=load_environment_lock(lock_path),
@@ -541,6 +602,14 @@ def treatment_id(config: AppConfig) -> str:
         validator = f"validator-shadow-{config.ai_validator.feedback_mode}"
     else:
         validator = f"validator-active-{config.ai_validator.feedback_mode}"
+    if config.ai_validator.enabled and config.ai_validator.api != config.api:
+        validator_model = re.sub(
+            r"[^a-z0-9]+", "-", config.ai_validator.api.model.lower()
+        ).strip("-")
+        validator_reasoning = config.ai_validator.api.reasoning_effort or "none"
+        validator = (
+            f"{validator}-model-{validator_model}-reasoning-{validator_reasoning}"
+        )
     return (
         f"{model}__reasoning-{reasoning}__temperature-{temperature}__{validator}"
     )

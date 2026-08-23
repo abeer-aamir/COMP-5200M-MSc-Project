@@ -111,7 +111,9 @@ def _plan(config: Any) -> dict[str, Any]:
         "max_ai_validator_responses_per_task": max_validator_responses,
         "max_model_responses_per_task": max_model_responses,
         "max_http_post_attempts_per_task": (
-            max_model_responses * (config.api.transport_retries + 1)
+            max_generations * (config.api.transport_retries + 1)
+            + max_validator_responses
+            * (config.ai_validator.api.transport_retries + 1)
         ),
         "max_candidate_clusters_per_task": max_cluster_attempts,
         "candidate_api_loss_confirmation_replays": (
@@ -157,8 +159,13 @@ def _plan(config: Any) -> dict[str, Any]:
             "intervention_active": (
                 config.ai_validator.enabled and not config.ai_validator.shadow_mode
             ),
-            "model": config.api.model,
-            "provider_only": list(config.api.provider_only),
+            "model": config.ai_validator.api.model,
+            "provider_only": list(config.ai_validator.api.provider_only),
+            "reasoning_effort": config.ai_validator.api.reasoning_effort,
+            "pricing_usd_per_million": {
+                "input": str(config.ai_validator.api.input_usd_per_million),
+                "output": str(config.ai_validator.api.output_usd_per_million),
+            },
             "feedback_mode": config.ai_validator.feedback_mode,
             "failure_threshold": (
                 "clear missing or contradicted requirement only; runtime uncertainty "
@@ -351,9 +358,21 @@ def main(argv: list[str] | None = None) -> int:
             load_env_file()
             api_key = os.getenv("OPENROUTER_API_KEY", "")
             client = OpenRouterTextClient(api_key, config.api)
+            validator_client = (
+                OpenRouterTextClient(api_key, config.ai_validator.api)
+                if config.ai_validator.enabled
+                and config.ai_validator.api != config.api
+                else client
+            )
             key_supplier = lambda: safe_key_budget_context(client.get_key_status())
         else:
             client = ReplayTextClient(args.fixtures, config.api.model)
+            validator_client = (
+                ReplayTextClient(args.fixtures, config.ai_validator.api.model)
+                if config.ai_validator.enabled
+                and config.ai_validator.api != config.api
+                else client
+            )
 
         public_results: list[dict[str, Any]] = []
         if args.initial_candidate is not None and len(tasks) != 1:
@@ -370,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 client,
                 harness,
+                validator_client=validator_client,
                 key_context_supplier=key_supplier,
             )
             public_results.append(

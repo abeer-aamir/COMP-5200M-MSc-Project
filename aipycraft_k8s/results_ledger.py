@@ -51,6 +51,8 @@ def _compact_record(
         "model": record.get("model"),
         "reasoning_effort": record.get("reasoning_effort"),
         "validator_enabled": bool(record.get("validator_enabled")),
+        "validator_model": record.get("validator_model"),
+        "validator_reasoning_effort": record.get("validator_reasoning_effort"),
         "status": record.get("status"),
         "terminal_attempt_result": record.get("terminal_attempt_result"),
         "attempts": int(record.get("attempts") or 0),

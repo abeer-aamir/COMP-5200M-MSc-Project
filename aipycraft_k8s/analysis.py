@@ -426,6 +426,22 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         "validator_intervention_active": (
             summary.get("ai_validator", {}) or {}
         ).get("intervention_active"),
+        "validator_model": (summary.get("ai_validator", {}) or {}).get("model"),
+        "validator_provider_only": (
+            summary.get("ai_validator", {}) or {}
+        ).get("provider_only"),
+        "validator_reasoning_effort": (
+            summary.get("ai_validator", {}) or {}
+        ).get("reasoning_effort"),
+        "validator_temperature": (
+            summary.get("ai_validator", {}) or {}
+        ).get("temperature"),
+        "validator_transport_retries": (
+            summary.get("ai_validator", {}) or {}
+        ).get("transport_retries"),
+        "validator_same_model_and_endpoint_as_aipycraft": (
+            summary.get("ai_validator", {}) or {}
+        ).get("same_model_and_endpoint_as_aipycraft"),
         "attempts": len(attempts),
         "regenerations": int(summary.get("regenerations") or 0),
         "duplicate_generation_responses": int(

@@ -912,11 +912,24 @@ class KubernetesAIPyCraftPipeline:
                 "enabled": self.config.ai_validator.enabled,
                 "feedback_mode": self.config.ai_validator.feedback_mode,
                 "shadow_mode": self.config.ai_validator.shadow_mode,
+                "model": self.config.ai_validator.api.model,
+                "provider_only": list(self.config.ai_validator.api.provider_only),
+                "reasoning_effort": self.config.ai_validator.api.reasoning_effort,
+                "temperature": self.config.ai_validator.api.temperature,
+                "transport_retries": self.config.ai_validator.api.transport_retries,
+                "input_usd_per_million": str(
+                    self.config.ai_validator.api.input_usd_per_million
+                ),
+                "output_usd_per_million": str(
+                    self.config.ai_validator.api.output_usd_per_million
+                ),
                 "intervention_active": (
                     self.config.ai_validator.enabled
                     and not self.config.ai_validator.shadow_mode
                 ),
-                "same_model_and_endpoint_as_aipycraft": True,
+                "same_model_and_endpoint_as_aipycraft": (
+                    self.config.ai_validator.api == self.config.api
+                ),
                 "failure_policy": "abort_on_validator_or_provider_error",
             },
             "attempts": attempts,

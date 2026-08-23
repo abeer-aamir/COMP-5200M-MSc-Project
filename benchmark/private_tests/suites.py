@@ -1629,6 +1629,18 @@ def _combined_command(container: dict[str, Any]) -> list[str]:
     return [*container.get("command", []), *container.get("args", [])]
 
 
+def _exact_shell_program(container: dict[str, Any], expected: str) -> bool:
+    """Ignore only YAML's harmless terminal line break in a sh -c program."""
+
+    command = _combined_command(container)
+    return (
+        len(command) == 3
+        and command[:2] == ["sh", "-c"]
+        and isinstance(command[2], str)
+        and command[2].rstrip("\r\n") == expected
+    )
+
+
 def _single_named_container(workload: dict[str, Any], name: str) -> dict[str, Any]:
     containers = pod_spec(workload).get("containers", [])
     require(len(containers) == 1, "workload must contain exactly one main container")
@@ -1709,15 +1721,14 @@ def _assert_http_readiness(
         require(probe.get("initialDelaySeconds", 0) == initial_delay, "readiness initialDelaySeconds differs")
 
 
-def _assert_medium_hardening(workload: dict[str, Any], label: str) -> None:
+def _assert_medium_hardening(
+    workload: dict[str, Any], label: str, *, require_run_as_non_root: bool = False
+) -> None:
     spec = pod_spec(workload)
     pod_security = spec.get("securityContext", {})
-    expected_pod = {
-        "runAsNonRoot": True,
-        "runAsUser": 1000,
-        "runAsGroup": 1000,
-        "fsGroup": 1000,
-    }
+    expected_pod = {"runAsUser": 1000, "runAsGroup": 1000, "fsGroup": 1000}
+    if require_run_as_non_root:
+        expected_pod["runAsNonRoot"] = True
     for field, expected in expected_pod.items():
         require(pod_security.get(field) == expected, f"{label}: pod securityContext {field} differs")
     for container in all_containers(spec):
@@ -2367,12 +2378,9 @@ def _medium1_checks(
         token_env = [item for item in container.get("env", []) if item.get("name") == "API_TOKEN"]
         require(len(token_env) == 1 and token_env[0].get("valueFrom", {}).get("secretKeyRef", {}) == {"name": "portal-token", "key": "API_TOKEN"}, "API_TOKEN is not sourced exactly once through portal-token/API_TOKEN secretKeyRef")
         require(not any(item.get("secretRef", {}).get("name") == "portal-token" for item in container.get("envFrom", [])), "portal-token must not be exposed through envFrom")
-        mount = find_mount(container, "/www")
-        require(mount is not None and mount.get("readOnly") is True, "/www must be mounted read-only")
-        volume = find_volume(pod_spec(deployment), mount.get("name", ""))
-        require(volume is not None and volume.get("configMap", {}).get("name") == "portal-content", "/www is not backed by portal-content")
-        items = volume.get("configMap", {}).get("items")
-        require(items is None or (len(items) == 1 and items[0].get("key") == "index.html"), "portal-content projection must include its complete key set")
+        _assert_complete_configmap_mount(
+            deployment, container, "/www", "portal-content", {"index.html"}
+        )
         _assert_tcp_port(container, 8080, "http")
         _assert_http_readiness(container, path="/", port="http", period=5, failure=3)
         kube.rollout("deployment", "portal-web", timeout_seconds=60)
@@ -2622,7 +2630,7 @@ def _medium3_checks(
         container = _single_named_container(stateful, "registry")
         require(container.get("image") == "busybox:1.36.1", "registry image differs")
         expected_command = 'if [ ! -f /data/index.html ]; then printf "%s-%s-%s\\n" "$PREFIX" "$HOSTNAME" "$SUFFIX" > /data/index.html; fi; httpd -f -p 8080 -h /data'
-        require(_combined_command(container) == ["sh", "-c", expected_command], "registry command differs")
+        require(_exact_shell_program(container, expected_command), "registry command differs")
         env = {item.get("name"): item.get("valueFrom", {}) for item in container.get("env", []) if isinstance(item, dict)}
         require(env.get("PREFIX", {}).get("configMapKeyRef", {}) == {"name": "registry-prefix", "key": "PREFIX"}, "PREFIX source differs")
         require(env.get("SUFFIX", {}).get("secretKeyRef", {}) == {"name": "registry-suffix", "key": "SUFFIX"}, "SUFFIX source differs")
@@ -2716,12 +2724,9 @@ def _medium4_checks(
         container = _single_named_container(deployment, "web")
         require(container.get("image") == "busybox:1.36.1", "check-web image differs")
         require(_combined_command(container) in (["httpd", "-f", "-p", "8080", "-h", "/www"], ["sh", "-c", "httpd -f -p 8080 -h /www"]), "check-web command differs")
-        mount = find_mount(container, "/www")
-        require(mount is not None and mount.get("readOnly") is True, "/www must be mounted read-only")
-        volume = find_volume(pod_spec(deployment), mount.get("name", ""))
-        require(volume is not None and volume.get("configMap", {}).get("name") == "check-content", "/www is not backed by check-content")
-        items = volume.get("configMap", {}).get("items")
-        require(items is None or (len(items) == 1 and items[0].get("key") == "index.html"), "check-content projection must include its complete key set")
+        _assert_complete_configmap_mount(
+            deployment, container, "/www", "check-content", {"index.html"}
+        )
         _assert_tcp_port(container, 8080, "http")
         _assert_http_readiness(container, path="/", port="http", period=5, failure=3, initial_delay=2)
         kube.rollout("deployment", "check-web", timeout_seconds=60)
@@ -2765,7 +2770,7 @@ def _medium4_checks(
         containers = pod.get("containers", [])
         require(len(containers) == 1 and containers[0].get("name") == "checker", "CronJob must have one checker container")
         require(containers[0].get("image") == "busybox:1.36.1", "checker image differs")
-        require(_combined_command(containers[0]) == ["sh", "-c", expected_cron_command], "scheduled-check command differs")
+        require(_exact_shell_program(containers[0], expected_cron_command), "scheduled-check command differs")
         return _run_cronjob_and_assert_log(kube, "scheduled-check", "scheduled-check", "check-ok\n", 60)
 
     def r08() -> str:
@@ -2823,7 +2828,7 @@ def _medium5_checks(
         require(len(init) == 1 and init[0].get("name") == "seed", "ledger-web must have exactly one seed init container")
         require(len(main) == 1 and main[0].get("name") == "web", "ledger-web must have exactly one web container")
         require(init[0].get("image") == "busybox:1.36.1", "seed image differs")
-        require(_combined_command(init[0]) == ["sh", "-c", "if [ ! -f /data/index.html ]; then cp /seed/index.html /data/index.html; fi"], "seed command differs")
+        require(_exact_shell_program(init[0], "if [ ! -f /data/index.html ]; then cp /seed/index.html /data/index.html; fi"), "seed command differs")
         require(main[0].get("image") == "busybox:1.36.1", "web image differs")
         require(_combined_command(main[0]) in (["httpd", "-f", "-p", "8080", "-h", "/data"], ["sh", "-c", "httpd -f -p 8080 -h /data"]), "ledger web command differs")
         seed_mount = find_mount(init[0], "/seed")
@@ -2966,6 +2971,13 @@ def _assert_complete_configmap_mount(
     volume = find_volume(pod_spec(workload), mount.get("name", ""))
     require(volume is not None, f"volume for {path} is missing")
     source = volume.get("configMap", {})
+    if not source:
+        projected_sources = volume.get("projected", {}).get("sources", [])
+        require(
+            isinstance(projected_sources, list) and len(projected_sources) == 1,
+            f"{path} must use one complete ConfigMap source",
+        )
+        source = projected_sources[0].get("configMap", {})
     require(source.get("name") == name, f"{path} is not backed by ConfigMap {name}")
     items = source.get("items")
     if items is not None:
@@ -2997,7 +3009,7 @@ def _assert_exact_service(
 
 
 def _assert_workload_hardening(workload: dict[str, Any], label: str) -> None:
-    _assert_medium_hardening(workload, label)
+    _assert_medium_hardening(workload, label, require_run_as_non_root=True)
 
 
 def _ready_count(kube: Kubectl, label: str) -> int:
