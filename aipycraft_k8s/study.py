@@ -246,6 +246,223 @@ def create_manifest(
     return manifest
 
 
+def recover_paired_study(
+    plan_path: Path, *, plan_only: bool = False
+) -> dict[str, Any]:
+    """Resume interrupted candidate banking, then run the original paired study."""
+
+    plan_path = plan_path.resolve()
+    plan = _read_json(plan_path)
+    required = {
+        "schema_version",
+        "study_name",
+        "generator_config",
+        "treatment_configs",
+        "tasks",
+        "existing_candidates",
+        "study_root",
+        "candidate_root",
+        "max_infrastructure_reruns",
+        "max_study_cost_usd",
+    }
+    if set(plan) != required or plan.get("schema_version") != 1:
+        raise StudyError(
+            "Recovery plan must be schema 1 with exactly the documented fields"
+        )
+
+    def project_path(raw: Any, field: str) -> Path:
+        if not isinstance(raw, str) or not raw.strip():
+            raise StudyError(f"Recovery plan {field} must be a non-empty path")
+        value = Path(raw)
+        return (value if value.is_absolute() else PROJECT_ROOT / value).resolve()
+
+    study_name = str(plan["study_name"])
+    tasks = [str(item) for item in plan["tasks"]]
+    if not tasks or len(tasks) != len(set(tasks)):
+        raise StudyError("Recovery plan tasks must be non-empty and unique")
+    unknown = sorted(set(tasks) - set(load_tasks()))
+    if unknown:
+        raise StudyError(f"Recovery plan contains unknown tasks: {unknown}")
+    generator_path = project_path(plan["generator_config"], "generator_config")
+    treatment_paths = [
+        project_path(item, "treatment_configs")
+        for item in plan["treatment_configs"]
+    ]
+    if not treatment_paths:
+        raise StudyError("Recovery plan requires treatment configs")
+    study_root = project_path(plan["study_root"], "study_root")
+    candidate_root = project_path(plan["candidate_root"], "candidate_root")
+    study_dir = study_root / study_name
+    manifest_path = study_dir / "manifest.json"
+    scheduler_state_path = study_dir / "state.json"
+    recovery_state_path = study_dir / "candidate_generation_recovery.json"
+    if scheduler_state_path.exists():
+        raise StudyError(
+            "Study scheduler state already exists; use the ordinary run command"
+        )
+    if manifest_path.exists() and plan_only:
+        return {
+            "status": "planned",
+            "paid_calls_made": False,
+            "manifest_exists": True,
+            "manifest": str(manifest_path),
+        }
+    if manifest_path.exists():
+        return run_manifest(manifest_path)
+
+    max_reruns = int(plan["max_infrastructure_reruns"])
+    if max_reruns < 0:
+        raise StudyError("Recovery max_infrastructure_reruns cannot be negative")
+    raw_cap = plan["max_study_cost_usd"]
+    cost_cap = None if raw_cap is None else Decimal(str(raw_cap))
+    if cost_cap is not None and cost_cap <= 0:
+        raise StudyError("Recovery max_study_cost_usd must be positive or null")
+
+    config = load_config(generator_path)
+    plan_sha256 = _sha256_file(plan_path)
+    candidate_by_task: dict[str, Path] = {}
+    source_paths = [
+        project_path(item, "existing_candidates")
+        for item in plan["existing_candidates"]
+    ]
+    if recovery_state_path.exists():
+        recovery = _read_json(recovery_state_path)
+        if recovery.get("plan_sha256") != plan_sha256:
+            raise StudyError("Recovery plan changed after checkpoint creation")
+        source_paths.extend(Path(item) for item in recovery.get("candidates", []))
+
+    for candidate_path in source_paths:
+        candidate_path = candidate_path.resolve()
+        raw = _read_json(candidate_path)
+        task_id = str(raw.get("task_id", ""))
+        if task_id not in tasks:
+            raise StudyError(
+                f"Recovery candidate {candidate_path} belongs to unexpected task {task_id}"
+            )
+        previous = candidate_by_task.get(task_id)
+        if previous is not None and previous != candidate_path:
+            raise StudyError(f"Multiple recovery candidates were supplied for {task_id}")
+        load_entry(candidate_path, task=load_task(task_id), config=config)
+        candidate_by_task[task_id] = candidate_path
+
+    if plan_only:
+        return {
+            "status": "planned",
+            "paid_calls_made": False,
+            "study_name": study_name,
+            "generator_model": config.api.model,
+            "generator_reasoning": config.api.reasoning_effort,
+            "existing_tasks": [
+                task_id for task_id in tasks if task_id in candidate_by_task
+            ],
+            "missing_tasks": [
+                task_id for task_id in tasks if task_id not in candidate_by_task
+            ],
+            "existing_candidates": len(candidate_by_task),
+            "max_study_cost_usd": (
+                None if cost_cap is None else str(cost_cap)
+            ),
+        }
+
+    def observed_candidate_cost() -> Decimal:
+        return sum(
+            (
+                Decimal(
+                    str(
+                        (_read_json(path).get("generation", {}) or {}).get(
+                            "cost_usd", "0"
+                        )
+                    )
+                )
+                for path in candidate_by_task.values()
+            ),
+            Decimal("0"),
+        )
+
+    def save_recovery(status: str, **extra: Any) -> None:
+        _write_json_atomic(
+            recovery_state_path,
+            {
+                "schema_version": 1,
+                "study_name": study_name,
+                "plan": str(plan_path),
+                "plan_sha256": plan_sha256,
+                "status": status,
+                "updated_at": _utc_now(),
+                "candidates": [
+                    str(candidate_by_task[task_id])
+                    for task_id in tasks
+                    if task_id in candidate_by_task
+                ],
+                "completed_tasks": [
+                    task_id for task_id in tasks if task_id in candidate_by_task
+                ],
+                "remaining_tasks": [
+                    task_id for task_id in tasks if task_id not in candidate_by_task
+                ],
+                "observed_candidate_cost_usd": str(observed_candidate_cost()),
+                **extra,
+            },
+        )
+
+    save_recovery("preflight")
+    preflight_started = time.monotonic()
+    try:
+        preflight = EnvironmentPreparer(
+            config.environment,
+            timeout_seconds=max(config.pipeline.command_timeout_seconds, 900),
+        ).doctor()
+    except Exception as exc:
+        save_recovery(
+            "preflight_failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+            preflight_duration_ms=round(
+                (time.monotonic() - preflight_started) * 1000
+            ),
+        )
+        raise
+    save_recovery(
+        "generating",
+        preflight_status=preflight.get("status"),
+        preflight_duration_ms=round((time.monotonic() - preflight_started) * 1000),
+    )
+
+    for task_id in tasks:
+        if task_id in candidate_by_task:
+            continue
+        if cost_cap is not None and observed_candidate_cost() >= cost_cap:
+            save_recovery("budget_stop", cap_usd=str(cost_cap))
+            raise StudyError("Recovery candidate-generation cost ceiling was reached")
+        try:
+            candidate_path = generate_candidate(
+                config_path=generator_path,
+                task_id=task_id,
+                output_root=candidate_root,
+            )
+        except Exception as exc:
+            save_recovery(
+                "interrupted",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        candidate_by_task[task_id] = candidate_path.resolve()
+        save_recovery("generating")
+
+    ordered_candidates = [candidate_by_task[task_id] for task_id in tasks]
+    create_manifest(
+        name=study_name,
+        candidate_paths=ordered_candidates,
+        config_paths=treatment_paths,
+        output_path=manifest_path,
+        max_infrastructure_reruns=max_reruns,
+        max_study_cost_usd=cost_cap,
+    )
+    save_recovery("manifest_created", manifest=str(manifest_path))
+    return run_manifest(manifest_path)
+
+
 def _public_result(stdout: str) -> dict[str, Any] | None:
     try:
         value = json.loads(stdout)
@@ -606,6 +823,14 @@ def _parser() -> argparse.ArgumentParser:
     paired.add_argument("--max-infrastructure-reruns", type=int, default=1)
     paired.add_argument("--max-study-cost-usd", type=Decimal)
     paired.add_argument("--confirm-paid-calls", required=True)
+
+    recover = sub.add_parser(
+        "recover-paired",
+        help="Reuse checkpointed candidates, generate only missing tasks, then run",
+    )
+    recover.add_argument("--plan", type=Path, required=True)
+    recover.add_argument("--confirm-paid-calls")
+    recover.add_argument("--plan-only", action="store_true")
     return parser
 
 
@@ -643,6 +868,12 @@ def main(argv: list[str] | None = None) -> int:
             value = run_manifest(args.manifest, only_row=args.row)
             print(json.dumps(value, indent=2))
             return 0 if value["status"] == "completed" else 2
+        if args.command == "recover-paired":
+            if not args.plan_only:
+                _confirm(args.confirm_paid_calls)
+            value = recover_paired_study(args.plan, plan_only=args.plan_only)
+            print(json.dumps(value, indent=2))
+            return 0 if value["status"] in {"completed", "planned"} else 2
 
         _confirm(args.confirm_paid_calls)
         if args.replicates < 1:
