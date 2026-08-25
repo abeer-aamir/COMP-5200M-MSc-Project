@@ -137,6 +137,12 @@ def _message_text(content: Any) -> str:
     raise ProviderError("OpenRouter response content was not text")
 
 
+def _provider_identity(value: str) -> str:
+    """Normalize OpenRouter provider slugs and display names for auditing."""
+
+    return "".join(character for character in value.casefold() if character.isalnum())
+
+
 def _nonnegative_int(value: Any) -> tuple[int, bool]:
     if isinstance(value, bool):
         return 0, False
@@ -473,8 +479,8 @@ class OpenRouterTextClient:
                 f"Model substitution refused: requested {self.config.model}, "
                 f"got {audit.response_model or '<missing>'}"
             )
-        if audit.provider is None or audit.provider.casefold() not in {
-            value.casefold() for value in self.config.provider_only
+        if audit.provider is None or _provider_identity(audit.provider) not in {
+            _provider_identity(value) for value in self.config.provider_only
         }:
             reject(
                 "Provider substitution refused: requested "

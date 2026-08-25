@@ -478,16 +478,24 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     )
     validator_api = main_api
     if "api_override" in ai_validator:
-        override = _exact_keys(
-            ai_validator["api_override"],
-            {
-                "model",
-                "reasoning_effort",
-                "input_usd_per_million",
-                "output_usd_per_million",
-            },
-            "ai_validator.api_override",
-        )
+        override = ai_validator["api_override"]
+        override_base_keys = {
+            "model",
+            "reasoning_effort",
+            "input_usd_per_million",
+            "output_usd_per_million",
+        }
+        if not isinstance(override, dict) or frozenset(override) not in {
+            frozenset(override_base_keys),
+            frozenset(override_base_keys | {"provider_only"}),
+        }:
+            actual = set(override) if isinstance(override, dict) else set()
+            expected = override_base_keys | {"provider_only"}
+            raise ConfigError(
+                "Invalid ai_validator.api_override fields; "
+                f"missing={sorted(override_base_keys - actual)}, "
+                f"extra={sorted(actual - expected)}"
+            )
         validator_model = str(override["model"]).strip()
         if not re.fullmatch(
             r"[A-Za-z0-9._:-]+/[A-Za-z0-9._:-]+", validator_model
@@ -504,10 +512,29 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
                 "ai_validator.api_override.reasoning_effort must be null or a "
                 "non-empty string"
             )
+        validator_providers = override.get(
+            "provider_only", list(main_api.provider_only)
+        )
+        if not isinstance(validator_providers, list) or not validator_providers or any(
+            not isinstance(item, str) or not item.strip()
+            for item in validator_providers
+        ):
+            raise ConfigError(
+                "ai_validator.api_override.provider_only must be a non-empty "
+                "string array"
+            )
+        normalized_validator_providers = tuple(
+            item.strip().lower() for item in validator_providers
+        )
+        if len(normalized_validator_providers) != 1:
+            raise ConfigError(
+                "Frozen validator experiments require exactly one explicit "
+                "provider route"
+            )
         validator_api = ApiConfig(
             base_url=main_api.base_url,
             model=validator_model,
-            provider_only=main_api.provider_only,
+            provider_only=normalized_validator_providers,
             allow_fallbacks=main_api.allow_fallbacks,
             temperature=main_api.temperature,
             reasoning_effort=(
