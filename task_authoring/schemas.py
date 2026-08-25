@@ -96,14 +96,14 @@ SPEC_SCHEMA: dict[str, Any] = {
         "properties": {
             "task_id": {
                 "type": "string",
-                "pattern": "^(pilot|easy|medium|hard)-[0-9]{3}$",
+                "pattern": "^(pilot|easy|medium|hard|very-hard)-[0-9]{3}$",
             },
             "difficulty_level": {"type": "string", "enum": list(DIFFICULTY_LEVELS)},
             "scenario": {"type": "string"},
             "requirements": {
                 "type": "array",
                 "minItems": 6,
-                "maxItems": 14,
+                "maxItems": 18,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -136,7 +136,7 @@ SPEC_SCHEMA: dict[str, Any] = {
             "runtime_behaviours": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 3,
+                "maxItems": 4,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -155,7 +155,7 @@ SPEC_SCHEMA: dict[str, Any] = {
             "safety_constraints": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 3,
+                "maxItems": 4,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -178,7 +178,7 @@ SPEC_SCHEMA: dict[str, Any] = {
             "verification_blueprints": {
                 "type": "array",
                 "minItems": 6,
-                "maxItems": 14,
+                "maxItems": 18,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,

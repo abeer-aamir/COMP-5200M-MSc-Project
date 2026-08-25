@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "benchmark" / "pilot_config.json"
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 REQUIRED_ROLES = ("spec_generator", "plaintext_writer", "critic")
-DIFFICULTY_LEVELS = ("easy", "medium", "hard")
+DIFFICULTY_LEVELS = ("easy", "medium", "hard", "very_hard")
 
 
 class ConfigError(ValueError):
@@ -99,8 +99,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
 
     task_count = int(raw.get("task_count", 0))
     max_task_count = int(raw.get("max_task_count", 0))
-    if not 1 <= task_count <= max_task_count <= 15:
-        raise ConfigError("Require 1 <= task_count <= max_task_count <= 15")
+    if not 1 <= task_count <= max_task_count <= 20:
+        raise ConfigError("Require 1 <= task_count <= max_task_count <= 20")
 
     revision_rounds = int(raw.get("max_revision_rounds", -1))
     if revision_rounds not in (0, 1):
@@ -177,11 +177,15 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
 
     default_difficulty = str(raw.get("default_difficulty", ""))
     if default_difficulty not in DIFFICULTY_LEVELS:
-        raise ConfigError("default_difficulty must be easy, medium, or hard")
+        raise ConfigError(
+            "default_difficulty must be easy, medium, hard, or very_hard"
+        )
 
     raw_contracts = raw.get("difficulty_contracts", {})
     if set(raw_contracts) != set(DIFFICULTY_LEVELS):
-        raise ConfigError("difficulty_contracts must define easy, medium, and hard")
+        raise ConfigError(
+            "difficulty_contracts must define easy, medium, hard, and very_hard"
+        )
     required_contract_fields = {
         "minimum_public_requirements",
         "maximum_public_requirements",

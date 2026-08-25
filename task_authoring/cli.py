@@ -44,7 +44,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--difficulty-plan",
-        help="Comma-separated campaign counts, for example easy:5,medium:5,hard:5",
+        help=(
+            "Comma-separated campaign counts, for example "
+            "easy:5,medium:5,hard:5,very_hard:5"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("plan", help="Show configuration and make no network calls")
@@ -70,7 +73,8 @@ def _task_plan(args: argparse.Namespace, config) -> list[tuple[str, str]]:
             parts = raw_entry.strip().split(":", 1)
             if len(parts) != 2 or parts[0] not in DIFFICULTY_LEVELS:
                 raise ValueError(
-                    "difficulty plan entries must use easy:N, medium:N, or hard:N"
+                    "difficulty plan entries must use easy:N, medium:N, hard:N, "
+                    "or very_hard:N"
                 )
             try:
                 count = int(parts[1])
@@ -81,15 +85,20 @@ def _task_plan(args: argparse.Namespace, config) -> list[tuple[str, str]]:
                     "difficulty plan counts must be positive and levels unique"
                 )
             counts[parts[0]] = count
+        task_prefixes = {"very_hard": "very-hard"}
         plan = [
-            (f"{level}-{index:03d}", level)
+            (f"{task_prefixes.get(level, level)}-{index:03d}", level)
             for level in DIFFICULTY_LEVELS
             for index in range(1, counts.get(level, 0) + 1)
         ]
     else:
         count = config.task_count if args.tasks is None else args.tasks
         level = args.difficulty or config.default_difficulty
-        prefix = level if args.difficulty is not None else "pilot"
+        prefix = (
+            "very-hard"
+            if args.difficulty is not None and level == "very_hard"
+            else level if args.difficulty is not None else "pilot"
+        )
         plan = [(f"{prefix}-{index:03d}", level) for index in range(1, count + 1)]
     if not 1 <= len(plan) <= config.max_task_count:
         raise ValueError(f"task plan must contain from 1 to {config.max_task_count} tasks")

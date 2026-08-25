@@ -7,7 +7,7 @@ mutation tests, real-cluster validation, and human audit remain authoritative.
 
 INPUTS
 
-<difficulty_level>{{easy|medium|hard}}</difficulty_level>
+<difficulty_level>{{easy|medium|hard|very_hard}}</difficulty_level>
 <difficulty_contract>{{selected_contract}}</difficulty_contract>
 
 <private_specification>
@@ -142,6 +142,11 @@ After correctness, independently classify structural hardness:
   without the required interaction depth;
 - `harder_than_contract`: actual structure exceeds a contract maximum/exact count or adds deeper
   interaction than the selected tier permits.
+
+For `very_hard`, also require a real dependency path of at least three edges, a genuine fan-in or
+fan-out point, at least two workload-controller roles, at least two bounded reversible induced
+changes, and at least one recovery that depends on multiple Kubernetes mechanisms converging.
+Nominal counts without this interaction structure are `easier_than_contract`.
 
 Give one concise sentence citing the concrete counts/edges/mechanisms that determine the result.
 Any hardness mismatch must also appear as a `contract_violation` finding, because an accepted task

@@ -7,7 +7,7 @@ solver sees only the public task text produced by the plaintext writer.
 INPUTS
 
 <task_id>{{task_id}}</task_id>
-<difficulty_level>{{easy|medium|hard}}</difficulty_level>
+<difficulty_level>{{easy|medium|hard|very_hard}}</difficulty_level>
 <difficulty_contract>{{selected_contract}}</difficulty_contract>
 <authoring_brief>{{frozen_brief}}</authoring_brief>
 <diversity_fingerprints>{{structured_fingerprints_of_previously_accepted_tasks}}</diversity_fingerprints>
@@ -121,6 +121,14 @@ responding rather than trusting your own summaries:
 
 If the selected contract contains a minimum, meet or exceed it without gratuitous filler. If it
 contains an exact value or maximum, obey it exactly.
+
+For `very_hard`, the numeric contract is necessary but not sufficient. The dependency graph must
+contain a real path of at least three edges and at least one genuine fan-in or fan-out point. Use at
+least two workload-controller roles, require at least two bounded and reversible induced changes,
+and make one recovery depend on more than one Kubernetes mechanism converging. Four isolated live
+checks, a long list of fields, or many independent resources do not qualify. Preserve feasibility:
+the complete task and its future oracle must still run deterministically on the frozen single-node
+environment with clean rollback after every mutation.
 
 DEPENDENCY GRAPH
 

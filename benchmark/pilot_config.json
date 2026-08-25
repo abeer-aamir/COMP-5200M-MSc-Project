@@ -2,7 +2,7 @@
   "api_base": "https://openrouter.ai/api/v1",
   "budget_usd": null,
   "task_count": 2,
-  "max_task_count": 15,
+  "max_task_count": 20,
   "max_revision_rounds": 1,
   "default_difficulty": "hard",
   "target_kubernetes_version": "1.35",
@@ -73,6 +73,17 @@
       "runtime_behaviours": 3,
       "safety_constraints": 3,
       "minimum_interacting_mechanisms": 3
+    },
+    "very_hard": {
+      "minimum_public_requirements": 16,
+      "maximum_public_requirements": 18,
+      "minimum_resource_kinds": 11,
+      "maximum_resource_kinds": 14,
+      "minimum_dependency_edges": 10,
+      "maximum_dependency_edges": null,
+      "runtime_behaviours": 4,
+      "safety_constraints": 4,
+      "minimum_interacting_mechanisms": 5
     }
   }
 }
