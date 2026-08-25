@@ -72,6 +72,7 @@ class PilotConfig:
     max_revision_rounds: int
     target_kubernetes_version: str
     kind_node_image: str
+    execution_image: str
     reservation_safety_multiplier: Decimal
     roles: dict[str, RoleConfig]
     default_difficulty: str
@@ -251,6 +252,9 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
     )
     if multiplier < Decimal("1.0"):
         raise ConfigError("reservation_safety_multiplier cannot be below 1")
+    execution_image = str(raw.get("execution_image", "busybox:1.36.1")).strip()
+    if not execution_image:
+        raise ConfigError("execution_image must be a non-empty image reference")
 
     return PilotConfig(
         path=config_path,
@@ -261,6 +265,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
         max_revision_rounds=revision_rounds,
         target_kubernetes_version=str(raw["target_kubernetes_version"]),
         kind_node_image=str(raw["kind_node_image"]),
+        execution_image=execution_image,
         reservation_safety_multiplier=multiplier,
         roles=roles,
         default_difficulty=default_difficulty,

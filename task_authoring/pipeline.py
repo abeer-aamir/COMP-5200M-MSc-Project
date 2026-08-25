@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -37,6 +38,28 @@ def _write_json(path: Path, value: Any) -> None:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _namespace_from_spec(spec: dict[str, Any]) -> str:
+    requirements = spec.get("requirements", [])
+    namespace_requirements = [
+        str(item.get("text", ""))
+        for item in requirements
+        if isinstance(item, dict) and re.search(r"\bNamespace\b", str(item.get("text", "")))
+    ]
+    if len(namespace_requirements) != 1:
+        raise PipelineError("Accepted task must contain exactly one Namespace requirement")
+    match = re.search(
+        r"\bNamespace(?:\s+object)?(?:\s+(?:named|called))?\s+[`'\"]?"
+        r"([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)[`'\"]?",
+        namespace_requirements[0],
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise PipelineError(
+            "Namespace requirement must name one DNS-compatible namespace"
+        )
+    return match.group(1).lower()
 
 
 def _artifact_integrity(root: Path) -> dict[str, Any]:
@@ -129,6 +152,8 @@ class TaskAuthoringPipeline:
         self.run_dir = self.output_root / self.run_id
         self.public_dir = self.run_dir / "public"
         self.private_dir = self.run_dir / "private"
+        self.execution_dir = self.run_dir / "tasks"
+        self.execution_index_path = self.run_dir / "task-index.json"
         self.usage_path = self.private_dir / "usage.jsonl"
         self._event_sequence = 0
         self._unknown_cost_failures = 0
@@ -509,9 +534,14 @@ class TaskAuthoringPipeline:
             last_errors = sorted(set(critic_shape_errors + gate_errors))
             _write_json(round_dir / "acceptance_errors.json", last_errors)
             if not last_errors:
+                namespace = _namespace_from_spec(spec)
+                task_text = writer["task_text"].strip() + "\n"
                 self.public_dir.mkdir(parents=True, exist_ok=True)
                 public_path = self.public_dir / f"{task_id}.txt"
-                public_path.write_text(writer["task_text"].strip() + "\n", encoding="utf-8")
+                public_path.write_text(task_text, encoding="utf-8")
+                execution_path = self.execution_dir / task_id / "description.txt"
+                execution_path.parent.mkdir(parents=True, exist_ok=True)
+                execution_path.write_text(task_text, encoding="utf-8")
                 _write_json(task_dir / "final_spec.json", spec)
                 _write_json(task_dir / "final_writer.json", writer)
                 _write_json(task_dir / "final_critic.json", critic)
@@ -533,6 +563,8 @@ class TaskAuthoringPipeline:
                     "finished_at": datetime.now(timezone.utc).isoformat(),
                     "round": round_number,
                     "public_path": str(public_path),
+                    "execution_description": str(execution_path),
+                    "namespace": namespace,
                     "hardness_assessment": critic["hardness_assessment"],
                     "critic_findings": len(critic["findings"]),
                     "duration_ms": round((time.monotonic() - task_started) * 1000),
@@ -615,6 +647,26 @@ class TaskAuthoringPipeline:
             stage_timings_ms["task_generation"] = round(
                 (time.monotonic() - task_generation_started) * 1000
             )
+        accepted_results = [
+            item for item in task_results if item.get("status") == "accepted"
+        ]
+        _write_json(
+            self.execution_index_path,
+            {
+                "schema_version": 1,
+                "kubernetes_version": self.config.target_kubernetes_version,
+                "execution_image": self.config.execution_image,
+                "tasks": [
+                    {
+                        "task_id": item["task_id"],
+                        "namespace": item["namespace"],
+                        "description": f"tasks/{item['task_id']}/description.txt",
+                        "post_execution_suite": None,
+                    }
+                    for item in accepted_results
+                ],
+            },
+        )
         summary = {
             "run_id": self.run_id,
             "status": status,
@@ -637,6 +689,7 @@ class TaskAuthoringPipeline:
             "openrouter_key_budget_context": self.key_budget_context,
             "accepted_tasks": sum(x.get("status") == "accepted" for x in task_results),
             "requested_tasks": len(self.task_plan),
+            "task_index": str(self.execution_index_path),
             "requested_by_difficulty": {
                 level: sum(difficulty == level for _, difficulty in self.task_plan)
                 for level in self.config.difficulty_contracts

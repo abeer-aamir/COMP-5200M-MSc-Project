@@ -52,25 +52,32 @@ class BenchmarkTask:
     namespace: str
     description_path: Path
     description: str
-    post_execution_suite: str
+    post_execution_suite: str | None
     kubernetes_version: str
     execution_image: str
 
 
-def _resolve_project_file(value: Any) -> Path:
+def _resolve_description(index_path: Path, value: Any) -> Path:
     if not isinstance(value, str):
         raise TaskError("Task description path must be a string")
-    path = (PROJECT_ROOT / value).resolve()
+    relative = Path(value)
+    if relative.is_absolute():
+        raise TaskError("Task description path must be relative")
+    canonical_index = index_path.resolve() == TASK_INDEX.resolve()
+    base = PROJECT_ROOT if canonical_index else index_path.resolve().parent
+    path = (base / relative).resolve()
     try:
-        path.relative_to(PROJECT_ROOT.resolve())
+        path.relative_to(base.resolve())
     except ValueError as exc:
-        raise TaskError("Task description escapes the project root") from exc
+        raise TaskError("Task description escapes its task-set root") from exc
     if not path.is_file():
         raise TaskError(f"Task description was not found: {path}")
     return path
 
 
 def load_tasks(index_path: Path = TASK_INDEX) -> dict[str, BenchmarkTask]:
+    index_path = Path(index_path).resolve()
+    canonical_index = index_path == TASK_INDEX.resolve()
     try:
         raw = json.loads(index_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -95,7 +102,7 @@ def load_tasks(index_path: Path = TASK_INDEX) -> dict[str, BenchmarkTask]:
         required = {"task_id", "namespace", "description", "post_execution_suite"}
         if not isinstance(item, dict) or set(item) != required:
             raise TaskError("Task index entry has unexpected fields")
-        description_path = _resolve_project_file(item["description"])
+        description_path = _resolve_description(index_path, item["description"])
         if not isinstance(item["task_id"], str) or not re.fullmatch(
             r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", item["task_id"]
         ):
@@ -108,27 +115,40 @@ def load_tasks(index_path: Path = TASK_INDEX) -> dict[str, BenchmarkTask]:
             r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", namespace
         ):
             raise TaskError(f"Invalid namespace for {task_id}: {namespace!r}")
-        expected_namespace = CANONICAL_TASK_NAMESPACES.get(task_id)
-        if expected_namespace is None:
-            raise TaskError(
-                f"Task {task_id} has no registered private evaluator contract"
-            )
-        if namespace != expected_namespace:
-            raise TaskError(
-                f"Task {task_id} must use namespace {expected_namespace!r}, "
-                f"not {namespace!r}"
-            )
-        if item["post_execution_suite"] != task_id:
-            raise TaskError(
-                f"Task {task_id} must use its matching private suite"
-            )
-        expected_description = (
-            PROJECT_ROOT / "benchmark" / "tasks" / task_id / "description.txt"
-        ).resolve()
-        if description_path != expected_description:
-            raise TaskError(
-                f"Task {task_id} description must be {expected_description}"
-            )
+        post_execution_suite = item["post_execution_suite"]
+        if canonical_index:
+            expected_namespace = CANONICAL_TASK_NAMESPACES.get(task_id)
+            if expected_namespace is None:
+                raise TaskError(
+                    f"Task {task_id} has no registered private evaluator contract"
+                )
+            if namespace != expected_namespace:
+                raise TaskError(
+                    f"Task {task_id} must use namespace {expected_namespace!r}, "
+                    f"not {namespace!r}"
+                )
+            if post_execution_suite != task_id:
+                raise TaskError(
+                    f"Task {task_id} must use its matching private suite"
+                )
+            expected_description = (
+                PROJECT_ROOT / "benchmark" / "tasks" / task_id / "description.txt"
+            ).resolve()
+            if description_path != expected_description:
+                raise TaskError(
+                    f"Task {task_id} description must be {expected_description}"
+                )
+        elif post_execution_suite is not None:
+            if not isinstance(post_execution_suite, str):
+                raise TaskError(
+                    f"Invalid private suite for {task_id}: {post_execution_suite!r}"
+                )
+            expected_namespace = CANONICAL_TASK_NAMESPACES.get(task_id)
+            if post_execution_suite != task_id or namespace != expected_namespace:
+                raise TaskError(
+                    f"External task {task_id} may use a private suite only when its "
+                    "registered task ID and namespace match"
+                )
         description = description_path.read_text(encoding="utf-8")
         if not description.strip():
             raise TaskError(f"Task {task_id} description is empty")
@@ -137,7 +157,7 @@ def load_tasks(index_path: Path = TASK_INDEX) -> dict[str, BenchmarkTask]:
             namespace=namespace,
             description_path=description_path,
             description=description,
-            post_execution_suite=task_id,
+            post_execution_suite=post_execution_suite,
             kubernetes_version=str(raw["kubernetes_version"]),
             execution_image=str(raw["execution_image"]),
         )

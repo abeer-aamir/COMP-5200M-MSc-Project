@@ -784,6 +784,8 @@ class KubernetesAIPyCraftPipeline:
         _write_json(evidence_dir / "post_execution.json", post)
         if post.get("status") == "passed":
             evaluation["result"] = "accepted"
+        elif post.get("status") == "not_scored":
+            evaluation["result"] = "accepted_unscored"
         elif post.get("status") == "failed":
             evaluation["result"] = "specification_discrepancy"
         else:
@@ -1981,6 +1983,16 @@ class KubernetesAIPyCraftPipeline:
                     attempt["result"] = "accepted"
                     record_validator_ground_truth(True, "hidden_oracle_passed")
                     summary["status"] = "completed"
+                    terminal = True
+                    break
+
+                if evaluation_result == "accepted_unscored":
+                    attempt["result"] = "accepted_unscored"
+                    record_validator_ground_truth(
+                        None,
+                        "generic_execution_gate_passed_without_private_suite",
+                    )
+                    summary["status"] = "completed_unscored"
                     terminal = True
                     break
 

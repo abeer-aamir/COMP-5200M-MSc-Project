@@ -20,6 +20,12 @@ def run_post_execution_verifier(
 ) -> dict[str, Any]:
     """Run the hidden live oracle. Its failures are terminal, never repair input."""
 
+    if task.post_execution_suite is None:
+        return {
+            "task_id": task.task_id,
+            "status": "not_scored",
+            "reason": "No private evaluator is registered for this generated task set",
+        }
     ready = env.readyz()
     if ready.returncode != 0 or "ok" not in ready.stdout.lower():
         return {

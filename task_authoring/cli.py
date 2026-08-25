@@ -38,6 +38,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--tasks", type=int, help="Override task count")
     parser.add_argument(
+        "--start-index",
+        type=int,
+        default=1,
+        help="First numeric task suffix; applies to every requested difficulty tier",
+    )
+    parser.add_argument(
         "--difficulty",
         choices=DIFFICULTY_LEVELS,
         help="Difficulty for a homogeneous task run",
@@ -63,6 +69,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _task_plan(args: argparse.Namespace, config) -> list[tuple[str, str]]:
+    if args.start_index < 1:
+        raise ValueError("--start-index must be at least 1")
     if args.difficulty_plan:
         if args.tasks is not None or args.difficulty is not None:
             raise ValueError(
@@ -89,7 +97,10 @@ def _task_plan(args: argparse.Namespace, config) -> list[tuple[str, str]]:
         plan = [
             (f"{task_prefixes.get(level, level)}-{index:03d}", level)
             for level in DIFFICULTY_LEVELS
-            for index in range(1, counts.get(level, 0) + 1)
+            for index in range(
+                args.start_index,
+                args.start_index + counts.get(level, 0),
+            )
         ]
     else:
         count = config.task_count if args.tasks is None else args.tasks
@@ -99,7 +110,10 @@ def _task_plan(args: argparse.Namespace, config) -> list[tuple[str, str]]:
             if args.difficulty is not None and level == "very_hard"
             else level if args.difficulty is not None else "pilot"
         )
-        plan = [(f"{prefix}-{index:03d}", level) for index in range(1, count + 1)]
+        plan = [
+            (f"{prefix}-{index:03d}", level)
+            for index in range(args.start_index, args.start_index + count)
+        ]
     if not 1 <= len(plan) <= config.max_task_count:
         raise ValueError(f"task plan must contain from 1 to {config.max_task_count} tasks")
     return plan

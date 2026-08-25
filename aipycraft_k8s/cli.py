@@ -26,7 +26,7 @@ from .openrouter import (
     safe_key_budget_context,
 )
 from .pipeline import KubernetesAIPyCraftPipeline
-from .tasks import TaskError, load_tasks
+from .tasks import TASK_INDEX, TaskError, load_tasks
 
 
 PAID_CONFIRMATION = "I_ACCEPT_PAID_OPENROUTER_CALLS"
@@ -58,6 +58,12 @@ def _parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="Run the paid OpenRouter pipeline.")
     run.add_argument("--task", default="all")
+    run.add_argument(
+        "--task-index",
+        type=Path,
+        default=TASK_INDEX,
+        help="Task-set index produced by task_authoring or the canonical benchmark index",
+    )
     run.add_argument("--confirm-paid-calls", required=True)
     run.add_argument(
         "--initial-candidate",
@@ -72,6 +78,12 @@ def _parser() -> argparse.ArgumentParser:
         "replay", help="Use ordered local .txt responses instead of an API."
     )
     replay.add_argument("--task", default="all")
+    replay.add_argument(
+        "--task-index",
+        type=Path,
+        default=TASK_INDEX,
+        help="Task-set index produced by task_authoring or the canonical benchmark index",
+    )
     replay.add_argument("--fixtures", type=Path, required=True)
     replay.add_argument("--initial-candidate", type=Path)
     return parser
@@ -81,8 +93,8 @@ def _print(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True, default=str))
 
 
-def _select_tasks(selection: str) -> list[Any]:
-    tasks = load_tasks()
+def _select_tasks(selection: str, index_path: Path = TASK_INDEX) -> list[Any]:
+    tasks = load_tasks(index_path)
     if selection == "all":
         return [tasks[key] for key in sorted(tasks)]
     if selection not in tasks:
@@ -336,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
             _print(harness.smoke())
             return 0
 
-        tasks = _select_tasks(args.task)
+        tasks = _select_tasks(args.task, args.task_index)
         harness = IsolatedKindHarness(
             config.environment,
             command_timeout_seconds=config.pipeline.command_timeout_seconds,
