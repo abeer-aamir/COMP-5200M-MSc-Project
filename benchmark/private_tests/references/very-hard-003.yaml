@@ -1,0 +1,229 @@
+apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: Namespace
+  metadata: {name: very-hard-chain-ns}
+- apiVersion: v1
+  kind: ConfigMap
+  metadata: {name: node-status, namespace: very-hard-chain-ns}
+  data: {index.html: "node-ok\n"}
+- apiVersion: v1
+  kind: Secret
+  metadata: {name: collector-token, namespace: very-hard-chain-ns}
+  type: Opaque
+  immutable: true
+  stringData: {TOKEN: collector-key}
+- apiVersion: apps/v1
+  kind: DaemonSet
+  metadata: {name: node-agent, namespace: very-hard-chain-ns}
+  spec:
+    selector: {matchLabels: {app: node-agent}}
+    template:
+      metadata: {labels: {app: node-agent, component: agent}}
+      spec:
+        automountServiceAccountToken: false
+        securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+        containers:
+        - name: agent
+          image: busybox:1.36.1
+          command: [httpd, -f, -p, '8090', -h, /srv]
+          ports: [{name: agent-http, containerPort: 8090, protocol: TCP}]
+          startupProbe: {httpGet: {path: /, port: agent-http}, periodSeconds: 5, failureThreshold: 18}
+          readinessProbe: {httpGet: {path: /, port: agent-http}, periodSeconds: 5, failureThreshold: 2}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: status, mountPath: /srv, readOnly: true}]
+        volumes: [{name: status, configMap: {name: node-status}}]
+- apiVersion: v1
+  kind: Service
+  metadata: {name: node-agent-svc, namespace: very-hard-chain-ns}
+  spec: {type: ClusterIP, selector: {app: node-agent}, ports: [{port: 8090, targetPort: agent-http, protocol: TCP}]}
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata: {name: status-collector, namespace: very-hard-chain-ns}
+  spec:
+    replicas: 2
+    minReadySeconds: 5
+    progressDeadlineSeconds: 180
+    strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
+    selector: {matchLabels: {app: status-collector}}
+    template:
+      metadata: {labels: {app: status-collector, component: collector}}
+      spec:
+        automountServiceAccountToken: false
+        securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+        initContainers:
+        - name: wait-agent
+          image: busybox:1.36.1
+          command: [sh, -ec]
+          args: ['i=0; until [ "$(wget -q -T 5 -O - http://node-agent-svc:8090/)" = node-ok ]; do i=$((i+1)); [ "$i" -ge 60 ] && exit 1; sleep 2; done']
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        containers:
+        - name: collector
+          image: busybox:1.36.1
+          command: [sh, -ec]
+          args: ['while true; do if [ "$TOKEN" = collector-key ] && body=$(wget -q -T 5 -O - http://node-agent-svc:8090/); then printf "collector:%s\n" "$body" > /www/index.new; mv /www/index.new /www/index.html; else rm -f /www/index.html; fi; sleep 2; done & exec httpd -f -p 8080 -h /www']
+          env:
+          - name: TOKEN
+            valueFrom: {secretKeyRef: {name: collector-token, key: TOKEN}}
+          ports: [{name: collector-http, containerPort: 8080, protocol: TCP}]
+          readinessProbe: {httpGet: {path: /, port: collector-http}, periodSeconds: 5, failureThreshold: 2}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: www, mountPath: /www}]
+        volumes: [{name: www, emptyDir: {}}]
+- apiVersion: v1
+  kind: Service
+  metadata: {name: status-collector-svc, namespace: very-hard-chain-ns}
+  spec: {type: ClusterIP, selector: {app: status-collector}, ports: [{port: 8080, targetPort: collector-http, protocol: TCP}]}
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata: {name: status-dashboard, namespace: very-hard-chain-ns}
+  spec:
+    replicas: 2
+    minReadySeconds: 5
+    progressDeadlineSeconds: 210
+    strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
+    selector: {matchLabels: {app: status-dashboard}}
+    template:
+      metadata: {labels: {app: status-dashboard, component: dashboard}}
+      spec:
+        automountServiceAccountToken: false
+        securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+        initContainers:
+        - name: wait-collector
+          image: busybox:1.36.1
+          command: [sh, -ec]
+          args: ['i=0; until [ "$(wget -q -T 5 -O - http://status-collector-svc:8080/)" = collector:node-ok ]; do i=$((i+1)); [ "$i" -ge 75 ] && exit 1; sleep 2; done']
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        containers:
+        - name: dashboard
+          image: busybox:1.36.1
+          command: [sh, -ec]
+          args: ['while true; do if body=$(wget -q -T 5 -O - http://status-collector-svc:8080/); then printf "dashboard:%s\n" "$body" > /www/index.new; mv /www/index.new /www/index.html; else rm -f /www/index.html; fi; sleep 2; done & exec httpd -f -p 8081 -h /www']
+          ports: [{name: dashboard-http, containerPort: 8081, protocol: TCP}]
+          readinessProbe: {httpGet: {path: /, port: dashboard-http}, periodSeconds: 5, failureThreshold: 2}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: www, mountPath: /www}]
+        volumes: [{name: www, emptyDir: {}}]
+- apiVersion: v1
+  kind: Service
+  metadata: {name: status-dashboard-svc, namespace: very-hard-chain-ns}
+  spec: {type: ClusterIP, selector: {app: status-dashboard}, ports: [{port: 80, targetPort: dashboard-http, protocol: TCP}]}
+- apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata: {name: collector-pdb, namespace: very-hard-chain-ns}
+  spec: {minAvailable: 1, selector: {matchLabels: {app: status-collector}}}
+- apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata: {name: dashboard-pdb, namespace: very-hard-chain-ns}
+  spec: {minAvailable: 1, selector: {matchLabels: {app: status-dashboard}}}
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: chain-default-deny, namespace: very-hard-chain-ns}
+  spec:
+    podSelector: {matchExpressions: [{key: component, operator: In, values: [agent, collector, dashboard]}]}
+    policyTypes: [Ingress, Egress]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: agent-ingress, namespace: very-hard-chain-ns}
+  spec:
+    podSelector: {matchLabels: {component: agent}}
+    policyTypes: [Ingress]
+    ingress:
+    - from: [{podSelector: {matchLabels: {component: collector}}}, {podSelector: {matchLabels: {access: status}}}]
+      ports: [{protocol: TCP, port: 8090}]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: collector-ingress, namespace: very-hard-chain-ns}
+  spec:
+    podSelector: {matchLabels: {component: collector}}
+    policyTypes: [Ingress]
+    ingress:
+    - from: [{podSelector: {matchLabels: {component: dashboard}}}, {podSelector: {matchLabels: {access: status}}}]
+      ports: [{protocol: TCP, port: 8080}]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: dashboard-ingress, namespace: very-hard-chain-ns}
+  spec:
+    podSelector: {matchLabels: {component: dashboard}}
+    policyTypes: [Ingress]
+    ingress:
+    - from: [{podSelector: {matchLabels: {access: status}}}, {podSelector: {matchLabels: {role: status-audit}}}]
+      ports: [{protocol: TCP, port: 8081}]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: collector-egress, namespace: very-hard-chain-ns}
+  spec:
+    podSelector: {matchLabels: {component: collector}}
+    policyTypes: [Egress]
+    egress:
+    - to: [{podSelector: {matchLabels: {component: agent}}}]
+      ports: [{protocol: TCP, port: 8090}]
+    - ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: dashboard-egress, namespace: very-hard-chain-ns}
+  spec:
+    podSelector: {matchLabels: {component: dashboard}}
+    policyTypes: [Egress]
+    egress:
+    - to: [{podSelector: {matchLabels: {component: collector}}}]
+      ports: [{protocol: TCP, port: 8080}]
+    - ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata: {name: status-auditor, namespace: very-hard-chain-ns}
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata: {name: node-agent-reader, namespace: very-hard-chain-ns}
+  rules:
+  - {apiGroups: [apps], resources: [daemonsets], resourceNames: [node-agent], verbs: [get]}
+  - {apiGroups: [apps], resources: [daemonsets/status], resourceNames: [node-agent], verbs: [get]}
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata: {name: node-agent-reader-binding, namespace: very-hard-chain-ns}
+  roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: node-agent-reader}
+  subjects: [{kind: ServiceAccount, name: status-auditor, namespace: very-hard-chain-ns}]
+- apiVersion: batch/v1
+  kind: CronJob
+  metadata: {name: status-audit, namespace: very-hard-chain-ns}
+  spec:
+    schedule: '7,37 * * * *'
+    suspend: true
+    concurrencyPolicy: Forbid
+    successfulJobsHistoryLimit: 1
+    failedJobsHistoryLimit: 1
+    jobTemplate:
+      spec:
+        activeDeadlineSeconds: 210
+        template:
+          metadata: {labels: {role: status-audit}}
+          spec:
+            serviceAccountName: status-auditor
+            restartPolicy: Never
+            securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+            containers:
+            - name: audit
+              image: busybox:1.36.1
+              command: [sh, -ec]
+              args: ['i=0; until [ "$(wget -q -T 5 -O - http://status-dashboard-svc/)" = dashboard:collector:node-ok ]; do i=$((i+1)); [ "$i" -ge 90 ] && exit 1; sleep 2; done; echo status-audit-ok']
+              securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+- apiVersion: v1
+  kind: LimitRange
+  metadata: {name: chain-defaults, namespace: very-hard-chain-ns}
+  spec: {limits: [{type: Container, defaultRequest: {cpu: 20m, memory: 32Mi}, default: {cpu: 200m, memory: 128Mi}}]}
+- apiVersion: v1
+  kind: ResourceQuota
+  metadata: {name: chain-quota, namespace: very-hard-chain-ns}
+  spec:
+    hard:
+      pods: '14'
+      services: '5'
+      count/daemonsets.apps: '2'
+      count/deployments.apps: '4'
+      count/jobs.batch: '3'
+      count/cronjobs.batch: '2'
+      requests.cpu: '2'
+      requests.memory: 1Gi
+      limits.cpu: '4'
+      limits.memory: 2Gi

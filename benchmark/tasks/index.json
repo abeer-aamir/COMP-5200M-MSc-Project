@@ -116,6 +116,36 @@
       "namespace": "hard-monitor-ns",
       "description": "benchmark/tasks/hard-005/description.txt",
       "post_execution_suite": "hard-005"
+    },
+    {
+      "task_id": "very-hard-001",
+      "namespace": "very-hard-release-ns",
+      "description": "benchmark/tasks/very-hard-001/description.txt",
+      "post_execution_suite": "very-hard-001"
+    },
+    {
+      "task_id": "very-hard-002",
+      "namespace": "very-hard-ledger-ns",
+      "description": "benchmark/tasks/very-hard-002/description.txt",
+      "post_execution_suite": "very-hard-002"
+    },
+    {
+      "task_id": "very-hard-003",
+      "namespace": "very-hard-chain-ns",
+      "description": "benchmark/tasks/very-hard-003/description.txt",
+      "post_execution_suite": "very-hard-003"
+    },
+    {
+      "task_id": "very-hard-004",
+      "namespace": "very-hard-rbac-ns",
+      "description": "benchmark/tasks/very-hard-004/description.txt",
+      "post_execution_suite": "very-hard-004"
+    },
+    {
+      "task_id": "very-hard-005",
+      "namespace": "very-hard-maintenance-ns",
+      "description": "benchmark/tasks/very-hard-005/description.txt",
+      "post_execution_suite": "very-hard-005"
     }
   ]
 }

@@ -1,0 +1,178 @@
+apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: Namespace
+  metadata: {name: very-hard-rbac-ns}
+- apiVersion: v1
+  kind: ConfigMap
+  metadata: {name: published-content, namespace: very-hard-rbac-ns}
+  data: {index.html: "published=v1\n"}
+- apiVersion: v1
+  kind: Secret
+  metadata: {name: publisher-token, namespace: very-hard-rbac-ns}
+  type: Opaque
+  immutable: true
+  stringData: {TOKEN: publish-key}
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata: {name: publisher-reader, namespace: very-hard-rbac-ns}
+  automountServiceAccountToken: true
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata: {name: published-content-reader, namespace: very-hard-rbac-ns}
+  rules: [{apiGroups: [''], resources: [configmaps], resourceNames: [published-content], verbs: [get]}]
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata: {name: published-content-reader-binding, namespace: very-hard-rbac-ns}
+  roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: published-content-reader}
+  subjects: [{kind: ServiceAccount, name: publisher-reader, namespace: very-hard-rbac-ns}]
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata: {name: authorized-publisher, namespace: very-hard-rbac-ns}
+  spec:
+    replicas: 2
+    minReadySeconds: 5
+    progressDeadlineSeconds: 180
+    strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
+    selector: {matchLabels: {app: authorized-publisher}}
+    template:
+      metadata: {labels: {app: authorized-publisher, component: publisher}}
+      spec:
+        serviceAccountName: publisher-reader
+        securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+        containers:
+        - name: publisher
+          image: busybox:1.36.1
+          command: [sh, -ec]
+          args:
+          - 'api="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS}/api/v1/namespaces/${POD_NAMESPACE}/configmaps/published-content"; bearer=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token); while true; do if [ "$TOKEN" = publish-key ] && wget -q -T 5 --no-check-certificate --header "Authorization: Bearer $bearer" -O /dev/null "$api"; then : > /work/authorized; else rm -f /work/authorized; fi; sleep 3; done & exec httpd -f -p 8080 -h /srv'
+          env:
+          - name: TOKEN
+            valueFrom: {secretKeyRef: {name: publisher-token, key: TOKEN}}
+          - name: POD_NAMESPACE
+            valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports: [{name: publisher-http, containerPort: 8080, protocol: TCP}]
+          readinessProbe:
+            exec: {command: [sh, -ec, 'test -f /work/authorized; test "$(wget -q -T 5 -O - http://127.0.0.1:8080/)" = "$(cat /srv/index.html)"']}
+            periodSeconds: 5
+            failureThreshold: 2
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+          - {name: content, mountPath: /srv, readOnly: true}
+          - {name: work, mountPath: /work}
+        volumes:
+        - {name: content, configMap: {name: published-content}}
+        - {name: work, emptyDir: {}}
+- apiVersion: v1
+  kind: Service
+  metadata: {name: authorized-publisher-svc, namespace: very-hard-rbac-ns}
+  spec: {type: ClusterIP, selector: {app: authorized-publisher}, ports: [{port: 8080, targetPort: publisher-http, protocol: TCP}]}
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata: {name: authorized-consumer, namespace: very-hard-rbac-ns}
+  spec:
+    replicas: 2
+    minReadySeconds: 5
+    progressDeadlineSeconds: 210
+    strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
+    selector: {matchLabels: {app: authorized-consumer}}
+    template:
+      metadata: {labels: {app: authorized-consumer, component: consumer}}
+      spec:
+        automountServiceAccountToken: false
+        securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+        initContainers:
+        - name: wait-publisher
+          image: busybox:1.36.1
+          command: [sh, -ec]
+          args: ['i=0; until [ "$(wget -q -T 5 -O - http://authorized-publisher-svc:8080/)" = published=v1 ]; do i=$((i+1)); [ "$i" -ge 75 ] && exit 1; sleep 2; done']
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        containers:
+        - name: consumer
+          image: busybox:1.36.1
+          command: [sh, -ec]
+          args: ['while true; do if body=$(wget -q -T 5 -O - http://authorized-publisher-svc:8080/); then printf "%s\n" "$body" > /www/index.new; mv /www/index.new /www/index.html; else rm -f /www/index.html; fi; sleep 2; done & exec httpd -f -p 8081 -h /www']
+          ports: [{name: consumer-http, containerPort: 8081, protocol: TCP}]
+          readinessProbe: {httpGet: {path: /, port: consumer-http}, periodSeconds: 5, failureThreshold: 2}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: www, mountPath: /www}]
+        volumes: [{name: www, emptyDir: {}}]
+- apiVersion: v1
+  kind: Service
+  metadata: {name: authorized-consumer-svc, namespace: very-hard-rbac-ns}
+  spec: {type: ClusterIP, selector: {app: authorized-consumer}, ports: [{port: 80, targetPort: consumer-http, protocol: TCP}]}
+- apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata: {name: publisher-pdb, namespace: very-hard-rbac-ns}
+  spec: {minAvailable: 1, selector: {matchLabels: {app: authorized-publisher}}}
+- apiVersion: policy/v1
+  kind: PodDisruptionBudget
+  metadata: {name: consumer-pdb, namespace: very-hard-rbac-ns}
+  spec: {minAvailable: 1, selector: {matchLabels: {app: authorized-consumer}}}
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: rbac-default-deny, namespace: very-hard-rbac-ns}
+  spec:
+    podSelector: {matchExpressions: [{key: component, operator: In, values: [publisher, consumer]}]}
+    policyTypes: [Ingress]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: publisher-ingress, namespace: very-hard-rbac-ns}
+  spec:
+    podSelector: {matchLabels: {component: publisher}}
+    policyTypes: [Ingress]
+    ingress:
+    - from: [{podSelector: {matchLabels: {component: consumer}}}, {podSelector: {matchLabels: {access: published}}}]
+      ports: [{protocol: TCP, port: 8080}]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: consumer-ingress, namespace: very-hard-rbac-ns}
+  spec:
+    podSelector: {matchLabels: {component: consumer}}
+    policyTypes: [Ingress]
+    ingress: [{from: [{podSelector: {matchLabels: {access: published}}}], ports: [{protocol: TCP, port: 8081}]}]
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata: {name: audit-isolation, namespace: very-hard-rbac-ns}
+  spec: {podSelector: {matchLabels: {job-name: authorization-audit}}, policyTypes: [Ingress]}
+- apiVersion: batch/v1
+  kind: Job
+  metadata: {name: authorization-audit, namespace: very-hard-rbac-ns}
+  spec:
+    backoffLimit: 0
+    activeDeadlineSeconds: 210
+    template:
+      metadata: {labels: {access: published}}
+      spec:
+        serviceAccountName: publisher-reader
+        restartPolicy: Never
+        securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+        containers:
+        - name: audit
+          image: busybox:1.36.1
+          command: [sh, -ec]
+          args:
+          - 'api="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS}/api/v1/namespaces/${POD_NAMESPACE}/configmaps/published-content"; bearer=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token); wget -q -T 5 --no-check-certificate --header "Authorization: Bearer $bearer" -O /dev/null "$api"; i=0; until [ "$(wget -q -T 5 -O - http://authorized-consumer-svc/)" = published=v1 ]; do i=$((i+1)); [ "$i" -ge 90 ] && exit 1; sleep 2; done; echo authorization-audit-ok'
+          env:
+          - name: POD_NAMESPACE
+            valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+- apiVersion: v1
+  kind: LimitRange
+  metadata: {name: rbac-defaults, namespace: very-hard-rbac-ns}
+  spec: {limits: [{type: Container, defaultRequest: {cpu: 20m, memory: 32Mi}, default: {cpu: 200m, memory: 128Mi}}]}
+- apiVersion: v1
+  kind: ResourceQuota
+  metadata: {name: rbac-quota, namespace: very-hard-rbac-ns}
+  spec:
+    hard:
+      pods: '12'
+      services: '4'
+      configmaps: '3'
+      secrets: '3'
+      count/jobs.batch: '3'
+      requests.cpu: '2'
+      requests.memory: 1Gi
+      limits.cpu: '4'
+      limits.memory: 2Gi

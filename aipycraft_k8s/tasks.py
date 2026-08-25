@@ -34,6 +34,11 @@ CANONICAL_TASK_NAMESPACES = {
     "hard-003": "hard-chain-ns",
     "hard-004": "hard-audit-ns",
     "hard-005": "hard-monitor-ns",
+    "very-hard-001": "very-hard-release-ns",
+    "very-hard-002": "very-hard-ledger-ns",
+    "very-hard-003": "very-hard-chain-ns",
+    "very-hard-004": "very-hard-rbac-ns",
+    "very-hard-005": "very-hard-maintenance-ns",
 }
 
 

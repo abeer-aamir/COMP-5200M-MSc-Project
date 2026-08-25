@@ -32,6 +32,13 @@ from .core import (
     role_bound_to_service_account,
     volume_claim_template,
 )
+from .very_hard_suites import (
+    very_hard_1_checks as _very_hard1_checks,
+    very_hard_2_checks as _very_hard2_checks,
+    very_hard_3_checks as _very_hard3_checks,
+    very_hard_4_checks as _very_hard4_checks,
+    very_hard_5_checks as _very_hard5_checks,
+)
 
 
 EXPECTED_REQUIREMENTS = {
@@ -54,6 +61,11 @@ EXPECTED_REQUIREMENTS = {
     "hard-003": {f"R{number:02d}" for number in range(1, 15)},
     "hard-004": {f"R{number:02d}" for number in range(1, 15)},
     "hard-005": {f"R{number:02d}" for number in range(1, 15)},
+    "very-hard-001": {f"R{number:02d}" for number in range(1, 18)},
+    "very-hard-002": {f"R{number:02d}" for number in range(1, 18)},
+    "very-hard-003": {f"R{number:02d}" for number in range(1, 18)},
+    "very-hard-004": {f"R{number:02d}" for number in range(1, 18)},
+    "very-hard-005": {f"R{number:02d}" for number in range(1, 18)},
 }
 
 _FRESH_CLUSTER_NAMESPACES = {
@@ -3483,6 +3495,16 @@ def run_suite(
         checks = _hard4_checks(kube, candidate_path)
     elif task_id == "hard-005":
         checks = _hard5_checks(kube, candidate_path)
+    elif task_id == "very-hard-001":
+        checks = _very_hard1_checks(kube, candidate_path)
+    elif task_id == "very-hard-002":
+        checks = _very_hard2_checks(kube, candidate_path)
+    elif task_id == "very-hard-003":
+        checks = _very_hard3_checks(kube, candidate_path)
+    elif task_id == "very-hard-004":
+        checks = _very_hard4_checks(kube, candidate_path)
+    elif task_id == "very-hard-005":
+        checks = _very_hard5_checks(kube, candidate_path)
     else:
         raise EvaluationError(f"unknown task id {task_id!r}")
     actual_ids = {requirement_id for requirement_id, _, _ in checks}
