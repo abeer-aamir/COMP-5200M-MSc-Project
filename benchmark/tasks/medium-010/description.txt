@@ -1,0 +1,11 @@
+We need a tiny retained cache in `medium-cache-ns`, with two stable members. It should follow a projected mode change without rolling and keep a file written by the evaluator when one ordinal is replaced.
+
+Put `PREFIX=cache` in immutable ConfigMap `cache-prefix`, with no other data. Put `SUFFIX=ready` in mutable Opaque Secret `cache-mode`, again as the only value. Create headless Service `cache-headless` with `clusterIP: None`, `publishNotReadyAddresses: false`, selector `app=cache`, and TCP 8080 targeting named port `cache-http`.
+
+StatefulSet `cache` has two `app=cache` replicas, uses `cache-headless`, `OrderedReady` management, RollingUpdate partition zero, and Retain policies for claims on scaling and deletion. Its one `busybox:1.36.1` container mounts `cache-prefix` at `/config`, `cache-mode` at `/mode`, and a `data` claim at `/data`, reading the prefix and suffix from the projected files. Every three seconds refresh `/data/index.html` as `<PREFIX>-<HOSTNAME>-<SUFFIX>\n` without deleting other files. Serve named port `cache-http` at 8080, probe `/` every five seconds, disable API-token mounting, and have both members Ready within 120 seconds. Each `data` claim requests 64Mi with `ReadWriteOnce`.
+
+Run the cache as non-root UID/GID 1000 with `fsGroup: 1000`, no privilege escalation, read-only root filesystems and all capabilities dropped. Only `/data` is writable. Default-deny member ingress and allow TCP 8080 only from `access=cache`; an unlabelled client must not reach either stable name.
+
+Add `cache-pdb` selecting `app=cache`, with `minAvailable: 1` and no `maxUnavailable`. ResourceQuota `cache-quota` has exactly six pods, three PVCs, 256Mi storage requests and two Services.
+
+If `SUFFIX` changes to `warm`, `cache-0` and `cache-1` must serve exactly `cache-cache-0-warm\n` and `cache-cache-1-warm\n` within 120 seconds without changing the StatefulSet generation or either UID. Restore `ready` within another 120 seconds, also without rollout. Then write `retained\n` to `/data/oracle-marker` on `cache-0` and delete that pod: a different-UID `cache-0` must be Ready within 90 seconds with the marker unchanged, and the headless Service must return to exactly two Ready addresses.

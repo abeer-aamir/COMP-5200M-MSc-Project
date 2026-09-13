@@ -1,0 +1,13 @@
+The artifact team needs a tiny seeded web endpoint in `medium-artifact-ns`. A one-shot Job should create the initial file on shared storage, then a single web replica should serve it. If the evaluator later changes that file, replacing the web pod must preserve the changed version rather than reseeding over it.
+
+Create immutable ConfigMap `artifact-seed-content` with only `index.html=artifact=v1\n`, and immutable Opaque Secret `artifact-check` with only `CHECK=serve`. PVC `artifact-store` requests exactly 64Mi, uses `ReadWriteOnce`, and has Filesystem volume mode.
+
+Job `artifact-seed` mounts the ConfigMap at `/seed` and the claim at `/data`. Its one `busybox:1.36.1` container copies `/seed/index.html` to `/data/index.html` only when the destination file does not already exist, then prints `artifact-seed-ok`. Use `restartPolicy: Never`, `backoffLimit: 0` and `activeDeadlineSeconds: 60`. The Job must Complete within 60 seconds with exactly `artifact-seed-ok\n` in its log.
+
+Deployment `artifact-web` has one replica labelled `app=artifact-web` and uses the Recreate strategy. A bounded init container mounts the claim and makes at most 30 checks, two seconds apart, for `/data/index.html`. The main `busybox:1.36.1` container also mounts the claim at `/data`, reads `CHECK` from `artifact-check` through a `secretKeyRef`, refuses to serve unless it equals `serve`, and serves `/data` on named TCP port `artifact-http` at 8080. Probe `/` every five seconds, disable service-account token mounting, and make the pod Ready within 90 seconds.
+
+Expose it through ClusterIP Service `artifact-web-svc`, port 80 to `artifact-http`, selecting `app=artifact-web`; the initial response must be exactly `artifact=v1\n`. Add `artifact-web-pdb` with selector `app=artifact-web`, `minAvailable: 1` and no `maxUnavailable`.
+
+Run the seed, init and web containers as non-root UID/GID 1000 with `fsGroup: 1000`, no privilege escalation, read-only root filesystems and all capabilities dropped. `/data` is the only writable location. Every container needs requests of 20m CPU/32Mi memory and limits of 200m CPU/128Mi memory.
+
+For the persistence check, the evaluator will replace `/data/index.html` with exactly `artifact=v2\n` and delete the web pod. A different-UID replacement must become Ready and serve the exact v2 body within 90 seconds. The seeding design must not overwrite that existing durable file.

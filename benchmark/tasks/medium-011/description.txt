@@ -1,0 +1,13 @@
+I need a two-replica notice endpoint in `medium-notice-ns`, plus a small one-shot verifier that proves the endpoint can be reached through its Service. The notice text should follow a ConfigMap update in place rather than rolling the pods.
+
+Start with a mutable ConfigMap named `notice-base` whose only entry is `BASE=notice`. The token belongs in an immutable Opaque Secret called `notice-token`, containing only `TOKEN=valid`.
+
+Deployment `notice-web` should have two replicas labelled `app=notice-web`. Use one `busybox:1.36.1` container per pod, mount `notice-base` at `/base`, read the token from `notice-token` with a `secretKeyRef`, and give it an `emptyDir` at `/www`. Every two seconds, while both values exist, write `<BASE>-<TOKEN>\n` to `/www/index.html`. Serve that directory on named TCP port `notice-http` at 8080 and probe `/` every five seconds with failure threshold two. Do not mount the service-account token. Use RollingUpdate with zero unavailable and one surge, `minReadySeconds: 5` and a 120-second progress deadline; both replicas should be Ready within 120 seconds.
+
+Expose the application as ClusterIP Service `notice-svc`, port 80 to `notice-http`. A client labelled `access=notice` must receive exactly `notice-valid\n`. Default-deny ingress to the notice pods and allow TCP 8080 only from that label, so an unlabelled client cannot get through.
+
+Add Job `notice-verify`, with its pod labelled `access=notice`. Its single `busybox:1.36.1` container gets no more than 20 attempts, spaced two seconds apart, to receive the exact normal response from `notice-svc`; after that it prints `notice-verify-ok`. Use `restartPolicy: Never`, `backoffLimit: 0` and `activeDeadlineSeconds: 60`. The Job must Complete within 60 seconds and its log must be exactly `notice-verify-ok\n`.
+
+Run the notice and verifier containers as non-root UID/GID 1000 with `fsGroup: 1000`, no privilege escalation, read-only root filesystems and all capabilities dropped. Only the notice container's `/www` should be writable. ResourceQuota `notice-quota` needs these exact hard limits: eight pods, two Services, three batch Jobs, 1 CPU/512Mi requests and 2 CPU/1Gi limits.
+
+Finally, changing `BASE` to `alert` must make both Ready pods and the Service return exactly `alert-valid\n` within 120 seconds without changing the Deployment generation or either pod UID. Restoring `notice` gets another 120 seconds and must also happen without a rollout.

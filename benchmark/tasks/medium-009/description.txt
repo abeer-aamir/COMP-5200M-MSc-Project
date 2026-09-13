@@ -1,0 +1,13 @@
+Build a small release endpoint in `medium-release-ns`. The page is fixed but its channel is live, and we want a suspended in-cluster audit that can be exercised before anyone turns its schedule on.
+
+Immutable ConfigMap `release-page` contains only `index.html=release=stable\n`. Mutable Opaque Secret `release-channel` contains only `CHANNEL=blue`.
+
+Deployment `release-web` has two `app=release-web` replicas. Its one `busybox:1.36.1` container mounts the page at `/page`, the channel at `/channel`, and an `emptyDir` at `/www`. Every two seconds, while both inputs exist, write `release=stable;channel=<current CHANNEL>\n` to `/www/index.html`. Serve it on named TCP port `release-http` at 8080 and probe `/` every five seconds with failure threshold two. Disable the API token, use RollingUpdate with no unavailable pods, one surge, five ready seconds and a 120-second progress deadline, and make both replicas Ready within 120 seconds.
+
+Expose port 80 through ClusterIP Service `release-svc`, targeting `release-http`. A pod labelled `access=release` should receive exactly `release=stable;channel=blue\n`. Default-deny ingress to the application and allow TCP 8080 only from that label. Add `release-pdb` with `minAvailable: 1`, selector `app=release-web`, and no `maxUnavailable`.
+
+Create suspended CronJob `release-audit` on schedule `*/9 * * * *`, using `Forbid` concurrency and one retained successful and failed Job. Label its pod `access=release`. Its one `busybox:1.36.1` container gets no more than 20 attempts, two seconds apart, to receive the exact normal Service body and then prints `release-audit-ok`. Use `restartPolicy: Never` and `activeDeadlineSeconds: 60`.
+
+Run both release and audit containers as non-root UID/GID 1000 with `fsGroup: 1000`, no privilege escalation, read-only roots and all capabilities dropped. Only release `/www` is writable.
+
+Changing `CHANNEL` to `green` must update both Ready pods and the Service to exactly `release=stable;channel=green\n` within 120 seconds without changing the Deployment generation or pod UIDs. Restore blue within another 120 seconds, again without rollout. Once blue is back, a Job created from `release-audit` must Complete within 60 seconds and log exactly `release-audit-ok\n`.

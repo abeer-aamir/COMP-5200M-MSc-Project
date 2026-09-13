@@ -32,6 +32,18 @@ from .core import (
     role_bound_to_service_account,
     volume_claim_template,
 )
+from .pending_easy_extension_suites import (
+    PENDING_EXPECTED_REQUIREMENTS as EASY_EXTENSION_EXPECTED_REQUIREMENTS,
+    PENDING_FACTORIES as EASY_EXTENSION_FACTORIES,
+)
+from .pending_hard_extension_suites import (
+    PENDING_EXPECTED_REQUIREMENTS as HARD_EXTENSION_EXPECTED_REQUIREMENTS,
+    PENDING_FACTORIES as HARD_EXTENSION_FACTORIES,
+)
+from .pending_medium_extension_suites import (
+    PENDING_EXPECTED_REQUIREMENTS as MEDIUM_EXTENSION_EXPECTED_REQUIREMENTS,
+    PENDING_FACTORIES as MEDIUM_EXTENSION_FACTORIES,
+)
 from .very_hard_suites import (
     very_hard_1_checks as _very_hard1_checks,
     very_hard_2_checks as _very_hard2_checks,
@@ -66,6 +78,15 @@ EXPECTED_REQUIREMENTS = {
     "very-hard-003": {f"R{number:02d}" for number in range(1, 18)},
     "very-hard-004": {f"R{number:02d}" for number in range(1, 18)},
     "very-hard-005": {f"R{number:02d}" for number in range(1, 18)},
+}
+EXPECTED_REQUIREMENTS.update(EASY_EXTENSION_EXPECTED_REQUIREMENTS)
+EXPECTED_REQUIREMENTS.update(MEDIUM_EXTENSION_EXPECTED_REQUIREMENTS)
+EXPECTED_REQUIREMENTS.update(HARD_EXTENSION_EXPECTED_REQUIREMENTS)
+
+EXTENSION_FACTORIES = {
+    **EASY_EXTENSION_FACTORIES,
+    **MEDIUM_EXTENSION_FACTORIES,
+    **HARD_EXTENSION_FACTORIES,
 }
 
 _FRESH_CLUSTER_NAMESPACES = {
@@ -3457,7 +3478,9 @@ def _require_candidate_path(candidate_path: Path | None) -> Path:
 def run_suite(
     task_id: str, kube: Kubectl, candidate_path: Path | None = None
 ) -> dict[str, Any]:
-    if task_id == "pilot-001":
+    if task_id in EXTENSION_FACTORIES:
+        checks = EXTENSION_FACTORIES[task_id](kube, candidate_path)
+    elif task_id == "pilot-001":
         checks = _task1_checks(kube, candidate_path)
     elif task_id == "pilot-002":
         checks = _task2_checks(kube, candidate_path)

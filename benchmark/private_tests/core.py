@@ -463,20 +463,37 @@ class Kubectl:
         if not name.startswith("aipc-eval-"):
             raise EvaluationError("probe pod names must use the aipc-eval- prefix")
         self.delete("pod", name)
-        args = [
-            "run",
-            name,
-            "-n",
-            self.namespace,
-            "--image=busybox:1.36.1",
-            "--restart=Never",
-        ]
-        if labels:
-            rendered = ",".join(f"{key}={value}" for key, value in sorted(labels.items()))
-            args.append(f"--labels={rendered}")
-        args.extend(["--command", "--", "sh", "-ec", shell_command])
+        # Evaluator Pods must remain admissible in namespaces whose candidate
+        # correctly installs a ResourceQuota without a LimitRange.  Supplying a
+        # small, fixed resource envelope prevents the oracle itself from causing
+        # a false candidate failure while keeping quota consumption negligible.
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": name,
+                "namespace": self.namespace,
+                "labels": dict(labels or {}),
+            },
+            "spec": {
+                "restartPolicy": "Never",
+                "automountServiceAccountToken": False,
+                "containers": [
+                    {
+                        "name": "probe",
+                        "image": "busybox:1.36.1",
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["sh", "-ec", shell_command],
+                        "resources": {
+                            "requests": {"cpu": "5m", "memory": "8Mi"},
+                            "limits": {"cpu": "50m", "memory": "32Mi"},
+                        },
+                    }
+                ],
+            },
+        }
         try:
-            self.run(args)
+            self.run(["apply", "-f", "-"], input_text=json.dumps(manifest))
         except KubectlError as exc:
             self._raise_evaluator_creation_failure(exc, f"probe Pod {name}")
         try:

@@ -118,6 +118,186 @@
       "post_execution_suite": "hard-005"
     },
     {
+      "task_id": "easy-006",
+      "namespace": "easy-maintenance-ns",
+      "description": "benchmark/tasks/easy-006/description.txt",
+      "post_execution_suite": "easy-006"
+    },
+    {
+      "task_id": "easy-007",
+      "namespace": "easy-nodekey-ns",
+      "description": "benchmark/tasks/easy-007/description.txt",
+      "post_execution_suite": "easy-007"
+    },
+    {
+      "task_id": "easy-008",
+      "namespace": "easy-pulse-ns",
+      "description": "benchmark/tasks/easy-008/description.txt",
+      "post_execution_suite": "easy-008"
+    },
+    {
+      "task_id": "easy-009",
+      "namespace": "easy-ordinal-ns",
+      "description": "benchmark/tasks/easy-009/description.txt",
+      "post_execution_suite": "easy-009"
+    },
+    {
+      "task_id": "easy-010",
+      "namespace": "easy-scale-ns",
+      "description": "benchmark/tasks/easy-010/description.txt",
+      "post_execution_suite": "easy-010"
+    },
+    {
+      "task_id": "easy-011",
+      "namespace": "easy-document-ns",
+      "description": "benchmark/tasks/easy-011/description.txt",
+      "post_execution_suite": "easy-011"
+    },
+    {
+      "task_id": "easy-012",
+      "namespace": "easy-greeting-ns",
+      "description": "benchmark/tasks/easy-012/description.txt",
+      "post_execution_suite": "easy-012"
+    },
+    {
+      "task_id": "easy-013",
+      "namespace": "easy-pair-ns",
+      "description": "benchmark/tasks/easy-013/description.txt",
+      "post_execution_suite": "easy-013"
+    },
+    {
+      "task_id": "easy-014",
+      "namespace": "easy-nodepage-ns",
+      "description": "benchmark/tasks/easy-014/description.txt",
+      "post_execution_suite": "easy-014"
+    },
+    {
+      "task_id": "easy-015",
+      "namespace": "easy-schedule-ns",
+      "description": "benchmark/tasks/easy-015/description.txt",
+      "post_execution_suite": "easy-015"
+    },
+    {
+      "task_id": "medium-006",
+      "namespace": "medium-signal-ns",
+      "description": "benchmark/tasks/medium-006/description.txt",
+      "post_execution_suite": "medium-006"
+    },
+    {
+      "task_id": "medium-007",
+      "namespace": "medium-node-ns",
+      "description": "benchmark/tasks/medium-007/description.txt",
+      "post_execution_suite": "medium-007"
+    },
+    {
+      "task_id": "medium-008",
+      "namespace": "medium-report-ns",
+      "description": "benchmark/tasks/medium-008/description.txt",
+      "post_execution_suite": "medium-008"
+    },
+    {
+      "task_id": "medium-009",
+      "namespace": "medium-release-ns",
+      "description": "benchmark/tasks/medium-009/description.txt",
+      "post_execution_suite": "medium-009"
+    },
+    {
+      "task_id": "medium-010",
+      "namespace": "medium-cache-ns",
+      "description": "benchmark/tasks/medium-010/description.txt",
+      "post_execution_suite": "medium-010"
+    },
+    {
+      "task_id": "medium-011",
+      "namespace": "medium-notice-ns",
+      "description": "benchmark/tasks/medium-011/description.txt",
+      "post_execution_suite": "medium-011"
+    },
+    {
+      "task_id": "medium-012",
+      "namespace": "medium-status-ns",
+      "description": "benchmark/tasks/medium-012/description.txt",
+      "post_execution_suite": "medium-012"
+    },
+    {
+      "task_id": "medium-013",
+      "namespace": "medium-auth-ns",
+      "description": "benchmark/tasks/medium-013/description.txt",
+      "post_execution_suite": "medium-013"
+    },
+    {
+      "task_id": "medium-014",
+      "namespace": "medium-view-ns",
+      "description": "benchmark/tasks/medium-014/description.txt",
+      "post_execution_suite": "medium-014"
+    },
+    {
+      "task_id": "medium-015",
+      "namespace": "medium-artifact-ns",
+      "description": "benchmark/tasks/medium-015/description.txt",
+      "post_execution_suite": "medium-015"
+    },
+    {
+      "task_id": "hard-006",
+      "namespace": "hard-mirror-ns",
+      "description": "benchmark/tasks/hard-006/description.txt",
+      "post_execution_suite": "hard-006"
+    },
+    {
+      "task_id": "hard-007",
+      "namespace": "hard-shard-ns",
+      "description": "benchmark/tasks/hard-007/description.txt",
+      "post_execution_suite": "hard-007"
+    },
+    {
+      "task_id": "hard-008",
+      "namespace": "hard-catalog-ns",
+      "description": "benchmark/tasks/hard-008/description.txt",
+      "post_execution_suite": "hard-008"
+    },
+    {
+      "task_id": "hard-009",
+      "namespace": "hard-artifact-ns",
+      "description": "benchmark/tasks/hard-009/description.txt",
+      "post_execution_suite": "hard-009"
+    },
+    {
+      "task_id": "hard-010",
+      "namespace": "hard-registry-ns",
+      "description": "benchmark/tasks/hard-010/description.txt",
+      "post_execution_suite": "hard-010"
+    },
+    {
+      "task_id": "hard-011",
+      "namespace": "hard-bulletin-ns",
+      "description": "benchmark/tasks/hard-011/description.txt",
+      "post_execution_suite": "hard-011"
+    },
+    {
+      "task_id": "hard-012",
+      "namespace": "hard-journal-ns",
+      "description": "benchmark/tasks/hard-012/description.txt",
+      "post_execution_suite": "hard-012"
+    },
+    {
+      "task_id": "hard-013",
+      "namespace": "hard-fanout-ns",
+      "description": "benchmark/tasks/hard-013/description.txt",
+      "post_execution_suite": "hard-013"
+    },
+    {
+      "task_id": "hard-014",
+      "namespace": "hard-quorum-ns",
+      "description": "benchmark/tasks/hard-014/description.txt",
+      "post_execution_suite": "hard-014"
+    },
+    {
+      "task_id": "hard-015",
+      "namespace": "hard-handoff-ns",
+      "description": "benchmark/tasks/hard-015/description.txt",
+      "post_execution_suite": "hard-015"
+    },
+    {
       "task_id": "very-hard-001",
       "namespace": "very-hard-release-ns",
       "description": "benchmark/tasks/very-hard-001/description.txt",

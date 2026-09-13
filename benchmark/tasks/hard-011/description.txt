@@ -1,0 +1,15 @@
+Build a two-replica internal bulletin in `hard-bulletin-ns`. It combines a fixed page with a projected code, and we need a paused checker template plus clean behaviour during ordinary pod replacement.
+
+Immutable ConfigMap `bulletin-page` contains only `index.html=bulletin=v1\n`. Mutable Opaque Secret `bulletin-code` contains only `code=blue`. Deployment `secure-bulletin` has two `app=secure-bulletin` replicas. Its one `busybox:1.36.1` container mounts the page at `/page`, the Secret at `/code`, and an emptyDir at `/www`. Every two seconds it writes `bulletin=v1;code=<current code>\n` to `/www/index.html` only while both inputs exist, removing it otherwise, and serves `/www` on named TCP port `bulletin-http` at 8080. Probe `/` every five seconds with failure threshold two, disable API-token mounting, and use RollingUpdate with no unavailable pods, one surge, five ready seconds and a 150-second progress deadline. Both replicas should be Ready within 150 seconds.
+
+ClusterIP Service `secure-bulletin-svc` exposes port 80 to that named port. An `access=bulletin` client should receive exactly `bulletin=v1;code=blue\n`.
+
+All bulletin and checker containers run as non-root UID/GID 1000 with `fsGroup: 1000`, no privilege escalation, read-only root filesystems and all capabilities dropped. Only bulletin `/www` is writable. Default-deny bulletin ingress and egress, allow TCP 8080 only from `access=bulletin` or `role=bulletin-check`, and allow bulletin egress only to cluster DNS on UDP/TCP 53. Unlabelled clients cannot reach the Service. Add `bulletin-pdb` with selector `app=secure-bulletin`, `minAvailable: 1` and no `maxUnavailable`.
+
+LimitRange `bulletin-defaults` provides container requests of 20m CPU and 32Mi memory and limits of 200m CPU and 128Mi memory. ResourceQuota `bulletin-quota` has exactly ten pods, three Services, three Secrets, three batch Jobs, two CronJobs, 2 CPU and 1Gi memory requests, and 4 CPU and 2Gi memory limits.
+
+Create suspended CronJob `bulletin-check` on schedule `*/7 * * * *`, with `Forbid` concurrency and one retained successful and failed Job. Label its pod `role=bulletin-check`. Its one `busybox:1.36.1` container has no more than 60 attempts, two seconds apart, to receive the exact normal bulletin body, then prints `bulletin-check-ok`. Use `restartPolicy: Never` and a 150-second active deadline. A Job made from this template must Complete in 150 seconds and log exactly `bulletin-check-ok\n`.
+
+Changing the Secret code to `green` should make both Ready pods and the Service return exactly `bulletin=v1;code=green\n` inside 150 seconds without a Deployment generation or pod UID change. Restoring blue gets another 150 seconds and must also avoid rollout.
+
+Set `revisionHistoryLimit: 2`, `terminationGracePeriodSeconds: 10`, and a main-container preStop exec of `['sh','-c','rm -f /www/index.html; sleep 3']`. Once one Ready pod is deleted and has left the endpoint set, twelve one-second requests from an `access=bulletin` client must all return the exact blue body, the terminating pod must leave readiness before exit, and a different-UID replacement must be Ready within 90 seconds.

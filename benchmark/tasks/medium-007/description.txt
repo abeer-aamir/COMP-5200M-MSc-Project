@@ -1,0 +1,11 @@
+Please add a small per-node banner to the one-node development cluster, all inside `medium-node-ns`. It should use an ordinary DaemonSet without pinning itself to a node, follow a projected page in place, and recover normally if its managed pod is removed.
+
+Create mutable ConfigMap `node-banner-page` with only `index.html=node-banner=v1\n`. The startup check belongs in an immutable Opaque Secret called `node-banner-key`, whose only value is `CHECK=node-ok`.
+
+DaemonSet `node-banner` should label its pod `app=node-banner` and have no `nodeSelector` or template tolerations. Use one `busybox:1.36.1` container, reading `CHECK` through a `secretKeyRef` and mounting the page at `/srv`. Start the HTTP server only when the check value is `node-ok`, expose named TCP port `node-http` at 8090, and probe `/` every five seconds with failure threshold three. Disable service-account token mounting. Exactly one pod should be Ready within 90 seconds on the reference cluster.
+
+ClusterIP Service `node-banner-svc` exposes port 80 to `node-http` and selects `app=node-banner`. A client labelled `access=node-banner` should receive exactly `node-banner=v1\n`. Default-deny ingress to the banner and allow TCP 8090 only from that label; an unlabelled client must fail. Add `node-banner-pdb` over the same app selector with `minAvailable: 1` and no `maxUnavailable`.
+
+Run the node container as non-root UID/GID 1000 with `fsGroup: 1000`, no privilege escalation, a read-only root filesystem and all capabilities dropped.
+
+The page must remain a live projection. Changing it to `node-banner=v2\n` should update the Ready pod and Service within 120 seconds without changing the DaemonSet generation or pod UID; restoring v1 gets another 120 seconds and must also avoid rollout. Once v1 is back, deleting the Ready pod should produce a different-UID Ready replacement and restore the exact Service response within 90 seconds.

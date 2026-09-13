@@ -1,0 +1,9 @@
+The reporting team needs a one-shot calculation and a paused audit schedule built from the same inputs. Put the batch-only setup in `medium-report-ns`; there is no long-running Service in this one.
+
+Use immutable ConfigMap `report-input` for exactly `VALUE=9` and `MULTIPLIER=4`. The operation mode is the sole value `MODE=scale` in immutable Opaque Secret `report-mode`.
+
+Job `report-build` has one `busybox:1.36.1` container. Load the two numbers from their matching ConfigMap keys and load `MODE` from the Secret through a `secretKeyRef`. Require scale mode, calculate 36, print only `report=36\n`, and exit non-zero if the inputs or result are wrong. Use `restartPolicy: Never`, `backoffLimit: 0`, `activeDeadlineSeconds: 60`, one completion and one parallel pod. It should Complete within 60 seconds with that exact log.
+
+Also create suspended CronJob `report-audit`, scheduled `11 */3 * * *`, with `Forbid` concurrency and one retained successful and failed Job. Its one `busybox:1.36.1` container loads the same three values, requires the same calculation and prints `report-audit=36`; use `restartPolicy: Never` and a 60-second active deadline. A Job made from the template must Complete within 60 seconds and log exactly `report-audit=36\n`.
+
+Both batch templates run as non-root UID and GID 1000 with `fsGroup: 1000`, no privilege escalation, read-only root filesystems and all capabilities dropped. LimitRange `report-defaults` supplies container requests of 20m CPU/32Mi memory and limits of 200m CPU/128Mi memory. ResourceQuota `report-quota` has exactly six pods, four batch Jobs, two CronJobs, 1 CPU/512Mi requests and 2 CPU/1Gi limits.

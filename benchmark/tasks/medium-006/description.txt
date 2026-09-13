@@ -1,0 +1,11 @@
+We need a small signal board for an internal team. Keep it in `medium-signal-ns`, and make sure changing the status code does not require a rollout and replacing one ordinary replica does not interrupt the page.
+
+The fixed part of the page belongs in an immutable ConfigMap called `signal-page`; its only entry is `index.html=signal=v1\n`. Put the live status in a mutable Opaque Secret named `signal-code`, with `CODE=green` as its only value.
+
+Run Deployment `signal-web` with two replicas labelled `app=signal-web`. Each pod has one `busybox:1.36.1` container. Mount the page at `/page`, project the Secret at `/code`, and provide a writable `emptyDir` at `/www`. Every two seconds, while both inputs exist, render `signal=v1;code=<current CODE>\n` into `/www/index.html`; remove the output if either input disappears. Serve it on named TCP port `signal-http` at 8080 and probe `/` every five seconds with failure threshold two. Disable service-account token mounting. Use RollingUpdate with no unavailable replicas, one surge, five ready seconds and a 120-second progress deadline, and have both pods Ready within 120 seconds.
+
+Expose the pods through ClusterIP Service `signal-svc`, port 80 to `signal-http`. A client labelled `access=signal` should receive exactly `signal=v1;code=green\n`. Deny ingress to the application by default and allow TCP 8080 only from that client label; an unlabelled client must not get through. Add `signal-pdb` with selector `app=signal-web`, `minAvailable: 1` and no `maxUnavailable`. LimitRange `signal-defaults` should give containers requests of 20m CPU/32Mi memory and limits of 200m CPU/128Mi memory.
+
+Harden the application as non-root UID and GID 1000 with `fsGroup: 1000`, no privilege escalation, a read-only root filesystem and all capabilities dropped. `/www` is its only writable data path.
+
+There are two behaviours we care about. If `CODE` changes to `amber`, both Ready pods and the Service must return exactly `signal=v1;code=amber\n` within 120 seconds without changing the Deployment generation or any pod UID; restoring `green` gets another 120 seconds and must also avoid rollout. After that, if one Ready pod is deleted and has left the endpoint set, ten requests one second apart through `signal-svc` must all return the exact green body, and a different-UID replacement must be Ready within 60 seconds.

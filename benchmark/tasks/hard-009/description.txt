@@ -1,0 +1,15 @@
+We have a batch-produced artifact that needs to be retained and served internally. Put it in `hard-artifact-ns`, and make sure replacement of the serving pod does not lose anything already on disk.
+
+Create immutable ConfigMap `artifact-settings` with exactly `NAME=daily` and `VERSION=v1`, immutable Opaque Secret `artifact-signing` with only `SIGN=sealed`, and PVC `artifact-data` requesting 96Mi with `ReadWriteOnce`.
+
+Job `artifact-seed` mounts the claim at `/data` and the settings at `/config`. Its one `busybox:1.36.1` container reads `SIGN` from the Secret, writes `daily-v1-sealed\n` atomically to `/data/artifact` only when that file is absent, then prints `artifact-seed-ok`. Use `restartPolicy: Never`, no backoff and a 90-second active deadline. It should Complete in 90 seconds and log exactly `artifact-seed-ok\n`.
+
+Deployment `artifact-server` has one `app=artifact-server` replica and uses the Recreate strategy. Its one `busybox:1.36.1` container mounts the claim at `/srv`, serves it through named TCP port `artifact-http` at 8080, and has a five-second readiness check with failure threshold two which requires `/srv/artifact` to equal `daily-v1-sealed\n`. Disable API-token mounting and make it Ready within 120 seconds. ClusterIP Service `artifact-svc` exposes port 80 to that named port; an `access=artifact` client should get exactly `daily-v1-sealed\n` from `/artifact`.
+
+Job `artifact-verify` carries pod label `access=artifact`. Its one `busybox:1.36.1` container gets at most 45 attempts, two seconds apart, for that exact Service response and then prints `artifact-verify-ok`. Use `restartPolicy: Never`, `backoffLimit: 0` and `activeDeadlineSeconds: 120`; it must Complete in that time and log exactly `artifact-verify-ok\n`.
+
+Run seed, server and verify containers as non-root UID/GID 1000 with `fsGroup: 1000`, no privilege escalation, read-only root filesystems and all capabilities dropped. Only the seed's `/data` claim mount and the server's `/srv` claim mount are writable. Deny ingress to server and batch pods, then allow server TCP 8080 only from `access=artifact`; an unlabelled client must not reach the Service. Add `artifact-pdb` selecting `app=artifact-server` with `minAvailable: 1` and no `maxUnavailable`.
+
+LimitRange `artifact-defaults` should provide container requests of 20m CPU and 32Mi memory and limits of 200m CPU and 128Mi memory. ResourceQuota `artifact-quota` has exactly eight pods, two PVCs, 256Mi storage requests, two Services, four batch Jobs, 1 CPU and 512Mi memory requests, and 2 CPU and 1Gi memory limits.
+
+Finally, if an evaluator writes `survivor\n` to `/srv/survivor`, records the server UID and deletes that pod, a different-UID replacement must be Ready within 150 seconds with both `artifact` and `survivor` unchanged. `artifact-svc` must return to one Ready endpoint and the exact artifact response within 180 seconds.

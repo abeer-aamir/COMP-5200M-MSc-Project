@@ -1,0 +1,17 @@
+I need an authorization-aware catalog in `hard-catalog-ns`. It should serve a projected page, but a pod is only Ready while it can really exercise a deliberately narrow Kubernetes permission.
+
+Create mutable ConfigMap `catalog-page` with only `index.html=catalog=v1\n`, and immutable Opaque Secret `catalog-token` with only `TOKEN=catalog-key`. ServiceAccount `catalog-reader` should have automatic token mounting enabled. Give it Role `catalog-page-reader`, containing exactly one core-API rule for only `get` on ConfigMap resource name `catalog-page`, through RoleBinding `catalog-page-reader-binding` which binds only that account.
+
+Deployment `authorized-catalog` has two replicas labelled `app=authorized-catalog` and uses `catalog-reader`. Its one `busybox:1.36.1` container, `catalog`, reads `TOKEN` through a `secretKeyRef`, mounts the page read-only at `/srv`, and has writable emptyDir `/work`. Every three seconds it should make a five-second-bounded HTTPS GET to the Kubernetes API for only `catalog-page` in its namespace, authenticated by the mounted bearer token. It creates `/work/authorized` only when the request succeeds and the application token is `catalog-key`, removing the marker otherwise. At the same time it serves `/srv` on named TCP port `catalog-http` at 8080. An exec readiness probe every five seconds with failure threshold two must require the authorization marker and an exact local HTTP response. Use RollingUpdate with `maxUnavailable: 0`, `maxSurge: 1`, `minReadySeconds: 5` and `progressDeadlineSeconds: 180`; both replicas should be Ready within 180 seconds.
+
+ClusterIP Service `authorized-catalog-svc` selects those pods and exposes TCP 80 to `catalog-http`. A pod labelled `access=catalog` should receive exactly `catalog=v1\n`.
+
+Add a one-shot Job called `catalog-audit` using `catalog-reader` and pod label `access=catalog`. Its one `busybox:1.36.1` container makes the same bounded authenticated API GET, then gets up to 60 attempts two seconds apart for the exact catalog Service body before printing `catalog-audit-ok`. Use `restartPolicy: Never`, `backoffLimit: 0` and `activeDeadlineSeconds: 150`. It needs to Complete within 150 seconds and log exactly `catalog-audit-ok\n`.
+
+Run catalog and audit containers as non-root UID/GID 1000 with `fsGroup: 1000`, no privilege escalation, read-only root filesystems and all Linux capabilities dropped. Only catalog `/work` may be writable.
+
+Use NetworkPolicies to deny ingress to both catalog and audit pods, then allow TCP 8080 to catalog only from `access=catalog`. An unlabelled client must not reach the Service. Add `catalog-pdb` selecting `app=authorized-catalog` with `minAvailable: 1` and no `maxUnavailable`.
+
+The projected page should update without a rollout. Changing it to `catalog=v2\n` must make both Ready pods and the Service serve the exact v2 body within 150 seconds, without changing the Deployment generation or pod UIDs. Restoring v1 gets another 150 seconds and must also avoid rollout.
+
+Authorization loss must affect readiness. If an evaluator saves and deletes `catalog-page-reader-binding`, both catalog pods should become NotReady and the Service should have no Ready endpoints within 90 seconds. Recreating the exact binding must restore two endpoints and the current exact body within 180 seconds. The evaluator will always attempt to restore the binding.

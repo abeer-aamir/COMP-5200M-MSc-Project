@@ -1,0 +1,15 @@
+Create a three-member retained journal in `hard-journal-ns`. We need stable ordinal responses, a partitioned update policy and a bounded check of every member.
+
+Use immutable ConfigMap `journal-prefix` with only `PREFIX=journal`, immutable Opaque Secret `journal-key` with only `KEY=k1`, and headless Service `journal-headless` with `clusterIP: None`, `publishNotReadyAddresses: false`, selector `app=journal`, and TCP 8080 to named `journal-http`.
+
+StatefulSet `journal` has three replicas, `serviceName: journal-headless`, Parallel pod management, RollingUpdate partition two, pod label `app=journal`, and Retain claim policies for scale and deletion. Its init container writes `seed\n` to `/data/seed` only if absent. The one `busybox:1.36.1` main container reads `KEY` from the Secret, mounts the prefix and its 64Mi `ReadWriteOnce` data claim, writes `<PREFIX>-<HOSTNAME>-<KEY>-<seed>\n` to `/data/index.html` without deleting other files, and serves named port `journal-http` at 8080. Probe `/` every five seconds, disable API-token mounting, and make all three replicas Ready within 180 seconds.
+
+ClusterIP Service `journal-svc` selects the members and exposes port 80 to the named target. It should have exactly three Ready addresses, and the stable names must return `journal-journal-0-k1-seed\n`, `journal-journal-1-k1-seed\n`, and `journal-journal-2-k1-seed\n` within 180 seconds.
+
+Job `journal-smoke` carries label `access=journal`. Its one `busybox:1.36.1` container gives each stable name at most 60 attempts, two seconds apart, to return its exact ordinal body, then prints `journal-smoke-ok`. Use `restartPolicy: Never`, no backoff and a 180-second deadline. It must Complete in 180 seconds and log exactly `journal-smoke-ok\n`.
+
+Run init, journal and smoke containers as non-root UID/GID 1000 with `fsGroup: 1000`, no privilege escalation, read-only root filesystems and all capabilities dropped. Only member claims are writable. Deny journal and smoke ingress, allow journal TCP 8080 only from `access=journal`, and permit smoke egress only to journal pods on 8080 plus DNS UDP/TCP 53. Unlabelled clients cannot reach either Service form. Add `journal-pdb` with `minAvailable: 2`, selector `app=journal`, and no `maxUnavailable`.
+
+LimitRange `journal-defaults` supplies requests of 20m CPU/32Mi memory and limits of 200m CPU/128Mi memory. ResourceQuota `journal-quota` has exactly ten pods, four PVCs, 384Mi storage requests, three Services, three batch Jobs, 2 CPU and 1Gi memory requests, and 4 CPU and 2Gi memory limits.
+
+For the rollout check, changing only pod-template annotation `experiment` to `v2` must replace and Ready only `journal-2` within 150 seconds while ordinals zero and one retain their UIDs. Restoring the annotation should again replace only ordinal two within 150 seconds. Separately, after writing `retained\n` to `/data/retained` on `journal-1` and deleting it, a different-UID ordinal one must be Ready within 150 seconds with both retained files unchanged, and both Services must recover three Ready addresses within 180 seconds.
