@@ -1,0 +1,47 @@
+# Secrets and local environments
+.env
+.env.*
+.venv/
+venv/
+myenv/
+
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.aipycraft/
+
+# Editors and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs, temporary files, and repository backups
+*.log
+*.tmp
+*.bundle
+tmp/
+
+# Generated configurations and local run artifacts
+analysis/
+outputs/
+plots/
+benchmark/aipycraft_config_*.json
+benchmark/aipycraft_runs/
+benchmark/candidate_bank/
+benchmark/comparison_runs/
+benchmark/experiment_campaigns/
+benchmark/experiment_sequences/
+benchmark/launcher_logs/
+benchmark/mock_responses/
+benchmark/pilot_runs/
+benchmark/recovery_plans/
+benchmark/recovery_runs/
+benchmark/study_runs/
+benchmark/unused_runs/
+benchmark/study_results/adjudications/
+benchmark/study_results/results_ledger.json
+validation_redeployments_*/
