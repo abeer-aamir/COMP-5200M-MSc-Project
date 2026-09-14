@@ -143,6 +143,7 @@ def load_entry(
     *,
     task: BenchmarkTask,
     config: AppConfig,
+    allow_task_description_drift: bool = False,
 ) -> CandidateBankEntry:
     record_path = path.resolve()
     try:
@@ -185,7 +186,10 @@ def load_entry(
         raise CandidateBankError("Unsupported candidate-bank schema version")
     if record["task_id"] != task.task_id:
         raise CandidateBankError("Candidate entry belongs to a different task")
-    if record["task_description_sha256"] != _hash_text(task.description):
+    if (
+        not allow_task_description_drift
+        and record["task_description_sha256"] != _hash_text(task.description)
+    ):
         raise CandidateBankError("Task description changed after candidate generation")
     if record["model"] != config.api.model:
         raise CandidateBankError("Candidate model differs from treatment model")
@@ -209,7 +213,11 @@ def load_entry(
     system_prompt = config.prompts.generate.read_text(encoding="utf-8")
     if record["generate_prompt_sha256"] != _hash_text(system_prompt):
         raise CandidateBankError("Generation prompt changed after candidate generation")
-    if record["initial_user_prompt_sha256"] != _hash_text(initial_user_prompt(task)):
+    if (
+        not allow_task_description_drift
+        and record["initial_user_prompt_sha256"]
+        != _hash_text(initial_user_prompt(task))
+    ):
         raise CandidateBankError("Initial user prompt changed after candidate generation")
 
     raw_path = _project_or_absolute(Path(str(record["raw_response"])), record_path.parent)
@@ -282,9 +290,15 @@ def load_initial_candidate(
     *,
     task: BenchmarkTask,
     config: AppConfig,
+    allow_task_description_drift: bool = False,
 ) -> CandidateBankEntry:
     """Accept an immutable bank record or a directly saved YAML/text response."""
 
     if path.suffix.lower() == ".json":
-        return load_entry(path, task=task, config=config)
+        return load_entry(
+            path,
+            task=task,
+            config=config,
+            allow_task_description_drift=allow_task_description_drift,
+        )
     return load_saved_yaml(path, task=task)

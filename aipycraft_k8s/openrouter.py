@@ -4,7 +4,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -22,6 +22,7 @@ class ProviderError(RuntimeError):
         unknown_cost_attempts: int = 0,
         audit_result: GenerationResult | None = None,
         transport_attempt_log: tuple[dict[str, Any], ...] = (),
+        provider_unavailable_retries: int = 0,
     ):
         super().__init__(message)
         self.transport_attempts = transport_attempts
@@ -29,6 +30,7 @@ class ProviderError(RuntimeError):
         self.unknown_cost_possible = unknown_cost_attempts > 0
         self.audit_result = audit_result
         self.transport_attempt_log = transport_attempt_log
+        self.provider_unavailable_retries = provider_unavailable_retries
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,11 @@ class GenerationResult:
     unobserved_billable_attempts: int
     billable: bool
     transport_attempt_log: tuple[dict[str, Any], ...] = ()
+    provider_response_attempts: int = 1
+    http_post_attempts: int = 1
+    provider_response_retry_log: tuple[dict[str, Any], ...] = ()
+    provider_unavailable_retries: int = 0
+    empty_length_provider_retries: int = 0
 
     def usage_consistency_issues(self) -> list[str]:
         """Return conservative local checks without replacing provider accounting."""
@@ -162,12 +169,22 @@ class OpenRouterTextClient:
         config: ApiConfig,
         *,
         timeout_seconds: int = 180,
+        retry_empty_length_with_alternate_provider: bool = False,
+        retry_provider_unavailable: bool = True,
+        provider_unavailable_retry_delay_seconds: float = 2.0,
     ):
         if not api_key:
             raise ProviderError("OPENROUTER_API_KEY is empty")
         self.api_key = api_key
         self.config = config
         self.timeout_seconds = timeout_seconds
+        self.retry_empty_length_with_alternate_provider = (
+            retry_empty_length_with_alternate_provider
+        )
+        self.retry_provider_unavailable = retry_provider_unavailable
+        self.provider_unavailable_retry_delay_seconds = max(
+            0.0, provider_unavailable_retry_delay_seconds
+        )
 
     def _request_json(
         self, method: str, path: str, payload: dict[str, Any] | None = None
@@ -437,18 +454,335 @@ class OpenRouterTextClient:
             unobserved_billable_attempts=uncertain_attempts,
             billable=True,
             transport_attempt_log=transport_attempt_log,
+            provider_response_attempts=1,
+            http_post_attempts=(
+                len(transport_attempt_log) if transport_attempt_log else retries + 1
+            ),
         )
 
-    def complete(self, system_prompt: str, user_prompt: str) -> GenerationResult:
-        payload = self.request_payload(system_prompt, user_prompt)
+    @staticmethod
+    def _provider_attempt_record(
+        result: GenerationResult,
+        *,
+        attempt: int,
+        routing: str,
+        trigger: str | None = None,
+        excluded_providers: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "attempt": attempt,
+            "routing": routing,
+            "provider": result.provider,
+            "generation_id": result.generation_id,
+            "request_id": result.request_id,
+            "finish_reason": result.finish_reason,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+            "reasoning_tokens": result.reasoning_tokens,
+            "total_tokens": result.total_tokens,
+            "cost_usd": str(result.cost_usd),
+            "latency_ms": result.latency_ms,
+            "response_characters": len(result.raw_text),
+            "http_post_attempts": result.http_post_attempts,
+        }
+        if trigger is not None:
+            record["trigger"] = trigger
+        if excluded_providers:
+            record["excluded_providers"] = list(excluded_providers)
+        return record
+
+    @classmethod
+    def _combine_provider_attempts(
+        cls,
+        first: GenerationResult,
+        second: GenerationResult,
+        *,
+        trigger: str,
+        routing: str,
+        excluded_providers: tuple[str, ...] = (),
+    ) -> GenerationResult:
+        transport_log: list[dict[str, Any]] = []
+        for application_attempt, result in ((1, first), (2, second)):
+            for item in result.transport_attempt_log:
+                annotated = dict(item)
+                annotated["provider_response_attempt"] = application_attempt
+                annotated["response_provider"] = result.provider
+                if application_attempt == 2:
+                    annotated["provider_retry_trigger"] = trigger
+                    annotated["excluded_providers"] = list(excluded_providers)
+                transport_log.append(annotated)
+        return GenerationResult(
+            raw_text=second.raw_text,
+            requested_model=second.requested_model,
+            response_model=second.response_model,
+            provider=second.provider,
+            generation_id=second.generation_id,
+            request_id=second.request_id,
+            system_fingerprint=second.system_fingerprint,
+            finish_reason=second.finish_reason,
+            prompt_tokens=first.prompt_tokens + second.prompt_tokens,
+            completion_tokens=first.completion_tokens + second.completion_tokens,
+            total_tokens=first.total_tokens + second.total_tokens,
+            reasoning_tokens=first.reasoning_tokens + second.reasoning_tokens,
+            cached_tokens=first.cached_tokens + second.cached_tokens,
+            cost_usd=first.cost_usd + second.cost_usd,
+            cost_source="aggregated_provider_retry",
+            provider_cost_complete=(
+                first.provider_cost_complete and second.provider_cost_complete
+            ),
+            usage_complete=first.usage_complete and second.usage_complete,
+            usage_raw={
+                "provider_response_attempts": [first.usage_raw, second.usage_raw]
+            },
+            latency_ms=first.latency_ms + second.latency_ms,
+            transport_retries=first.transport_retries + second.transport_retries,
+            unobserved_billable_attempts=(
+                first.unobserved_billable_attempts
+                + second.unobserved_billable_attempts
+            ),
+            billable=first.billable or second.billable,
+            transport_attempt_log=tuple(transport_log),
+            provider_response_attempts=(
+                first.provider_response_attempts
+                + second.provider_response_attempts
+            ),
+            http_post_attempts=first.http_post_attempts + second.http_post_attempts,
+            provider_response_retry_log=(
+                first.provider_response_retry_log
+                or (
+                    cls._provider_attempt_record(
+                        first,
+                        attempt=1,
+                        routing="configured_provider",
+                    ),
+                )
+            )
+            + (
+                cls._provider_attempt_record(
+                    second,
+                    attempt=first.provider_response_attempts + 1,
+                    routing=routing,
+                    trigger=trigger,
+                    excluded_providers=excluded_providers,
+                ),
+            ),
+            provider_unavailable_retries=(
+                first.provider_unavailable_retries
+                + second.provider_unavailable_retries
+                + int(trigger == "provider_unavailable_after_backoff")
+            ),
+            empty_length_provider_retries=(
+                first.empty_length_provider_retries
+                + second.empty_length_provider_retries
+                + int(trigger == "empty_response_with_finish_reason_length")
+            ),
+        )
+
+    @staticmethod
+    def _retryable_error_response(response: dict[str, Any]) -> bool:
+        error = response.get("error")
+        if not isinstance(error, dict):
+            return False
+
+        retryable_codes = {408, 409, 429, 500, 502, 503, 504}
+
+        def values(value: Any) -> list[Any]:
+            if isinstance(value, dict):
+                result: list[Any] = []
+                for child in value.values():
+                    result.extend(values(child))
+                return result
+            if isinstance(value, list):
+                result = []
+                for child in value:
+                    result.extend(values(child))
+                return result
+            return [value]
+
+        flattened = values(error)
+        if any(
+            (isinstance(value, int) and value in retryable_codes)
+            or (isinstance(value, str) and value.isdigit() and int(value) in retryable_codes)
+            for value in flattened
+        ):
+            return True
+        text = json.dumps(error, ensure_ascii=False).casefold()
+        return any(
+            marker in text
+            for marker in (
+                "no available provider",
+                "provider unavailable",
+                "temporarily unavailable",
+                "rate limit",
+                "no endpoints found",
+                "upstream timeout",
+            )
+        )
+
+    @staticmethod
+    def _retryable_provider_exception(exc: ProviderError) -> bool:
+        text = str(exc).casefold()
+        nonretryable_statuses = ("http 400", "http 401", "http 402", "http 403", "http 404")
+        if any(marker in text for marker in nonretryable_statuses):
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "http 408",
+                "http 409",
+                "http 429",
+                "http 500",
+                "http 502",
+                "http 503",
+                "http 504",
+                "timed out",
+                "urlerror",
+                "temporarily unavailable",
+                "connection reset",
+                "connection refused",
+                "name or service not known",
+                "getaddrinfo failed",
+            )
+        )
+
+    def _provider_unavailable_retry(
+        self,
+        payload: dict[str, Any],
+        *,
+        first_audit: GenerationResult | None = None,
+        first_error: ProviderError | None = None,
+    ) -> tuple[dict[str, Any], GenerationResult]:
+        delay_started = time.monotonic()
+        time.sleep(self.provider_unavailable_retry_delay_seconds)
+        retry_sleep_ms = round((time.monotonic() - delay_started) * 1000)
+        try:
+            response, audit = self._audit_request(payload)
+        except ProviderError as exc:
+            prior_posts = (
+                first_audit.http_post_attempts
+                if first_audit is not None
+                else first_error.transport_attempts if first_error is not None else 0
+            )
+            prior_unknown = (
+                first_audit.unobserved_billable_attempts
+                if first_audit is not None
+                else first_error.unknown_cost_attempts if first_error is not None else 0
+            )
+            prior_log = (
+                first_audit.transport_attempt_log
+                if first_audit is not None
+                else first_error.transport_attempt_log if first_error is not None else ()
+            )
+            failed_audit = first_audit
+            if failed_audit is not None:
+                failed_audit = replace(
+                    failed_audit,
+                    http_post_attempts=prior_posts + exc.transport_attempts,
+                    unobserved_billable_attempts=prior_unknown + exc.unknown_cost_attempts,
+                    provider_cost_complete=False,
+                    transport_attempt_log=prior_log + exc.transport_attempt_log,
+                    provider_unavailable_retries=(
+                        failed_audit.provider_unavailable_retries + 1
+                    ),
+                    provider_response_retry_log=(
+                        failed_audit.provider_response_retry_log
+                        or (
+                            self._provider_attempt_record(
+                                failed_audit,
+                                attempt=1,
+                                routing="configured_provider",
+                            ),
+                        )
+                    )
+                    + (
+                        {
+                            "attempt": failed_audit.provider_response_attempts + 1,
+                            "routing": "configured_provider_retry",
+                            "trigger": "provider_unavailable_after_backoff",
+                            "outcome": "transport_error",
+                            "error": str(exc),
+                            "retry_sleep_duration_ms": retry_sleep_ms,
+                            "http_post_attempts": exc.transport_attempts,
+                        },
+                    ),
+                )
+            raise ProviderError(
+                "Provider-unavailable retry failed after backoff: " f"{exc}",
+                transport_attempts=prior_posts + exc.transport_attempts,
+                unknown_cost_attempts=prior_unknown + exc.unknown_cost_attempts,
+                audit_result=failed_audit,
+                transport_attempt_log=prior_log + exc.transport_attempt_log,
+                provider_unavailable_retries=1,
+            ) from exc
+
+        if first_audit is not None:
+            combined = self._combine_provider_attempts(
+                first_audit,
+                audit,
+                trigger="provider_unavailable_after_backoff",
+                routing="configured_provider_retry",
+            )
+            retry_log = list(combined.provider_response_retry_log)
+            retry_log[-1]["retry_sleep_duration_ms"] = retry_sleep_ms
+            combined = replace(combined, provider_response_retry_log=tuple(retry_log))
+            return response, combined
+
+        if first_error is None:
+            raise AssertionError("provider retry requires a prior response or error")
+        annotated_log: list[dict[str, Any]] = []
+        for item in first_error.transport_attempt_log:
+            annotated = dict(item)
+            annotated["provider_response_attempt"] = 1
+            annotated_log.append(annotated)
+        for item in audit.transport_attempt_log:
+            annotated = dict(item)
+            annotated["provider_response_attempt"] = 2
+            annotated["provider_retry_trigger"] = "provider_unavailable_after_backoff"
+            annotated_log.append(annotated)
+        return response, replace(
+            audit,
+            provider_cost_complete=(
+                audit.provider_cost_complete and first_error.unknown_cost_attempts == 0
+            ),
+            transport_retries=(
+                audit.transport_retries + max(first_error.transport_attempts - 1, 0)
+            ),
+            unobserved_billable_attempts=(
+                audit.unobserved_billable_attempts + first_error.unknown_cost_attempts
+            ),
+            transport_attempt_log=tuple(annotated_log),
+            http_post_attempts=audit.http_post_attempts + first_error.transport_attempts,
+            provider_unavailable_retries=audit.provider_unavailable_retries + 1,
+            provider_response_retry_log=(
+                {
+                    "attempt": 1,
+                    "routing": "configured_provider",
+                    "trigger": "provider_unavailable_after_transport_backoff",
+                    "outcome": "transport_error",
+                    "error": str(first_error),
+                    "http_post_attempts": first_error.transport_attempts,
+                },
+                {
+                    **self._provider_attempt_record(
+                        audit,
+                        attempt=2,
+                        routing="configured_provider_retry",
+                        trigger="provider_unavailable_after_backoff",
+                    ),
+                    "retry_sleep_duration_ms": retry_sleep_ms,
+                },
+            ),
+        )
+
+    def _audit_request(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], GenerationResult]:
         request_result = self._request_json("POST", "/chat/completions", payload)
         response, latency_ms, retries, header_request_id, uncertain_attempts = (
             request_result[:5]
         )
-        transport_attempt_log = (
-            request_result[5] if len(request_result) > 5 else ()
-        )
-        audit = self._audit_response(
+        transport_attempt_log = request_result[5] if len(request_result) > 5 else ()
+        return response, self._audit_response(
             response,
             latency_ms=latency_ms,
             retries=retries,
@@ -457,12 +791,32 @@ class OpenRouterTextClient:
             transport_attempt_log=transport_attempt_log,
         )
 
-        def reject(message: str) -> None:
+    def complete(self, system_prompt: str, user_prompt: str) -> GenerationResult:
+        payload = self.request_payload(system_prompt, user_prompt)
+        try:
+            response, audit = self._audit_request(payload)
+        except ProviderError as exc:
+            if not self.retry_provider_unavailable or not self._retryable_provider_exception(exc):
+                raise
+            response, audit = self._provider_unavailable_retry(
+                payload,
+                first_error=exc,
+            )
+
+        if self.retry_provider_unavailable and self._retryable_error_response(response):
+            response, audit = self._provider_unavailable_retry(
+                payload,
+                first_audit=audit,
+            )
+
+        def reject(message: str, result: GenerationResult = audit) -> None:
             raise ProviderError(
                 message,
-                transport_attempts=retries + 1,
-                audit_result=audit,
-                transport_attempt_log=audit.transport_attempt_log,
+                transport_attempts=result.http_post_attempts,
+                unknown_cost_attempts=result.unobserved_billable_attempts,
+                audit_result=result,
+                transport_attempt_log=result.transport_attempt_log,
+                provider_unavailable_retries=result.provider_unavailable_retries,
             )
 
         if response.get("error"):
@@ -486,6 +840,98 @@ class OpenRouterTextClient:
                 "Provider substitution refused: requested "
                 f"{list(self.config.provider_only)}, got {audit.provider or '<missing>'}"
             )
+        retry_eligible = (
+            self.retry_empty_length_with_alternate_provider
+            and audit.finish_reason == "length"
+            and not audit.raw_text
+        )
+        if retry_eligible:
+            excluded_providers = tuple(self.config.provider_only)
+            retry_payload = self.request_payload(system_prompt, user_prompt)
+            retry_payload["provider"] = {
+                "ignore": list(excluded_providers),
+                "allow_fallbacks": False,
+                "require_parameters": True,
+                "data_collection": "deny",
+            }
+            try:
+                retry_response, retry_audit = self._audit_request(retry_payload)
+            except ProviderError as exc:
+                raise ProviderError(
+                    "Alternate-provider retry failed after empty length response: "
+                    f"{exc}",
+                    transport_attempts=(
+                        audit.http_post_attempts + exc.transport_attempts
+                    ),
+                    unknown_cost_attempts=(
+                        audit.unobserved_billable_attempts
+                        + exc.unknown_cost_attempts
+                    ),
+                    audit_result=audit,
+                    transport_attempt_log=(
+                        audit.transport_attempt_log + exc.transport_attempt_log
+                    ),
+                ) from exc
+            combined = self._combine_provider_attempts(
+                audit,
+                retry_audit,
+                trigger="empty_response_with_finish_reason_length",
+                routing="alternate_provider",
+                excluded_providers=excluded_providers,
+            )
+            if retry_response.get("error"):
+                reject(
+                    "OpenRouter alternate-provider error response: "
+                    f"{retry_response['error']}",
+                    combined,
+                )
+            retry_choices = retry_response.get("choices")
+            if (
+                not isinstance(retry_choices, list)
+                or not retry_choices
+                or not isinstance(retry_choices[0], dict)
+            ):
+                reject(
+                    "OpenRouter alternate-provider response contained no choices",
+                    combined,
+                )
+            if retry_audit.response_model != self.config.model:
+                reject(
+                    "Model substitution refused during alternate-provider retry: "
+                    f"requested {self.config.model}, got "
+                    f"{retry_audit.response_model or '<missing>'}",
+                    combined,
+                )
+            excluded_identities = {
+                _provider_identity(value) for value in excluded_providers
+            }
+            if (
+                retry_audit.provider is None
+                or _provider_identity(retry_audit.provider) in excluded_identities
+            ):
+                reject(
+                    "Alternate-provider retry did not use a different provider: "
+                    f"excluded {list(excluded_providers)}, got "
+                    f"{retry_audit.provider or '<missing>'}",
+                    combined,
+                )
+            if retry_audit.finish_reason == "length" and not retry_audit.raw_text:
+                reject(
+                    "OpenRouter alternate-provider retry also returned "
+                    "finish_reason=length with no answer",
+                    combined,
+                )
+            try:
+                _message_text(
+                    (retry_choices[0].get("message") or {}).get("content")
+                )
+            except (AttributeError, ProviderError) as exc:
+                reject(
+                    "OpenRouter alternate-provider response content was not text: "
+                    f"{exc}",
+                    combined,
+                )
+            return combined
         choice = choices[0]
         try:
             _message_text((choice.get("message") or {}).get("content"))

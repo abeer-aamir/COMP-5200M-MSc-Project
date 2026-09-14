@@ -57,6 +57,15 @@ def _compact_record(
         "terminal_attempt_result": record.get("terminal_attempt_result"),
         "attempts": int(record.get("attempts") or 0),
         "regenerations": int(record.get("regenerations") or 0),
+        "provider_unavailable_retries": int(
+            record.get("provider_unavailable_retries") or 0
+        ),
+        "validator_unparsable_response_retries": int(
+            record.get("validator_unparsable_response_retries") or 0
+        ),
+        "empty_length_provider_retries": int(
+            record.get("empty_length_provider_retries") or 0
+        ),
         "deployment_successes": int(record.get("deployment_successes") or 0),
         "hidden_verifier_reached": bool(record.get("hidden_verifier_reached")),
         "hidden_passed": int(record.get("hidden_passed") or 0),

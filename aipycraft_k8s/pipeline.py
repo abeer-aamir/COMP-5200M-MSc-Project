@@ -554,10 +554,8 @@ class KubernetesAIPyCraftPipeline:
     ) -> dict[str, Any]:
         cost = sum((item.cost_usd for item in results), Decimal("0"))
         return {
-            "requests": len(results),
-            "http_post_attempts": sum(
-                item.transport_retries + 1 for item in results
-            )
+            "requests": sum(item.provider_response_attempts for item in results),
+            "http_post_attempts": sum(item.http_post_attempts for item in results)
             + terminal_transport_attempts,
             "prompt_tokens": sum(item.prompt_tokens for item in results),
             "completion_tokens": sum(item.completion_tokens for item in results),
@@ -582,6 +580,12 @@ class KubernetesAIPyCraftPipeline:
                 int(attempt.get("retry_sleep_duration_ms", 0) or 0)
                 for item in results
                 for attempt in item.transport_attempt_log
+            ),
+            "provider_unavailable_retries": sum(
+                item.provider_unavailable_retries for item in results
+            ),
+            "empty_length_provider_retries": sum(
+                item.empty_length_provider_retries for item in results
             ),
             "cost_usd": str(cost),
             "provider_cost_complete": all(
@@ -815,6 +819,11 @@ class KubernetesAIPyCraftPipeline:
         }
         unknown_cost_by_role = {role_generator: 0, role_validator: 0}
         terminal_transport_by_role = {role_generator: 0, role_validator: 0}
+        terminal_provider_unavailable_by_role = {
+            role_generator: 0,
+            role_validator: 0,
+        }
+        validator_parse_retries = 0
         aipycraft_response_hashes: list[str] = []
         attempts: list[dict[str, Any]] = []
         attempt_start_times: dict[int, float] = {}
@@ -908,6 +917,17 @@ class KubernetesAIPyCraftPipeline:
                 "cleanup_verified_environment_setup_retry_is_not_regeneration": True,
                 "hidden_or_confirmed_infrastructure_failures_regenerate": False,
                 "transport_retry_is_same_request_not_candidate_regeneration": True,
+                "provider_unavailable_retry_is_not_candidate_regeneration": True,
+                "validator_parse_retry_is_not_candidate_regeneration": True,
+                "empty_length_alternate_provider_retry_is_not_candidate_regeneration": (
+                    bool(
+                        getattr(
+                            self.validator_client,
+                            "retry_empty_length_with_alternate_provider",
+                            False,
+                        )
+                    )
+                ),
             },
             "duplicate_generation_responses": 0,
             "ai_validator": {
@@ -933,6 +953,15 @@ class KubernetesAIPyCraftPipeline:
                     self.config.ai_validator.api == self.config.api
                 ),
                 "failure_policy": "abort_on_validator_or_provider_error",
+                "unparsable_response_retries": 1,
+                "provider_unavailable_retries": 1,
+                "empty_length_alternate_provider_retry": bool(
+                    getattr(
+                        self.validator_client,
+                        "retry_empty_length_with_alternate_provider",
+                        False,
+                    )
+                ),
             },
             "attempts": attempts,
             "ai_pre_validation_public": None,
@@ -1300,198 +1329,268 @@ class KubernetesAIPyCraftPipeline:
                         validation_user, encoding="utf-8"
                     )
                     validator_started = time.monotonic()
+                    validation_result: GenerationResult | None = None
+                    decision = None
+                    validation_model_calls: list[dict[str, Any]] = []
+                    validation_retry_log: list[dict[str, Any]] = []
+                    validator_parse_total_ms = 0
                     try:
-                        validation_result = self.validator_client.complete(
-                            validator_system, validation_user
-                        )
-                        attempt["stage_timings_ms"]["ai_pre_validator_request"] = (
-                            round((time.monotonic() - validator_started) * 1000)
-                        )
-                    except ProviderError as exc:
-                        attempt["stage_timings_ms"]["ai_pre_validator_request"] = (
-                            round((time.monotonic() - validator_started) * 1000)
-                        )
-                        if not self.config.ai_validator.shadow_mode:
-                            raise
-                        rejected_call: dict[str, Any] | None = None
-                        if exc.audit_result is not None:
-                            audit = exc.audit_result
-                            record_model_result(role_validator, audit)
-                            (attempt_dir / "ai_validator_raw_response.txt").write_text(
-                                audit.raw_text, encoding="utf-8"
-                            )
-                            rejected_call = {
-                                **self._model_audit(
-                                    audit, validator_system, validation_user
-                                ),
-                                "validation_error": str(exc),
-                            }
-                        else:
-                            terminal_transport_by_role[role_validator] += (
-                                exc.transport_attempts
-                            )
-                        unknown_cost_by_role[role_validator] += (
-                            exc.unknown_cost_attempts
-                        )
-                        validation_record = {
-                            "enabled": True,
-                            "feedback_mode": self.config.ai_validator.feedback_mode,
-                            "shadow_mode": True,
-                            "status": "shadow_provider_error",
-                            "error": str(exc),
-                            "model_call": rejected_call,
-                            "transport_attempts": exc.transport_attempts,
-                            "transport_attempt_log": list(
-                                exc.transport_attempt_log
-                            ),
-                            "unknown_cost_attempts": exc.unknown_cost_attempts,
-                        }
-                        attempt["ai_pre_validation"] = validation_record
-                        summary["ai_pre_validation_public"] = {
-                            "enabled": True,
-                            "feedback_mode": self.config.ai_validator.feedback_mode,
-                            "shadow_mode": True,
-                            "status": "shadow_provider_error",
-                        }
-                        _write_json(
-                            attempt_dir / "ai_pre_validation.json", validation_record
-                        )
-                        validation_result = None
-                    if validation_result is None:
-                        pass
-                    else:
-                        record_model_result(role_validator, validation_result)
-                        (attempt_dir / "ai_validator_raw_response.txt").write_text(
-                            validation_result.raw_text, encoding="utf-8"
-                        )
-                        validation_audit = self._model_audit(
-                            validation_result, validator_system, validation_user
-                        )
-                        validation_record = {
-                            "enabled": True,
-                            "feedback_mode": self.config.ai_validator.feedback_mode,
-                            "shadow_mode": self.config.ai_validator.shadow_mode,
-                            "status": "response_received",
-                            "model_call": validation_audit,
-                        }
-                        attempt["ai_pre_validation"] = validation_record
-                        _write_json(
-                            attempt_dir / "ai_pre_validation.json", validation_record
-                        )
-                        validator_parse_started = time.monotonic()
-                        try:
-                            if validation_result.finish_reason != "stop":
-                                raise AiValidationError(
-                                    "AI validator returned finish_reason="
-                                    f"{validation_result.finish_reason or '<missing>'}"
+                        for validator_response_attempt in (1, 2):
+                            try:
+                                validation_result = self.validator_client.complete(
+                                    validator_system, validation_user
                                 )
-                            decision = parse_decision(
-                                validation_result.raw_text,
-                                self.config.ai_validator.feedback_mode,
-                            )
-                        except AiValidationError as exc:
-                            if not self.config.ai_validator.shadow_mode:
-                                raise
-                            validation_record = {
-                                **validation_record,
-                                "status": "shadow_validator_error",
-                                "error": str(exc),
-                            }
-                            attempt["ai_pre_validation"] = validation_record
-                            summary["ai_pre_validation_public"] = {
-                                "enabled": True,
-                                "feedback_mode": (
-                                    self.config.ai_validator.feedback_mode
-                                ),
-                                "shadow_mode": True,
-                                "status": "shadow_validator_error",
-                            }
-                            _write_json(
-                                attempt_dir / "ai_pre_validation.json",
-                                validation_record,
-                            )
-                        else:
-                            validation_decision_satisfies = decision.satisfies
-                            validation_record = {
-                                **validation_record,
-                                "status": (
-                                    "passed" if decision.satisfies else "rejected"
-                                ),
-                                "decision": decision.audit_dict(),
-                            }
-                            attempt["ai_pre_validation"] = validation_record
-                            _write_json(
-                                attempt_dir / "ai_pre_validation.json",
-                                validation_record,
-                            )
-                            summary["ai_pre_validation_public"] = {
-                                "enabled": True,
-                                "feedback_mode": (
-                                    self.config.ai_validator.feedback_mode
-                                ),
-                                "shadow_mode": self.config.ai_validator.shadow_mode,
-                                "status": validation_record["status"],
-                                "satisfies": decision.satisfies,
-                                "problem_count": len(decision.problems),
-                                "intervened": (
-                                    not decision.satisfies
-                                    and not self.config.ai_validator.shadow_mode
-                                ),
-                            }
-                            if (
-                                not decision.satisfies
-                                and not self.config.ai_validator.shadow_mode
-                            ):
-                                attempt["validator_ground_truth"] = (
-                                    _validator_ground_truth(
-                                        satisfies=False,
-                                        candidate_correct=None,
-                                        basis="not_deployed_active_validator_rejection",
-                                        reason=(
-                                            "The active validator blocked deployment; "
-                                            "live correctness is unobserved"
-                                        ),
+                            except ProviderError as exc:
+                                if not self.config.ai_validator.shadow_mode:
+                                    raise
+                                rejected_call: dict[str, Any] | None = None
+                                if exc.audit_result is not None:
+                                    audit = exc.audit_result
+                                    record_model_result(role_validator, audit)
+                                    (attempt_dir / "ai_validator_raw_response.txt").write_text(
+                                        audit.raw_text, encoding="utf-8"
                                     )
-                                )
-                                attempt["validator_outcome_agreement"] = attempt[
-                                    "validator_ground_truth"
-                                ]
-                                _write_json(
-                                    attempt_dir / "validator_ground_truth.json",
-                                    attempt["validator_ground_truth"],
-                                )
-                                _write_json(
-                                    attempt_dir / "validator_outcome_agreement.json",
-                                    attempt["validator_outcome_agreement"],
-                                )
-                                attempt["result"] = "ai_pre_validation_rejected"
-                                if index < self.config.pipeline.max_regenerations:
-                                    repair_trigger = "ai_validator"
-                                    repair_failure = queue_regeneration(
-                                        attempt,
-                                        attempt_dir,
-                                        trigger=repair_trigger,
-                                        failure_kind="ai_validator",
-                                        detail=correction_feedback(
-                                            decision,
-                                            self.config.ai_validator.feedback_mode,
+                                    rejected_call = {
+                                        **self._model_audit(
+                                            audit, validator_system, validation_user
                                         ),
-                                        evidence_artifacts=[
-                                            "ai_pre_validation.json",
-                                            "ai_validator_raw_response.txt",
-                                            "candidate.yaml",
-                                        ],
+                                        "validation_error": str(exc),
+                                    }
+                                    validation_model_calls.append(rejected_call)
+                                else:
+                                    terminal_transport_by_role[role_validator] += (
+                                        exc.transport_attempts
+                                    )
+                                    terminal_provider_unavailable_by_role[
+                                        role_validator
+                                    ] += exc.provider_unavailable_retries
+                                unknown_cost_by_role[role_validator] += (
+                                    exc.unknown_cost_attempts
+                                )
+                                validation_record = {
+                                    "enabled": True,
+                                    "feedback_mode": self.config.ai_validator.feedback_mode,
+                                    "shadow_mode": True,
+                                    "status": "shadow_provider_error",
+                                    "error": str(exc),
+                                    "model_call": rejected_call,
+                                    "model_calls": validation_model_calls,
+                                    "technical_retry_log": validation_retry_log,
+                                    "validator_parse_retries": len(validation_retry_log),
+                                    "transport_attempts": exc.transport_attempts,
+                                    "transport_attempt_log": list(
+                                        exc.transport_attempt_log
+                                    ),
+                                    "unknown_cost_attempts": exc.unknown_cost_attempts,
+                                }
+                                attempt["ai_pre_validation"] = validation_record
+                                summary["ai_pre_validation_public"] = {
+                                    "enabled": True,
+                                    "feedback_mode": self.config.ai_validator.feedback_mode,
+                                    "shadow_mode": True,
+                                    "status": "shadow_provider_error",
+                                }
+                                _write_json(
+                                    attempt_dir / "ai_pre_validation.json",
+                                    validation_record,
+                                )
+                                validation_result = None
+                                break
+
+                            record_model_result(role_validator, validation_result)
+                            raw_response_name = (
+                                "ai_validator_raw_response_attempt-"
+                                f"{validator_response_attempt:02d}.txt"
+                            )
+                            (attempt_dir / raw_response_name).write_text(
+                                validation_result.raw_text, encoding="utf-8"
+                            )
+                            (attempt_dir / "ai_validator_raw_response.txt").write_text(
+                                validation_result.raw_text, encoding="utf-8"
+                            )
+                            validation_audit = self._model_audit(
+                                validation_result, validator_system, validation_user
+                            )
+                            validation_audit["validator_response_attempt"] = (
+                                validator_response_attempt
+                            )
+                            validation_model_calls.append(validation_audit)
+                            validation_record = {
+                                "enabled": True,
+                                "feedback_mode": self.config.ai_validator.feedback_mode,
+                                "shadow_mode": self.config.ai_validator.shadow_mode,
+                                "status": "response_received",
+                                "model_call": validation_audit,
+                                "model_calls": validation_model_calls,
+                                "technical_retry_log": validation_retry_log,
+                                "validator_parse_retries": len(validation_retry_log),
+                            }
+                            attempt["ai_pre_validation"] = validation_record
+                            _write_json(
+                                attempt_dir / "ai_pre_validation.json",
+                                validation_record,
+                            )
+                            validator_parse_started = time.monotonic()
+                            try:
+                                if validation_result.finish_reason != "stop":
+                                    raise AiValidationError(
+                                        "AI validator returned finish_reason="
+                                        f"{validation_result.finish_reason or '<missing>'}"
+                                    )
+                                decision = parse_decision(
+                                    validation_result.raw_text,
+                                    self.config.ai_validator.feedback_mode,
+                                )
+                            except AiValidationError as exc:
+                                if validator_response_attempt == 1:
+                                    validator_parse_retries += 1
+                                    validation_retry_log.append(
+                                        {
+                                            "retry": 1,
+                                            "trigger": "unparsable_validator_response",
+                                            "error": str(exc),
+                                            "source_artifact": raw_response_name,
+                                        }
+                                    )
+                                    validation_record = {
+                                        **validation_record,
+                                        "status": "retrying_unparsable_response",
+                                        "error": str(exc),
+                                        "technical_retry_log": validation_retry_log,
+                                        "validator_parse_retries": 1,
+                                    }
+                                    attempt["ai_pre_validation"] = validation_record
+                                    _write_json(
+                                        attempt_dir / "ai_pre_validation.json",
+                                        validation_record,
                                     )
                                     continue
-                                summary["status"] = "candidate_failed"
-                                terminal = True
-                                break
-                        finally:
-                            attempt["stage_timings_ms"][
-                                "ai_pre_validator_decision_parse"
-                            ] = round(
-                                (time.monotonic() - validator_parse_started) * 1000
+                                if not self.config.ai_validator.shadow_mode:
+                                    raise
+                                validation_record = {
+                                    **validation_record,
+                                    "status": "shadow_validator_error",
+                                    "error": str(exc),
+                                    "technical_retry_log": validation_retry_log,
+                                    "validator_parse_retries": len(
+                                        validation_retry_log
+                                    ),
+                                }
+                                attempt["ai_pre_validation"] = validation_record
+                                summary["ai_pre_validation_public"] = {
+                                    "enabled": True,
+                                    "feedback_mode": (
+                                        self.config.ai_validator.feedback_mode
+                                    ),
+                                    "shadow_mode": True,
+                                    "status": "shadow_validator_error",
+                                }
+                                _write_json(
+                                    attempt_dir / "ai_pre_validation.json",
+                                    validation_record,
+                                )
+                            finally:
+                                parse_key = (
+                                    "ai_pre_validator_decision_parse_attempt_"
+                                    f"{validator_response_attempt:02d}"
+                                )
+                                parse_duration_ms = round(
+                                    (time.monotonic() - validator_parse_started) * 1000
+                                )
+                                validator_parse_total_ms += parse_duration_ms
+                                attempt["stage_timings_ms"][parse_key] = (
+                                    parse_duration_ms
+                                )
+                            break
+                    finally:
+                        attempt["stage_timings_ms"]["ai_pre_validator_request"] = (
+                            round((time.monotonic() - validator_started) * 1000)
+                        )
+                        attempt["stage_timings_ms"][
+                            "ai_pre_validator_decision_parse"
+                        ] = validator_parse_total_ms
+
+                    if decision is not None:
+                        validation_decision_satisfies = decision.satisfies
+                        validation_record = {
+                            **validation_record,
+                            "status": (
+                                "passed" if decision.satisfies else "rejected"
+                            ),
+                            "decision": decision.audit_dict(),
+                            "model_calls": validation_model_calls,
+                            "technical_retry_log": validation_retry_log,
+                            "validator_parse_retries": len(validation_retry_log),
+                        }
+                        attempt["ai_pre_validation"] = validation_record
+                        _write_json(
+                            attempt_dir / "ai_pre_validation.json",
+                            validation_record,
+                        )
+                        summary["ai_pre_validation_public"] = {
+                            "enabled": True,
+                            "feedback_mode": (
+                                self.config.ai_validator.feedback_mode
+                            ),
+                            "shadow_mode": self.config.ai_validator.shadow_mode,
+                            "status": validation_record["status"],
+                            "satisfies": decision.satisfies,
+                            "problem_count": len(decision.problems),
+                            "intervened": (
+                                not decision.satisfies
+                                and not self.config.ai_validator.shadow_mode
+                            ),
+                        }
+                        if (
+                            not decision.satisfies
+                            and not self.config.ai_validator.shadow_mode
+                        ):
+                            attempt["validator_ground_truth"] = (
+                                _validator_ground_truth(
+                                    satisfies=False,
+                                    candidate_correct=None,
+                                    basis="not_deployed_active_validator_rejection",
+                                    reason=(
+                                        "The active validator blocked deployment; "
+                                        "live correctness is unobserved"
+                                    ),
+                                )
                             )
+                            attempt["validator_outcome_agreement"] = attempt[
+                                "validator_ground_truth"
+                            ]
+                            _write_json(
+                                attempt_dir / "validator_ground_truth.json",
+                                attempt["validator_ground_truth"],
+                            )
+                            _write_json(
+                                attempt_dir / "validator_outcome_agreement.json",
+                                attempt["validator_outcome_agreement"],
+                            )
+                            attempt["result"] = "ai_pre_validation_rejected"
+                            if index < self.config.pipeline.max_regenerations:
+                                repair_trigger = "ai_validator"
+                                repair_failure = queue_regeneration(
+                                    attempt,
+                                    attempt_dir,
+                                    trigger=repair_trigger,
+                                    failure_kind="ai_validator",
+                                    detail=correction_feedback(
+                                        decision,
+                                        self.config.ai_validator.feedback_mode,
+                                    ),
+                                    evidence_artifacts=[
+                                        "ai_pre_validation.json",
+                                        "ai_validator_raw_response.txt",
+                                        "candidate.yaml",
+                                    ],
+                                )
+                                continue
+                            summary["status"] = "candidate_failed"
+                            terminal = True
+                            break
+                    elif validation_result is None:
+                        pass
                 else:
                     disabled_record = {
                         "enabled": False,
@@ -2082,6 +2181,9 @@ class KubernetesAIPyCraftPipeline:
                         attempt["result"] = "provider_response_rejected"
             else:
                 terminal_transport_by_role[active_role] += exc.transport_attempts
+                terminal_provider_unavailable_by_role[active_role] += (
+                    exc.provider_unavailable_retries
+                )
                 if attempts and attempts[-1]["result"] == "running":
                     attempts[-1]["result"] = (
                         "ai_validator_provider_error"
@@ -2096,6 +2198,7 @@ class KubernetesAIPyCraftPipeline:
                 "transport_attempts": exc.transport_attempts,
                 "transport_attempt_log": list(exc.transport_attempt_log),
                 "unknown_cost_attempts": exc.unknown_cost_attempts,
+                "provider_unavailable_retries": exc.provider_unavailable_retries,
             }
         except AiValidationError as exc:
             summary["status"] = "validator_error"
@@ -2197,6 +2300,20 @@ class KubernetesAIPyCraftPipeline:
                     unknown_cost_failures=unknown_cost_by_role[role],
                 )
                 for role, results in results_by_role.items()
+            }
+            for role, count in terminal_provider_unavailable_by_role.items():
+                summary["usage_by_role"][role]["provider_unavailable_retries"] += count
+            summary["usage_totals"]["provider_unavailable_retries"] += sum(
+                terminal_provider_unavailable_by_role.values()
+            )
+            summary["technical_retry_counts"] = {
+                "validator_unparsable_response": validator_parse_retries,
+                "provider_unavailable_after_backoff": summary["usage_totals"][
+                    "provider_unavailable_retries"
+                ],
+                "empty_length_alternate_provider": summary["usage_totals"][
+                    "empty_length_provider_retries"
+                ],
             }
             summary["finished_at"] = finished_marker
             summary["duration_ms"] = round((time.monotonic() - started) * 1000)

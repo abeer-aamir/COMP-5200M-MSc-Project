@@ -595,6 +595,18 @@ def build_analysis_record(summary: dict[str, Any]) -> dict[str, Any]:
         "generator_responses": int(generator_usage.get("requests") or 0),
         "validator_responses": int(validator_usage.get("requests") or 0),
         "http_post_attempts": int(usage.get("http_post_attempts") or 0),
+        "provider_unavailable_retries": int(
+            usage.get("provider_unavailable_retries") or 0
+        ),
+        "empty_length_provider_retries": int(
+            usage.get("empty_length_provider_retries") or 0
+        ),
+        "validator_unparsable_response_retries": int(
+            (summary.get("technical_retry_counts", {}) or {}).get(
+                "validator_unparsable_response"
+            )
+            or 0
+        ),
         "prompt_tokens": int(usage.get("prompt_tokens") or 0),
         "completion_tokens": int(usage.get("completion_tokens") or 0),
         "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),

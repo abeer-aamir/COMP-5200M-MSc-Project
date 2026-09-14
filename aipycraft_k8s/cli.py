@@ -30,6 +30,14 @@ from .tasks import TASK_INDEX, TaskError, load_tasks
 
 
 PAID_CONFIRMATION = "I_ACCEPT_PAID_OPENROUTER_CALLS"
+DEEPSEEK_EMPTY_LENGTH_RETRY_MODEL = "deepseek/deepseek-v4-flash-0731"
+
+
+def _validator_alternate_provider_retry_enabled(config: Any) -> bool:
+    return bool(
+        config.ai_validator.enabled
+        and config.ai_validator.api.model == DEEPSEEK_EMPTY_LENGTH_RETRY_MODEL
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -73,6 +81,14 @@ def _parser() -> argparse.ArgumentParser:
             "attempt 1 instead of a model call."
         ),
     )
+    run.add_argument(
+        "--allow-candidate-task-description-drift",
+        action="store_true",
+        help=(
+            "Reuse a provenance-checked candidate generated before an intentional "
+            "plaintext rewrite. The original and current hashes remain logged."
+        ),
+    )
 
     replay = subparsers.add_parser(
         "replay", help="Use ordered local .txt responses instead of an API."
@@ -108,8 +124,18 @@ def _plan(config: Any) -> dict[str, Any]:
     max_cluster_attempts = max_generations * (
         config.pipeline.candidate_api_loss_confirmation_replays + 1
     ) * (config.pipeline.environment_setup_retries + 1)
+    provider_unavailable_attempts = 2
+    validator_parse_attempts = 2
+    max_validator_provider_responses = (
+        max_generations
+        * validator_parse_attempts
+        * (provider_unavailable_attempts + int(_validator_alternate_provider_retry_enabled(config)))
+        if config.ai_validator.enabled
+        else 0
+    )
     max_validator_responses = max_generations if config.ai_validator.enabled else 0
-    max_model_responses = max_generations + max_validator_responses
+    max_generator_responses = max_generations * provider_unavailable_attempts
+    max_model_responses = max_generator_responses + max_validator_provider_responses
     return {
         "status": "planned",
         "paid_calls_made": False,
@@ -120,11 +146,17 @@ def _plan(config: Any) -> dict[str, Any]:
         "temperature": config.api.temperature,
         "reasoning_effort": config.api.reasoning_effort,
         "max_aipycraft_generations_per_task": max_generations,
+        "max_aipycraft_provider_responses_per_task": max_generator_responses,
         "max_ai_validator_responses_per_task": max_validator_responses,
+        "max_ai_validator_provider_responses_per_task": (
+            max_validator_provider_responses
+        ),
+        "max_validator_parse_attempts_per_candidate": validator_parse_attempts,
+        "max_provider_unavailable_retries_per_model_call": 1,
         "max_model_responses_per_task": max_model_responses,
         "max_http_post_attempts_per_task": (
-            max_generations * (config.api.transport_retries + 1)
-            + max_validator_responses
+            max_generator_responses * (config.api.transport_retries + 1)
+            + max_validator_provider_responses
             * (config.ai_validator.api.transport_retries + 1)
         ),
         "max_candidate_clusters_per_task": max_cluster_attempts,
@@ -179,6 +211,9 @@ def _plan(config: Any) -> dict[str, Any]:
                 "output": str(config.ai_validator.api.output_usd_per_million),
             },
             "feedback_mode": config.ai_validator.feedback_mode,
+            "empty_length_alternate_provider_retry": (
+                _validator_alternate_provider_retry_enabled(config)
+            ),
             "failure_threshold": (
                 "clear missing or contradicted requirement only; runtime uncertainty "
                 "alone passes"
@@ -371,9 +406,14 @@ def main(argv: list[str] | None = None) -> int:
             api_key = os.getenv("OPENROUTER_API_KEY", "")
             client = OpenRouterTextClient(api_key, config.api)
             validator_client = (
-                OpenRouterTextClient(api_key, config.ai_validator.api)
+                OpenRouterTextClient(
+                    api_key,
+                    config.ai_validator.api,
+                    retry_empty_length_with_alternate_provider=(
+                        _validator_alternate_provider_retry_enabled(config)
+                    ),
+                )
                 if config.ai_validator.enabled
-                and config.ai_validator.api != config.api
                 else client
             )
             key_supplier = lambda: safe_key_budget_context(client.get_key_status())
@@ -393,7 +433,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         for task in tasks:
             initial_candidate = (
-                load_initial_candidate(args.initial_candidate, task=task, config=config)
+                load_initial_candidate(
+                    args.initial_candidate,
+                    task=task,
+                    config=config,
+                    allow_task_description_drift=(
+                        args.command == "run"
+                        and args.allow_candidate_task_description_drift
+                    ),
+                )
                 if args.initial_candidate is not None
                 else None
             )

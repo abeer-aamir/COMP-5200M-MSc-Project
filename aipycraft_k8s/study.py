@@ -27,6 +27,7 @@ from .tasks import load_task, load_tasks
 STUDY_SCHEMA_VERSION = 1
 DEFAULT_BANK_ROOT = PROJECT_ROOT / "benchmark" / "candidate_bank"
 DEFAULT_STUDY_ROOT = PROJECT_ROOT / "benchmark" / "study_runs"
+MAX_INITIAL_GENERATION_ATTEMPTS = 2
 
 
 class StudyError(RuntimeError):
@@ -73,6 +74,32 @@ def _confirm(value: str) -> None:
             "Paid calls were not confirmed. Pass exactly "
             f"--confirm-paid-calls {PAID_CONFIRMATION}"
         )
+
+
+def _failed_call_cost(exc: BaseException) -> Decimal:
+    """Return provider-reported cost attached to a failed generation call."""
+
+    audit_result = getattr(exc, "audit_result", None)
+    if audit_result is None:
+        return Decimal("0")
+    return Decimal(str(getattr(audit_result, "cost_usd", "0") or "0"))
+
+
+def _generation_failure_record(exc: BaseException, attempt: int) -> dict[str, Any]:
+    audit_result = getattr(exc, "audit_result", None)
+    audit = audit_result.audit_dict() if audit_result is not None else None
+    return {
+        "attempt": attempt,
+        "failed_at": _utc_now(),
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "cost_usd": str(_failed_call_cost(exc)),
+        "transport_attempts": getattr(exc, "transport_attempts", None),
+        "unknown_cost_attempts": getattr(exc, "unknown_cost_attempts", None),
+        "finish_reason": (audit or {}).get("finish_reason"),
+        "generation_id": (audit or {}).get("generation_id"),
+        "request_id": (audit or {}).get("request_id"),
+    }
 
 
 def generate_candidate(
@@ -154,6 +181,12 @@ def create_manifest(
     output_path: Path,
     max_infrastructure_reruns: int,
     max_study_cost_usd: Decimal | None,
+    charge_candidate_generation_cost: bool = True,
+    failed_generation_cost_usd: Decimal = Decimal("0"),
+    skipped_tasks: list[dict[str, Any]] | None = None,
+    candidate_source_metadata: dict[str, Any] | None = None,
+    allow_task_description_drift: bool = False,
+    write: bool = True,
 ) -> dict[str, Any]:
     if not candidate_paths or not config_paths:
         raise StudyError("At least one candidate and treatment config are required")
@@ -191,17 +224,22 @@ def create_manifest(
         raise StudyError("Treatment configs contain a duplicate treatment ID")
     rows: list[dict[str, Any]] = []
     seen_treatments: set[str] = set()
-    shared_initial_cost = Decimal("0")
+    candidate_generation_cost = Decimal("0")
     for candidate_index, candidate_path in enumerate(candidate_paths):
         raw = _read_json(candidate_path.resolve())
         task_id = str(raw.get("task_id", ""))
         task = load_task(task_id)
         generation = raw.get("generation", {}) or {}
-        shared_initial_cost += Decimal(str(generation.get("cost_usd", "0")))
+        candidate_generation_cost += Decimal(str(generation.get("cost_usd", "0")))
         rotation = candidate_index % len(config_paths)
         ordered_configs = loaded_configs[rotation:] + loaded_configs[:rotation]
         for config in ordered_configs:
-            entry = load_entry(candidate_path, task=task, config=config)
+            entry = load_entry(
+                candidate_path,
+                task=task,
+                config=config,
+                allow_task_description_drift=allow_task_description_drift,
+            )
             treatment = treatment_id(config)
             seen_treatments.add(treatment)
             rows.append(
@@ -214,8 +252,22 @@ def create_manifest(
                     "config": str(config.path),
                     "config_sha256": hashlib.sha256(config.path.read_bytes()).hexdigest(),
                     "treatment_id": treatment,
+                    "candidate_task_description_drift_allowed": (
+                        allow_task_description_drift
+                    ),
+                    "candidate_task_description_sha256": raw.get(
+                        "task_description_sha256"
+                    ),
+                    "current_task_description_sha256": hashlib.sha256(
+                        task.description.encode("utf-8")
+                    ).hexdigest(),
                 }
             )
+    shared_initial_cost = (
+        candidate_generation_cost
+        if charge_candidate_generation_cost
+        else Decimal("0")
+    ) + failed_generation_cost_usd
     manifest = {
         "schema_version": STUDY_SCHEMA_VERSION,
         "study_name": name,
@@ -240,9 +292,28 @@ def create_manifest(
         },
         "treatments": sorted(seen_treatments),
         "shared_initial_generation_cost_usd": str(shared_initial_cost),
+        "initial_generation_accounting": {
+            "candidate_cost_incurred_in_this_study": charge_candidate_generation_cost,
+            "successful_candidate_cost_usd": (
+                str(candidate_generation_cost)
+                if charge_candidate_generation_cost
+                else "0"
+            ),
+            "failed_candidate_call_cost_usd": str(failed_generation_cost_usd),
+            "reused_candidate_historical_cost_usd": (
+                "0"
+                if charge_candidate_generation_cost
+                else str(candidate_generation_cost)
+            ),
+            "maximum_attempts_per_initial_candidate": MAX_INITIAL_GENERATION_ATTEMPTS,
+        },
+        "skipped_initial_candidates": skipped_tasks or [],
+        "candidate_source_metadata": candidate_source_metadata,
+        "candidate_task_description_drift_allowed": allow_task_description_drift,
         "rows": rows,
     }
-    _write_json_atomic(output_path.resolve(), manifest)
+    if write:
+        _write_json_atomic(output_path.resolve(), manifest)
     return manifest
 
 
@@ -321,15 +392,18 @@ def recover_paired_study(
     config = load_config(generator_path)
     plan_sha256 = _sha256_file(plan_path)
     candidate_by_task: dict[str, Path] = {}
+    recovery_checkpoint: dict[str, Any] = {}
     source_paths = [
         project_path(item, "existing_candidates")
         for item in plan["existing_candidates"]
     ]
     if recovery_state_path.exists():
-        recovery = _read_json(recovery_state_path)
-        if recovery.get("plan_sha256") != plan_sha256:
+        recovery_checkpoint = _read_json(recovery_state_path)
+        if recovery_checkpoint.get("plan_sha256") != plan_sha256:
             raise StudyError("Recovery plan changed after checkpoint creation")
-        source_paths.extend(Path(item) for item in recovery.get("candidates", []))
+        source_paths.extend(
+            Path(item) for item in recovery_checkpoint.get("candidates", [])
+        )
 
     for candidate_path in source_paths:
         candidate_path = candidate_path.resolve()
@@ -345,6 +419,23 @@ def recover_paired_study(
         load_entry(candidate_path, task=load_task(task_id), config=config)
         candidate_by_task[task_id] = candidate_path
 
+    initial_existing_tasks = set(candidate_by_task)
+    generation_attempts: dict[str, list[dict[str, Any]]] = {
+        str(task_id): list(records)
+        for task_id, records in (
+            recovery_checkpoint.get("generation_attempts", {}) or {}
+        ).items()
+        if isinstance(records, list)
+    }
+    skipped_task_ids = {
+        str(item.get("task_id"))
+        for item in recovery_checkpoint.get("skipped_initial_candidates", [])
+        if isinstance(item, dict) and item.get("task_id")
+    }
+    failed_generation_cost = Decimal(
+        str(recovery_checkpoint.get("failed_generation_cost_usd", "0"))
+    )
+
     if plan_only:
         return {
             "status": "planned",
@@ -356,7 +447,12 @@ def recover_paired_study(
                 task_id for task_id in tasks if task_id in candidate_by_task
             ],
             "missing_tasks": [
-                task_id for task_id in tasks if task_id not in candidate_by_task
+                task_id
+                for task_id in tasks
+                if task_id not in candidate_by_task and task_id not in skipped_task_ids
+            ],
+            "skipped_tasks": [
+                task_id for task_id in tasks if task_id in skipped_task_ids
             ],
             "existing_candidates": len(candidate_by_task),
             "max_study_cost_usd": (
@@ -364,7 +460,7 @@ def recover_paired_study(
             ),
         }
 
-    def observed_candidate_cost() -> Decimal:
+    def successful_candidate_cost() -> Decimal:
         return sum(
             (
                 Decimal(
@@ -378,6 +474,20 @@ def recover_paired_study(
             ),
             Decimal("0"),
         )
+
+    def observed_candidate_cost() -> Decimal:
+        return successful_candidate_cost() + failed_generation_cost
+
+    def skipped_records() -> list[dict[str, Any]]:
+        return [
+            {
+                "task_id": task_id,
+                "status": "initial_candidate_skipped",
+                "attempts": generation_attempts.get(task_id, []),
+            }
+            for task_id in tasks
+            if task_id in skipped_task_ids
+        ]
 
     def save_recovery(status: str, **extra: Any) -> None:
         _write_json_atomic(
@@ -398,8 +508,18 @@ def recover_paired_study(
                     task_id for task_id in tasks if task_id in candidate_by_task
                 ],
                 "remaining_tasks": [
-                    task_id for task_id in tasks if task_id not in candidate_by_task
+                    task_id
+                    for task_id in tasks
+                    if task_id not in candidate_by_task
+                    and task_id not in skipped_task_ids
                 ],
+                "skipped_initial_candidates": skipped_records(),
+                "generation_attempts": generation_attempts,
+                "maximum_attempts_per_initial_candidate": (
+                    MAX_INITIAL_GENERATION_ATTEMPTS
+                ),
+                "successful_candidate_cost_usd": str(successful_candidate_cost()),
+                "failed_generation_cost_usd": str(failed_generation_cost),
                 "observed_candidate_cost_usd": str(observed_candidate_cost()),
                 **extra,
             },
@@ -429,28 +549,59 @@ def recover_paired_study(
     )
 
     for task_id in tasks:
-        if task_id in candidate_by_task:
+        if task_id in candidate_by_task or task_id in skipped_task_ids:
             continue
-        if cost_cap is not None and observed_candidate_cost() >= cost_cap:
-            save_recovery("budget_stop", cap_usd=str(cost_cap))
-            raise StudyError("Recovery candidate-generation cost ceiling was reached")
-        try:
-            candidate_path = generate_candidate(
-                config_path=generator_path,
-                task_id=task_id,
-                output_root=candidate_root,
-            )
-        except Exception as exc:
-            save_recovery(
-                "interrupted",
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            raise
-        candidate_by_task[task_id] = candidate_path.resolve()
-        save_recovery("generating")
+        task_attempts = generation_attempts.setdefault(task_id, [])
+        for attempt in range(
+            len(task_attempts) + 1, MAX_INITIAL_GENERATION_ATTEMPTS + 1
+        ):
+            if cost_cap is not None and observed_candidate_cost() >= cost_cap:
+                save_recovery("budget_stop", cap_usd=str(cost_cap))
+                raise StudyError(
+                    "Recovery candidate-generation cost ceiling was reached"
+                )
+            try:
+                candidate_path = generate_candidate(
+                    config_path=generator_path,
+                    task_id=task_id,
+                    output_root=candidate_root,
+                )
+            except Exception as exc:
+                failure = _generation_failure_record(exc, attempt)
+                task_attempts.append(failure)
+                failed_generation_cost += Decimal(failure["cost_usd"])
+                _append_event(
+                    candidate_root.resolve() / "generation_events.jsonl",
+                    {
+                        "event": (
+                            "candidate_generation_retry_scheduled"
+                            if attempt < MAX_INITIAL_GENERATION_ATTEMPTS
+                            else "initial_candidate_skipped"
+                        ),
+                        "task_id": task_id,
+                        "attempt": attempt,
+                        "maximum_attempts": MAX_INITIAL_GENERATION_ATTEMPTS,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "failed_call_cost_usd": failure["cost_usd"],
+                    },
+                )
+                if attempt < MAX_INITIAL_GENERATION_ATTEMPTS:
+                    save_recovery("generating", retrying_task=task_id)
+                    continue
+                skipped_task_ids.add(task_id)
+                save_recovery("generating", most_recent_skip=task_id)
+                break
+            candidate_by_task[task_id] = candidate_path.resolve()
+            save_recovery("generating")
+            break
 
-    ordered_candidates = [candidate_by_task[task_id] for task_id in tasks]
+    ordered_candidates = [
+        candidate_by_task[task_id] for task_id in tasks if task_id in candidate_by_task
+    ]
+    if not ordered_candidates:
+        save_recovery("no_candidates")
+        raise StudyError("Every initial candidate was skipped after two failed attempts")
     create_manifest(
         name=study_name,
         candidate_paths=ordered_candidates,
@@ -458,8 +609,215 @@ def recover_paired_study(
         output_path=manifest_path,
         max_infrastructure_reruns=max_reruns,
         max_study_cost_usd=cost_cap,
+        failed_generation_cost_usd=failed_generation_cost,
+        skipped_tasks=skipped_records(),
+        candidate_source_metadata={
+            "mode": "checkpoint_recovery",
+            "plan": str(plan_path),
+            "plan_sha256": plan_sha256,
+            "preexisting_tasks": sorted(initial_existing_tasks),
+        },
     )
     save_recovery("manifest_created", manifest=str(manifest_path))
+    return run_manifest(manifest_path)
+
+
+def reuse_saved_candidates(
+    *,
+    name: str,
+    source_manifest_paths: list[Path],
+    config_paths: list[Path],
+    tasks: list[str],
+    study_root: Path,
+    max_infrastructure_reruns: int,
+    max_study_cost_usd: Decimal | None,
+    allow_task_description_drift: bool = False,
+    plan_only: bool = False,
+) -> dict[str, Any]:
+    """Run validator-only treatments from immutable, previously generated YAML."""
+
+    if not source_manifest_paths:
+        raise StudyError("At least one source manifest is required")
+    if not config_paths:
+        raise StudyError("At least one treatment config is required")
+    if not tasks or len(tasks) != len(set(tasks)):
+        raise StudyError("Reused-candidate tasks must be non-empty and unique")
+    unknown = sorted(set(tasks) - set(load_tasks()))
+    if unknown:
+        raise StudyError(f"Unknown tasks: {unknown}")
+    if max_infrastructure_reruns < 0:
+        raise StudyError("--max-infrastructure-reruns cannot be negative")
+    if max_study_cost_usd is not None and max_study_cost_usd <= 0:
+        raise StudyError("--max-study-cost-usd must be positive or omitted")
+
+    source_metadata: list[dict[str, Any]] = []
+    candidates: dict[str, tuple[Path, str]] = {}
+    for source_path in source_manifest_paths:
+        source_path = source_path.resolve()
+        source = _read_json(source_path)
+        rows = source.get("rows")
+        if not isinstance(rows, list):
+            raise StudyError(f"Source manifest has no rows: {source_path}")
+        source_metadata.append(
+            {
+                "manifest": str(source_path),
+                "manifest_sha256": _sha256_file(source_path),
+                "study_name": source.get("study_name"),
+            }
+        )
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            task_id = str(row.get("task_id", ""))
+            if task_id not in tasks:
+                continue
+            raw_candidate_path = Path(str(row.get("candidate_record", "")))
+            candidate_path = (
+                raw_candidate_path
+                if raw_candidate_path.is_absolute()
+                else PROJECT_ROOT / raw_candidate_path
+            ).resolve()
+            expected_sha256 = str(row.get("candidate_record_sha256", ""))
+            if not candidate_path.is_file():
+                raise StudyError(
+                    f"Saved candidate is missing for {task_id}: {candidate_path}"
+                )
+            actual_sha256 = _sha256_file(candidate_path)
+            if not expected_sha256 or actual_sha256 != expected_sha256:
+                raise StudyError(
+                    f"Saved candidate record integrity failed for {task_id}: "
+                    f"{candidate_path}"
+                )
+            previous = candidates.get(task_id)
+            if previous is not None and previous != (candidate_path, actual_sha256):
+                raise StudyError(
+                    f"Source manifests contain conflicting candidates for {task_id}"
+                )
+            candidates[task_id] = (candidate_path, actual_sha256)
+
+    missing = [task_id for task_id in tasks if task_id not in candidates]
+    if missing:
+        raise StudyError(
+            "Saved candidate preflight failed before paid calls; missing tasks: "
+            + ", ".join(missing)
+        )
+    candidate_paths = [candidates[task_id][0] for task_id in tasks]
+    study_dir = study_root.resolve() / name
+    manifest_path = study_dir / "manifest.json"
+    state_path = study_dir / "state.json"
+    if manifest_path.exists() or state_path.exists():
+        raise StudyError(
+            "Study name already has a manifest/state. Resume it with the run "
+            "command instead of creating another reused-candidate study."
+        )
+
+    candidate_source_metadata = {
+        "mode": "reused_saved_initial_candidates",
+        "historical_generation_cost_excluded_from_this_study": True,
+        "task_description_drift_allowed": allow_task_description_drift,
+        "source_manifests": source_metadata,
+        "selected_candidates": [
+            {
+                "task_id": task_id,
+                "candidate_record": str(candidates[task_id][0]),
+                "candidate_record_sha256": candidates[task_id][1],
+                "candidate_task_description_sha256": _read_json(
+                    candidates[task_id][0]
+                ).get("task_description_sha256"),
+                "current_task_description_sha256": hashlib.sha256(
+                    load_task(task_id).description.encode("utf-8")
+                ).hexdigest(),
+            }
+            for task_id in tasks
+        ],
+    }
+    preview = create_manifest(
+        name=name,
+        candidate_paths=candidate_paths,
+        config_paths=config_paths,
+        output_path=manifest_path,
+        max_infrastructure_reruns=max_infrastructure_reruns,
+        max_study_cost_usd=max_study_cost_usd,
+        charge_candidate_generation_cost=False,
+        candidate_source_metadata=candidate_source_metadata,
+        allow_task_description_drift=allow_task_description_drift,
+        write=False,
+    )
+    if plan_only:
+        return {
+            "status": "planned",
+            "paid_calls_made": False,
+            "study_name": name,
+            "tasks": tasks,
+            "candidate_count": len(candidate_paths),
+            "treatments": preview["treatments"],
+            "row_count": len(preview["rows"]),
+            "source_manifests": source_metadata,
+            "historical_candidate_cost_usd": preview[
+                "initial_generation_accounting"
+            ]["reused_candidate_historical_cost_usd"],
+            "charged_initial_generation_cost_usd": "0",
+            "max_study_cost_usd": (
+                None
+                if max_study_cost_usd is None
+                else str(max_study_cost_usd)
+            ),
+        }
+
+    study_dir.mkdir(parents=True, exist_ok=True)
+    first_config = load_config(config_paths[0])
+    preflight_started = time.monotonic()
+    try:
+        preflight = EnvironmentPreparer(
+            first_config.environment,
+            timeout_seconds=max(first_config.pipeline.command_timeout_seconds, 900),
+        ).doctor()
+    except Exception as exc:
+        _write_json_atomic(
+            study_dir / "study_preflight.json",
+            {
+                "schema_version": 1,
+                "checked_at": _utc_now(),
+                "duration_ms": round((time.monotonic() - preflight_started) * 1000),
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "paid_calls_made_before_this_check": False,
+            },
+        )
+        raise
+    _write_json_atomic(
+        study_dir / "study_preflight.json",
+        {
+            "schema_version": 1,
+            "checked_at": _utc_now(),
+            "duration_ms": round((time.monotonic() - preflight_started) * 1000),
+            "status": "completed",
+            "result": preflight,
+            "paid_calls_made_before_this_check": False,
+        },
+    )
+    _write_json_atomic(
+        study_dir / "candidate_reuse_summary.json",
+        {
+            "schema_version": 1,
+            "created_at": _utc_now(),
+            "status": "validated",
+            "paid_calls_made_for_candidate_reuse": False,
+            **candidate_source_metadata,
+        },
+    )
+    create_manifest(
+        name=name,
+        candidate_paths=candidate_paths,
+        config_paths=config_paths,
+        output_path=manifest_path,
+        max_infrastructure_reruns=max_infrastructure_reruns,
+        max_study_cost_usd=max_study_cost_usd,
+        charge_candidate_generation_cost=False,
+        candidate_source_metadata=candidate_source_metadata,
+        allow_task_description_drift=allow_task_description_drift,
+    )
     return run_manifest(manifest_path)
 
 
@@ -624,6 +982,8 @@ def run_manifest(manifest_path: Path, *, only_row: str | None = None) -> dict[st
                 "--confirm-paid-calls",
                 PAID_CONFIRMATION,
             ]
+            if row.get("candidate_task_description_drift_allowed"):
+                command.append("--allow-candidate-task-description-drift")
             invocation_started_at = _utc_now()
             started = time.monotonic()
             try:
@@ -831,6 +1191,31 @@ def _parser() -> argparse.ArgumentParser:
     recover.add_argument("--plan", type=Path, required=True)
     recover.add_argument("--confirm-paid-calls")
     recover.add_argument("--plan-only", action="store_true")
+
+    reuse = sub.add_parser(
+        "reuse",
+        help=(
+            "Validate and reuse saved initial candidates, then run only the "
+            "requested treatment configs"
+        ),
+    )
+    reuse.add_argument("--name", required=True)
+    reuse.add_argument("--source-manifest", type=Path, action="append", required=True)
+    reuse.add_argument("--treatment-config", type=Path, action="append", required=True)
+    reuse.add_argument("--task", action="append", required=True)
+    reuse.add_argument("--study-root", type=Path, default=DEFAULT_STUDY_ROOT)
+    reuse.add_argument("--max-infrastructure-reruns", type=int, default=1)
+    reuse.add_argument("--max-study-cost-usd", type=Decimal)
+    reuse.add_argument("--confirm-paid-calls")
+    reuse.add_argument("--plan-only", action="store_true")
+    reuse.add_argument(
+        "--allow-task-description-drift",
+        action="store_true",
+        help=(
+            "Allow immutable candidates from an intentional plaintext rewrite; "
+            "source and current hashes remain in the manifest"
+        ),
+    )
     return parser
 
 
@@ -872,6 +1257,22 @@ def main(argv: list[str] | None = None) -> int:
             if not args.plan_only:
                 _confirm(args.confirm_paid_calls)
             value = recover_paired_study(args.plan, plan_only=args.plan_only)
+            print(json.dumps(value, indent=2))
+            return 0 if value["status"] in {"completed", "planned"} else 2
+        if args.command == "reuse":
+            if not args.plan_only:
+                _confirm(args.confirm_paid_calls)
+            value = reuse_saved_candidates(
+                name=args.name,
+                source_manifest_paths=args.source_manifest,
+                config_paths=args.treatment_config,
+                tasks=args.task,
+                study_root=args.study_root,
+                max_infrastructure_reruns=args.max_infrastructure_reruns,
+                max_study_cost_usd=args.max_study_cost_usd,
+                allow_task_description_drift=args.allow_task_description_drift,
+                plan_only=args.plan_only,
+            )
             print(json.dumps(value, indent=2))
             return 0 if value["status"] in {"completed", "planned"} else 2
 
@@ -925,32 +1326,118 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         candidate_paths: list[Path] = []
-        shared_cost = Decimal("0")
-        for task_id in args.task:
-            for _ in range(args.replicates):
-                candidate_path = generate_candidate(
-                    config_path=args.generator_config,
-                    task_id=task_id,
-                    output_root=args.candidate_root,
-                )
-                candidate_paths.append(candidate_path)
-                candidate_record = _read_json(candidate_path)
-                shared_cost += Decimal(
-                    str(
-                        (candidate_record.get("generation", {}) or {}).get(
-                            "cost_usd", "0"
+        failed_generation_cost = Decimal("0")
+        generation_attempts: dict[str, list[dict[str, Any]]] = {}
+        skipped_candidates: list[dict[str, Any]] = []
+
+        def successful_generation_cost() -> Decimal:
+            return sum(
+                (
+                    Decimal(
+                        str(
+                            (_read_json(path).get("generation", {}) or {}).get(
+                                "cost_usd", "0"
+                            )
                         )
                     )
+                    for path in candidate_paths
+                ),
+                Decimal("0"),
+            )
+
+        def write_generation_summary(status: str) -> None:
+            _write_json_atomic(
+                study_dir / "candidate_generation_summary.json",
+                {
+                    "schema_version": 1,
+                    "study_name": args.name,
+                    "status": status,
+                    "updated_at": _utc_now(),
+                    "maximum_attempts_per_initial_candidate": (
+                        MAX_INITIAL_GENERATION_ATTEMPTS
+                    ),
+                    "successful_candidates": [str(path) for path in candidate_paths],
+                    "generation_attempts": generation_attempts,
+                    "skipped_initial_candidates": skipped_candidates,
+                    "successful_candidate_cost_usd": str(
+                        successful_generation_cost()
+                    ),
+                    "failed_generation_cost_usd": str(failed_generation_cost),
+                    "observed_candidate_cost_usd": str(
+                        successful_generation_cost() + failed_generation_cost
+                    ),
+                },
+            )
+
+        for task_id in args.task:
+            for replicate in range(1, args.replicates + 1):
+                attempt_key = (
+                    task_id
+                    if args.replicates == 1
+                    else f"{task_id}#replicate-{replicate}"
                 )
-                if (
-                    args.max_study_cost_usd is not None
-                    and shared_cost >= args.max_study_cost_usd
-                ):
-                    raise StudyError(
-                        "Study cost ceiling was reached during candidate-bank "
-                        f"generation ({shared_cost} USD observed). Existing immutable "
-                        "candidate entries were retained; no treatments were started."
+                task_attempts = generation_attempts.setdefault(attempt_key, [])
+                generated = False
+                for attempt in range(1, MAX_INITIAL_GENERATION_ATTEMPTS + 1):
+                    observed = successful_generation_cost() + failed_generation_cost
+                    if (
+                        args.max_study_cost_usd is not None
+                        and observed >= args.max_study_cost_usd
+                    ):
+                        write_generation_summary("budget_stop")
+                        raise StudyError(
+                            "Study cost ceiling was reached during candidate-bank "
+                            f"generation ({observed} USD observed). Existing immutable "
+                            "candidate entries were retained; no treatments were started."
+                        )
+                    try:
+                        candidate_path = generate_candidate(
+                            config_path=args.generator_config,
+                            task_id=task_id,
+                            output_root=args.candidate_root,
+                        )
+                    except Exception as exc:
+                        failure = _generation_failure_record(exc, attempt)
+                        task_attempts.append(failure)
+                        failed_generation_cost += Decimal(failure["cost_usd"])
+                        _append_event(
+                            args.candidate_root.resolve() / "generation_events.jsonl",
+                            {
+                                "event": (
+                                    "candidate_generation_retry_scheduled"
+                                    if attempt < MAX_INITIAL_GENERATION_ATTEMPTS
+                                    else "initial_candidate_skipped"
+                                ),
+                                "task_id": task_id,
+                                "replicate": replicate,
+                                "attempt": attempt,
+                                "maximum_attempts": MAX_INITIAL_GENERATION_ATTEMPTS,
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                                "failed_call_cost_usd": failure["cost_usd"],
+                            },
+                        )
+                        write_generation_summary("generating")
+                        continue
+                    candidate_paths.append(candidate_path)
+                    generated = True
+                    write_generation_summary("generating")
+                    break
+                if not generated:
+                    skipped_candidates.append(
+                        {
+                            "task_id": task_id,
+                            "replicate": replicate,
+                            "status": "initial_candidate_skipped",
+                            "attempts": task_attempts,
+                        }
                     )
+                    write_generation_summary("generating")
+        if not candidate_paths:
+            write_generation_summary("no_candidates")
+            raise StudyError(
+                "Every initial candidate was skipped after two failed attempts"
+            )
         manifest_path = study_dir / "manifest.json"
         create_manifest(
             name=args.name,
@@ -959,7 +1446,10 @@ def main(argv: list[str] | None = None) -> int:
             output_path=manifest_path,
             max_infrastructure_reruns=args.max_infrastructure_reruns,
             max_study_cost_usd=args.max_study_cost_usd,
+            failed_generation_cost_usd=failed_generation_cost,
+            skipped_tasks=skipped_candidates,
         )
+        write_generation_summary("manifest_created")
         value = run_manifest(manifest_path)
         print(json.dumps(value, indent=2))
         return 0 if value["status"] == "completed" else 2
